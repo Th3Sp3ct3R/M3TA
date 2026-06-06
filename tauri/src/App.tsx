@@ -231,6 +231,50 @@ const MIND_GLYPH: Record<string, string> = {
 
 // The "watch it think" surface — advisory cognition beats streamed live, typed in
 // with their glyph; decide/intend carry a confidence chip. Non-binding by design.
+interface CoreActivity {
+  id: string;
+  zone: string;
+  label: string;
+  status: "active" | "completed";
+}
+
+// Map a tool to a Containment-Core "zone" — the presence layer's room names.
+function zoneForActivity(name: string | undefined, _label: string): string {
+  const n = (name ?? "").toLowerCase();
+  if (["read", "write", "edit", "applyintent", "findandedit"].includes(n)) return "Code Forge";
+  if (["bash", "powershell", "bashoutput", "killshell"].includes(n)) return "Build Forge";
+  if (["grep", "glob", "codebasesearch"].includes(n)) return "Index Scan";
+  if (["browser", "webfetch", "websearch"].includes(n)) return "Browser Radar";
+  if (["memory", "livingmind"].includes(n)) return "Memory Vault";
+  if (["mission", "operator"].includes(n)) return "Mission War Room";
+  if (n === "task") return "Subagent Bay";
+  if (n.startsWith("skill") || ["runskill", "selfevolve", "self", "bootstrap"].includes(n)) return "Self Lab";
+  return "Core Reactor";
+}
+
+// The presence layer: slides in on tool activity, snaps to COMPLETED (or a red
+// CONTAINMENT BREACH on failure) with a glitch beat, then dismisses.
+function CorePanel({ activity }: { activity: CoreActivity }) {
+  const done = activity.status === "completed";
+  return (
+    <motion.div
+      className={`corePanel${done ? " done" : ""}`}
+      initial={{ opacity: 0, x: 44, filter: "blur(4px)" }}
+      animate={{ opacity: 1, x: 0, filter: "blur(0px)" }}
+      exit={{ opacity: 0, x: 44, filter: "blur(8px)" }}
+      transition={{ duration: 0.28, ease: [0.16, 0.84, 0.24, 1] }}
+    >
+      <div className="corePanelScan" aria-hidden="true" />
+      <div className="corePanelHead">
+        <span className="coreDot" />
+        <strong>{activity.zone}</strong>
+        <span className="coreState">{done ? "" : "● active"}</span>
+      </div>
+      <div className="coreActivityLabel">{activity.label}</div>
+    </motion.div>
+  );
+}
+
 function MindPanel({ beats }: { beats: MindBeat[] }) {
   const latestId = beats[beats.length - 1]?.id;
   return (
@@ -611,6 +655,10 @@ function App() {
   const [mindThoughts, setMindThoughts] = useState<MindBeat[]>([]);
   const mindBeatSeqRef = useRef(0);
   const mindIdleClearRef = useRef<number | null>(null);
+  // Containment Core presence — a side panel driven by live tool activity.
+  const [coreActivity, setCoreActivity] = useState<CoreActivity | null>(null);
+  const coreSeqRef = useRef(0);
+  const coreClearRef = useRef<number | null>(null);
   useEffect(() => {
     if (mindThoughts.length === 0) return;
     if (mindIdleClearRef.current !== null) window.clearTimeout(mindIdleClearRef.current);
@@ -1242,9 +1290,28 @@ function App() {
     if (detail.type === "turn_start") {
       stopVoicePlayback();
       setMindThoughts([]);
+      if (coreClearRef.current !== null) {
+        window.clearTimeout(coreClearRef.current);
+        coreClearRef.current = null;
+      }
+      setCoreActivity(null);
     }
     if (detail.type === "text_delta") feedVoiceText(detail.text);
     if (detail.type === "turn_end") flushVoiceBuffer(true);
+    // Containment Core presence: light up on tool activity, flash COMPLETED, vanish.
+    if (detail.type === "tool_start" || (detail.type === "tool_call" && ["planning", "ready", "running"].includes(detail.status ?? ""))) {
+      const label = detail.activityDescription || (detail.name ? `Running ${detail.name}` : "Working");
+      if (coreClearRef.current !== null) {
+        window.clearTimeout(coreClearRef.current);
+        coreClearRef.current = null;
+      }
+      setCoreActivity({ id: `core-${coreSeqRef.current++}`, zone: zoneForActivity(detail.name, label), label, status: "active" });
+    }
+    if (detail.type === "turn_end") {
+      setCoreActivity((cur) => (cur ? { ...cur, status: "completed", label: detail.status === "failed" ? "CONTAINMENT BREACH" : "COMPLETED" } : cur));
+      if (coreClearRef.current !== null) window.clearTimeout(coreClearRef.current);
+      coreClearRef.current = window.setTimeout(() => setCoreActivity(null), 2200);
+    }
     if (detail.type === "daemon_ready" || detail.type === "desktop_daemon_started") setDaemon("running");
     const maybeLevel = detail.type === "reasoning_set" ? detail.level : detail.reasoningLevel;
     if (isReasoningLevel(maybeLevel)) {
@@ -1471,6 +1538,9 @@ function App() {
       <EvolutionPulseDeck pulses={pulses} />
       <AnimatePresence>
         {mindThoughts.length > 0 ? <MindPanel beats={mindThoughts} /> : null}
+      </AnimatePresence>
+      <AnimatePresence>
+        {coreActivity ? <CorePanel activity={coreActivity} /> : null}
       </AnimatePresence>
       <Titlebar identity={agentIdentity} />
       <aside className="sidebar">
