@@ -28,6 +28,17 @@ export {
   type ActionDescriptor,
   type PolicyEvaluation,
 } from "./policy.js";
+export {
+  redactPreview,
+  isApprovalExpired,
+  defaultRollbackHint,
+  type ApprovalVerb,
+  type ActionPreview,
+  type RollbackHint,
+  type ApprovalRequest,
+  type ApprovalDecision,
+  type ProofCard,
+} from "./approval.js";
 export type {
   EffectSpec,
   EffectCost,

@@ -42,6 +42,9 @@ export type LedgerPhase =
   | "proposed"
   | "simulated"
   | "staged" // gated: needs approval (leash too short for this irreversibility)
+  | "approved" // owner approved a staged effect
+  | "rejected" // owner rejected a staged effect
+  | "expired" // a staged approval timed out (auto-denied)
   | "denied" // gated: budget/policy refusal
   | "committed"
   | "already" // idempotent no-op: this key was already committed
@@ -57,6 +60,9 @@ export interface LedgerEntry {
   irreversibility: Irreversibility;
   cost?: EffectCost;
   detail?: string;
+  /** Approval provenance (set on approved/rejected/committed-after-approval entries). */
+  approvalId?: string;
+  approver?: string;
 }
 
 export type GateDecision =
