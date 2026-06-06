@@ -179,8 +179,114 @@ def wav_to_bytes(wav: Any, sample_rate: int) -> bytes:
     return output.getvalue()
 
 
-def parse_args() -> VoiceSettings:
-    parser = argparse.ArgumentParser(description="Crix Kokoro-82M TTS WebSocket sidecar")
+@dataclass(frozen=True)
+class STTSettings:
+    engine: str
+    model: str
+    device: str
+    input_device: str | None
+    language: str
+    sample_rate: int = 16_000
+
+
+class MockSTT:
+    """Plumbing engine — no mic, no model. Returns a fixed transcript so the WS
+    wiring and UI can be exercised without faster-whisper/sounddevice installed."""
+
+    name = "mock"
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> str:
+        return "this is a mock transcript from the voice input plumbing."
+
+    def cancel(self) -> None:
+        pass
+
+
+class WhisperSTT:
+    """Local push-to-talk STT: capture the default input device with sounddevice
+    while the key/button is held, then transcribe the utterance with
+    faster-whisper (small.en by default)."""
+
+    def __init__(self, settings: STTSettings) -> None:
+        import sounddevice as sd
+        from faster_whisper import WhisperModel
+
+        self._sd = sd
+        self.settings = settings
+        self.name = f"whisper:{settings.model}"
+
+        device, index, compute = "cpu", 0, "int8"
+        if settings.device.startswith("cuda"):
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    device, compute = "cuda", "float16"
+                    index = int(settings.device.split(":")[1]) if ":" in settings.device else 0
+            except Exception:
+                device, index, compute = "cpu", 0, "int8"
+        # Warmed on construction (sidecar auto-starts in the background), so the
+        # first real utterance is transcribed instantly, not after a cold load.
+        self.model = WhisperModel(settings.model, device=device, device_index=index, compute_type=compute)
+
+        raw = settings.input_device
+        self._input = int(raw) if raw is not None and raw.isdigit() else (raw or None)
+        self._frames: list[Any] = []
+        self._stream: Any = None
+
+    def start(self) -> None:
+        self._frames = []
+        self._stream = self._sd.InputStream(
+            samplerate=self.settings.sample_rate,
+            channels=1,
+            dtype="float32",
+            device=self._input,
+            callback=self._on_audio,
+        )
+        self._stream.start()
+
+    def _on_audio(self, indata: Any, _frames: int, _time: Any, _status: Any) -> None:
+        self._frames.append(indata.copy())
+
+    def _close(self) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            finally:
+                self._stream = None
+
+    def stop(self) -> str:
+        self._close()
+        if not self._frames:
+            return ""
+        audio = np.concatenate(self._frames, axis=0).flatten().astype(np.float32)
+        self._frames = []
+        if audio.size < self.settings.sample_rate // 4:  # under ~0.25s — too short to be speech
+            return ""
+        segments, _info = self.model.transcribe(audio, language=self.settings.language, beam_size=1, vad_filter=True)
+        return "".join(segment.text for segment in segments).strip()
+
+    def cancel(self) -> None:
+        self._close()
+        self._frames = []
+
+
+def build_stt(settings: STTSettings) -> MockSTT | WhisperSTT | None:
+    if settings.engine == "mock":
+        return MockSTT()
+    try:
+        return WhisperSTT(settings)
+    except Exception as error:  # faster-whisper / sounddevice / model unavailable
+        print(f"[stt] whisper unavailable ({error}); /stt disabled — chat + TTS unaffected", flush=True)
+        return None
+
+
+def parse_args() -> tuple[VoiceSettings, STTSettings]:
+    parser = argparse.ArgumentParser(description="Crix local voice sidecar (Kokoro TTS + Whisper STT)")
     parser.add_argument("--host", default=os.environ.get("CRIX_TTS_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("CRIX_TTS_PORT", "8765")))
     parser.add_argument("--engine", choices=["kokoro", "mock"], default=os.environ.get("CRIX_TTS_ENGINE", "kokoro"))
@@ -190,8 +296,14 @@ def parse_args() -> VoiceSettings:
     parser.add_argument("--device", default=os.environ.get("CRIX_TTS_DEVICE", "cuda:0"))
     parser.add_argument("--language", default=os.environ.get("CRIX_TTS_LANGUAGE", "English"))
     parser.add_argument("--mock", action="store_true")
+    # Speech-to-text (push-to-talk). --mock forces the mock engine for both.
+    parser.add_argument("--stt-engine", choices=["whisper", "mock"], default=os.environ.get("CRIX_STT_ENGINE", "whisper"))
+    parser.add_argument("--stt-model", default=os.environ.get("CRIX_STT_MODEL", "small.en"))
+    parser.add_argument("--stt-device", default=os.environ.get("CRIX_STT_DEVICE", "cuda:0"))
+    parser.add_argument("--stt-input-device", default=os.environ.get("CRIX_STT_INPUT_DEVICE"))
+    parser.add_argument("--stt-lang", default=os.environ.get("CRIX_STT_LANG", "en"))
     args = parser.parse_args()
-    return VoiceSettings(
+    voice = VoiceSettings(
         host=args.host,
         port=args.port,
         engine=args.engine,
@@ -202,6 +314,14 @@ def parse_args() -> VoiceSettings:
         language=args.language,
         mock=bool(args.mock),
     )
+    stt = STTSettings(
+        engine="mock" if args.mock else args.stt_engine,
+        model=args.stt_model,
+        device=args.stt_device,
+        input_device=args.stt_input_device,
+        language=args.stt_lang,
+    )
+    return voice, stt
 
 
 def build_synth(settings: VoiceSettings) -> MockSynth | KokoroSynth:
@@ -224,11 +344,18 @@ async def voices() -> dict[str, Any]:
 async def health() -> dict[str, Any]:
     settings: VoiceSettings | None = getattr(app.state, "settings", None)
     synth = getattr(app.state, "synth", None)
+    stt = getattr(app.state, "stt", None)
+    stt_settings: STTSettings | None = getattr(app.state, "stt_settings", None)
     return {
         "ok": synth is not None,
         "engine": settings.engine if settings else None,
         "model": getattr(synth, "name", None),
         "mock": bool(settings.mock) if settings else None,
+        "stt": {
+            "ok": stt is not None,
+            "engine": stt_settings.engine if stt_settings else None,
+            "model": getattr(stt, "name", None),
+        },
     }
 
 
@@ -278,6 +405,75 @@ async def tts_socket(websocket: WebSocket) -> None:
     finally:
         await queue.put(None)
         worker.cancel()
+
+
+@app.websocket("/stt")
+async def stt_socket(websocket: WebSocket) -> None:
+    """Push-to-talk speech-to-text. The client holds a button/key:
+      listen_start → record the mic   |   listen_stop → transcribe + return text
+      listen_cancel → discard. One utterance at a time; the mic is owned here
+    (server side), so there is no WebView microphone-permission dance."""
+    await websocket.accept()
+    stt = getattr(app.state, "stt", None)
+    stt_settings: STTSettings = app.state.stt_settings
+    await websocket.send_json({
+        "type": "ready",
+        "engine": stt_settings.engine,
+        "model": getattr(stt, "name", None),
+        "available": stt is not None,
+        "mock": stt_settings.engine == "mock",
+    })
+
+    listening = False
+    try:
+        while True:
+            payload = await websocket.receive_json()
+            message_type = payload.get("type")
+
+            if message_type == "listen_start":
+                if stt is None:
+                    await websocket.send_json({"type": "error", "message": "stt engine unavailable"})
+                    continue
+                if listening:
+                    continue
+                try:
+                    await asyncio.to_thread(stt.start)
+                    listening = True
+                    await websocket.send_json({"type": "listening"})
+                except Exception as error:
+                    listening = False
+                    await websocket.send_json({"type": "error", "message": str(error)})
+
+            elif message_type == "listen_stop":
+                if not listening:
+                    continue
+                listening = False
+                await websocket.send_json({"type": "transcribing"})
+                try:
+                    text = await asyncio.to_thread(stt.stop)
+                    await websocket.send_json({"type": "transcript", "text": text})
+                except Exception as error:
+                    await websocket.send_json({"type": "error", "message": str(error)})
+
+            elif message_type == "listen_cancel":
+                if listening and stt is not None:
+                    listening = False
+                    try:
+                        await asyncio.to_thread(stt.cancel)
+                    except Exception:
+                        pass
+                await websocket.send_json({"type": "cancelled"})
+
+            else:
+                await websocket.send_json({"type": "error", "message": f"unknown message type: {message_type}"})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if listening and stt is not None:
+            try:
+                await asyncio.to_thread(stt.cancel)
+            except Exception:
+                pass
 
 
 async def tts_worker(
@@ -341,10 +537,12 @@ def drain_queue(queue: asyncio.Queue[dict[str, Any] | None]) -> None:
 
 
 def main() -> None:
-    settings = parse_args()
-    app.state.settings = settings
-    app.state.synth = build_synth(settings)
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    voice_settings, stt_settings = parse_args()
+    app.state.settings = voice_settings
+    app.state.synth = build_synth(voice_settings)
+    app.state.stt_settings = stt_settings
+    app.state.stt = build_stt(stt_settings)
+    uvicorn.run(app, host=voice_settings.host, port=voice_settings.port)
 
 
 if __name__ == "__main__":

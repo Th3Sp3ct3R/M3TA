@@ -29,6 +29,11 @@
   <input id="text" type="text" value="Systems online. I am Crix, your entity, ready when you are." />
 </div>
 <div id="status" class="meta"></div>
+<div id="micbar" class="bar">
+  <button id="ptt" style="border-color:#37c46b;background:#16331f;color:#cfffe0">🎙 Hold to Talk (STT)</button>
+  <span id="sttStatus" class="meta">STT: connecting…</span>
+  <span id="transcript" class="char" style="flex:1"></span>
+</div>
 <div id="grid" class="grid"></div>
 <script>
 const HTTP = "http://127.0.0.1:8765/voices";
@@ -36,6 +41,30 @@ const WS = "ws://127.0.0.1:8765/tts";
 const speed = document.getElementById("speed");
 const speedv = document.getElementById("speedv");
 speed.oninput = () => (speedv.textContent = Number(speed.value).toFixed(2) + "x");
+
+// ── Push-to-talk STT round-trip (mic is captured server-side by the sidecar) ──
+const STT_WS = "ws://127.0.0.1:8765/stt";
+const ptt = document.getElementById("ptt");
+const sttStatus = document.getElementById("sttStatus");
+const transcript = document.getElementById("transcript");
+let sttWs = null, holding = false;
+function sttConnect() {
+  sttWs = new WebSocket(STT_WS);
+  sttWs.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === "ready") sttStatus.textContent = m.available ? "STT ready · " + (m.model || m.engine) : "STT unavailable";
+    if (m.type === "listening") sttStatus.textContent = "🔴 listening…";
+    if (m.type === "transcribing") sttStatus.textContent = "transcribing…";
+    if (m.type === "transcript") { sttStatus.textContent = "STT ready"; transcript.textContent = m.text || "(no speech detected)"; }
+    if (m.type === "cancelled") sttStatus.textContent = "STT ready";
+    if (m.type === "error") sttStatus.innerHTML = '<span class=err>' + m.message + "</span>";
+  };
+  sttWs.onclose = () => { sttStatus.textContent = "STT disconnected — is the sidecar running?"; sttWs = null; };
+}
+sttConnect();
+function sttSend(o) { if (sttWs && sttWs.readyState === 1) sttWs.send(JSON.stringify(o)); }
+ptt.addEventListener("mousedown", (e) => { e.preventDefault(); if (!sttWs) sttConnect(); holding = true; transcript.textContent = ""; sttSend({ type: "listen_start" }); });
+window.addEventListener("mouseup", () => { if (holding) { holding = false; sttSend({ type: "listen_stop" }); } });
 
 function b64ToUrl(b64, mime) {
   const bin = atob(b64);

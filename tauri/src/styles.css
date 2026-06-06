@@ -5586,6 +5586,23 @@ body,
   background: color-mix(in srgb, var(--accent) 16%, transparent);
 }
 
+/* ── Push-to-talk mic button — pulses red while listening ─────────────────── */
+.composerIconButton.ptt-listening,
+.composerIconButton.ptt-listening.active {
+  color: var(--bad, #ff5c74);
+  border-color: color-mix(in srgb, var(--bad, #ff5c74) 55%, transparent);
+  background: color-mix(in srgb, var(--bad, #ff5c74) 16%, transparent);
+  animation: pttPulse 1s ease-in-out infinite;
+}
+.composerIconButton.ptt-transcribing {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+@keyframes pttPulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--bad, #ff5c74) 45%, transparent); }
+  50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--bad, #ff5c74) 0%, transparent); }
+}
+
 .chatShell .eventAvatar {
   background:
     radial-gradient(circle at 38% 28%, color-mix(in srgb, var(--accent-2) 22%, transparent), transparent 46%),

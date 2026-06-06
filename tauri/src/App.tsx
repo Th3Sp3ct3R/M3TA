@@ -38,6 +38,8 @@ import {
   Trash2,
   Volume2,
   VolumeX,
+  Mic,
+  MicOff,
   Play,
   Wallet,
   Wrench,
@@ -53,6 +55,7 @@ type CornerMode = "rounded" | "square";
 type HeartbeatStatus = "idle" | "active" | "alert" | "dreaming" | "error";
 type DaemonState = "starting" | "running" | "stopped" | "error";
 type VoiceStatus = "off" | "connecting" | "ready" | "speaking" | "error";
+type SttStatus = "off" | "ready" | "listening" | "transcribing" | "error";
 
 interface EvolutionGain {
   target: string;
@@ -527,6 +530,7 @@ const DEFAULT_APPEARANCE: AppearanceSettings = {
 const UI_DEV_MODE = import.meta.env.VITE_CRIX_DEV === "1";
 const VOICE_TTS_ENDPOINT = "ws://127.0.0.1:8765/tts";
 const VOICE_HTTP_ENDPOINT = "http://127.0.0.1:8765/voices";
+const STT_ENDPOINT = "ws://127.0.0.1:8765/stt";
 const VOICE_PREVIEW_TEXT = "Systems online. I am Crix — your entity, ready when you are.";
 // Flush speech in small, natural units so it is spoken as it streams rather than
 // in one block at the end. A clause (comma/clause break) is enough to start; a
@@ -553,6 +557,7 @@ function App() {
   const [webSearchMode, setWebSearchMode] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("off");
+  const [sttStatus, setSttStatus] = useState<SttStatus>("off");
   const [reasoningLevel, setReasoningLevel] = useState<ReasoningLevel>("medium");
   const [reasoningSync, setReasoningSync] = useState<ReasoningSync>("idle");
   const [clockNow, setClockNow] = useState(() => Date.now());
@@ -585,6 +590,9 @@ function App() {
   // The WS callbacks close over this ref so chunks always ship the LATEST chosen
   // voice/speed, even though the socket was opened earlier.
   const voiceSettingsRef = useRef({ voice: appearance.voiceId, speed: appearance.voiceSpeed });
+  const sttSocketRef = useRef<WebSocket | null>(null);
+  const sttHoldingRef = useRef(false);
+  const sttReconnectTimerRef = useRef<number | null>(null);
 
   // Weirdcore +N TARGET pulses — agent evolution telemetry the daemon
   // forwards to us as { type: "lifecycle", event: { type, gain, ... } }.
@@ -671,6 +679,39 @@ function App() {
 
   useEffect(() => {
     void fetchVoiceCatalog();
+  }, []);
+
+  // Push-to-talk: keep the STT socket warm and bind global release/cancel + the
+  // F9 hold-to-talk hotkey (works regardless of focus; no typing conflict).
+  useEffect(() => {
+    openSttSocket();
+    const onMouseUp = () => stopListening();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.code === "F9" && !event.repeat && !event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey) {
+        event.preventDefault();
+        startListening();
+      } else if (event.code === "Escape" && sttHoldingRef.current) {
+        cancelListening();
+      }
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.code === "F9") {
+        event.preventDefault();
+        stopListening();
+      }
+    };
+    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      const socket = sttSocketRef.current;
+      sttSocketRef.current = null;
+      if (sttReconnectTimerRef.current !== null) window.clearTimeout(sttReconnectTimerRef.current);
+      if (socket && socket.readyState !== WebSocket.CLOSED) socket.close();
+    };
   }, []);
 
   useEffect(() => {
@@ -1017,6 +1058,81 @@ function App() {
     };
     preview.onopen = () => preview.send(payload);
     window.setTimeout(() => preview.readyState === WebSocket.OPEN && preview.close(), 12000);
+  }
+
+  // ── Voice input (push-to-talk STT) — the mic is captured server-side by the
+  // sidecar, so there's no WebView microphone-permission prompt. ──────────────
+  function openSttSocket() {
+    const current = sttSocketRef.current;
+    if (current && (current.readyState === WebSocket.OPEN || current.readyState === WebSocket.CONNECTING)) return;
+    if (sttReconnectTimerRef.current !== null) {
+      window.clearTimeout(sttReconnectTimerRef.current);
+      sttReconnectTimerRef.current = null;
+    }
+    const socket = new WebSocket(STT_ENDPOINT);
+    sttSocketRef.current = socket;
+    socket.onmessage = (event) => {
+      if (typeof event.data === "string") handleSttMessage(event.data);
+    };
+    socket.onerror = () => {
+      if (sttSocketRef.current === socket) setSttStatus("error");
+    };
+    socket.onclose = () => {
+      if (sttSocketRef.current !== socket) return;
+      sttSocketRef.current = null;
+      sttHoldingRef.current = false;
+      setSttStatus("off");
+      if (sttReconnectTimerRef.current === null) {
+        sttReconnectTimerRef.current = window.setTimeout(() => {
+          sttReconnectTimerRef.current = null;
+          openSttSocket();
+        }, 2500);
+      }
+    };
+  }
+
+  function handleSttMessage(data: string) {
+    let payload: { type?: string; text?: string; available?: boolean };
+    try {
+      payload = JSON.parse(data) as typeof payload;
+    } catch {
+      return;
+    }
+    if (payload.type === "ready") setSttStatus(payload.available === false ? "error" : "ready");
+    else if (payload.type === "listening") setSttStatus("listening");
+    else if (payload.type === "transcribing") setSttStatus("transcribing");
+    else if (payload.type === "transcript") {
+      setSttStatus("ready");
+      const text = (payload.text ?? "").trim();
+      if (text) setMessage((prev) => (prev.trim() ? `${prev.trimEnd()} ${text}` : text));
+    } else if (payload.type === "cancelled") setSttStatus("ready");
+    else if (payload.type === "error") setSttStatus("error");
+  }
+
+  function startListening() {
+    const socket = sttSocketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      openSttSocket();
+      return;
+    }
+    if (sttHoldingRef.current) return;
+    sttHoldingRef.current = true;
+    if (voiceEnabledRef.current) stopVoicePlayback(); // barge-in + echo guard
+    socket.send(JSON.stringify({ type: "listen_start" }));
+  }
+
+  function stopListening() {
+    if (!sttHoldingRef.current) return;
+    sttHoldingRef.current = false;
+    const socket = sttSocketRef.current;
+    if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "listen_stop" }));
+  }
+
+  function cancelListening() {
+    if (!sttHoldingRef.current) return;
+    sttHoldingRef.current = false;
+    const socket = sttSocketRef.current;
+    if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "listen_cancel" }));
   }
 
   function enqueueVoiceAudio(url: string) {
@@ -1552,8 +1668,11 @@ function App() {
                 onMessage={setMessage}
                 onPermissionDecision={respondToPermission}
                 onSend={sendMessage}
+                onPttStart={startListening}
+                onPttStop={stopListening}
                 onVoiceStop={() => stopVoicePlayback()}
                 onVoiceToggle={toggleVoiceReplies}
+                sttStatus={sttStatus}
                 onWebSearchMode={setWebSearchMode}
                 refEl={transcriptRef}
                 running={running}
@@ -2221,6 +2340,8 @@ function ChatView({
   onAttachmentRemove,
   onMessage,
   onPermissionDecision,
+  onPttStart,
+  onPttStop,
   onSend,
   onVoiceStop,
   onVoiceToggle,
@@ -2230,6 +2351,7 @@ function ChatView({
   stats,
   status,
   liveActivity,
+  sttStatus,
   voiceEnabled,
   voiceStatus,
   webSearchMode,
@@ -2244,6 +2366,8 @@ function ChatView({
   onMessage: (value: string) => void;
   onPermissionDecision: (id: string | undefined, decision: PermissionDecision) => void;
   onSend: (event: React.FormEvent) => void;
+  onPttStart: () => void;
+  onPttStop: () => void;
   onVoiceStop: () => void;
   onVoiceToggle: () => void;
   onWebSearchMode: (value: boolean) => void;
@@ -2252,6 +2376,7 @@ function ChatView({
   stats: ReturnType<typeof collectStats>;
   status: HeartbeatStatus;
   liveActivity: LiveActivity;
+  sttStatus: SttStatus;
   voiceEnabled: boolean;
   voiceStatus: VoiceStatus;
   webSearchMode: boolean;
@@ -2303,6 +2428,11 @@ function ChatView({
               tone={voiceStatus === "error" ? "bad" : voiceStatus === "ready" || voiceStatus === "speaking" ? "ok" : "warn"}
             />
           ) : null}
+          {sttStatus === "listening" || sttStatus === "transcribing" ? (
+            <StatusPill label="Mic" value={sttStatus} tone="ok" />
+          ) : sttStatus === "error" ? (
+            <StatusPill label="Mic" value="offline" tone="bad" />
+          ) : null}
           {attachments.length > 0 ? <StatusPill label="Images" value={String(attachments.length)} tone="ok" /> : null}
         </div>
         {attachments.length > 0 ? (
@@ -2339,6 +2469,17 @@ function ChatView({
               type="button"
             >
               <Globe2 size={18} />
+            </button>
+            <button
+              aria-pressed={sttStatus === "listening"}
+              className={`composerIconButton ptt-${sttStatus}${sttStatus === "listening" ? " active" : ""}`}
+              disabled={sttStatus === "off" || sttStatus === "error"}
+              onMouseDown={(event) => { event.preventDefault(); onPttStart(); }}
+              onMouseUp={onPttStop}
+              title={sttStatus === "off" || sttStatus === "error" ? "Voice input offline — start the voice sidecar (pnpm voice:tts)" : "Hold to talk (or hold F9)"}
+              type="button"
+            >
+              {sttStatus === "off" || sttStatus === "error" ? <MicOff size={18} /> : <Mic size={18} />}
             </button>
             <button
               aria-pressed={voiceEnabled}
