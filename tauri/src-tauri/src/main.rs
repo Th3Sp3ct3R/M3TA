@@ -45,6 +45,13 @@ struct VoiceState {
     child: Mutex<Option<Child>>,
 }
 
+struct CrixRuntime {
+    app_root: PathBuf,
+    cli_entry: PathBuf,
+    node: PathBuf,
+    workspace: PathBuf,
+}
+
 #[derive(Serialize)]
 struct DaemonStatus {
     running: bool,
@@ -185,14 +192,26 @@ fn start_daemon(
     provider: Option<String>,
     model: Option<String>,
 ) -> Result<DaemonStatus, String> {
-    let (root, cli_entry) = resolve_crix_cli().ok_or_else(|| {
-        "Could not find packages/cli/dist/entry.js. Build Crix from the repo before launching the desktop app.".to_string()
+    let runtime = resolve_crix_runtime(Some(&app)).ok_or_else(|| {
+        "Could not find Crix runtime. Rebuild the desktop runtime before launching the app."
+            .to_string()
     })?;
+    fs::create_dir_all(&runtime.workspace)
+        .map_err(|error| format!("failed to create Crix workspace: {error}"))?;
+    if let Some(home) = desktop_crix_home() {
+        fs::create_dir_all(&home)
+            .map_err(|error| format!("failed to create Crix home: {error}"))?;
+    }
 
     let provider = clean_optional(provider);
     let model = clean_optional(model);
-    let mut command = Command::new("node");
-    command.arg(&cli_entry).arg("daemon").arg("--json");
+    let mut command = Command::new(&runtime.node);
+    command
+        .arg(&runtime.cli_entry)
+        .arg("daemon")
+        .arg("--json")
+        .arg("--workspace")
+        .arg(&runtime.workspace);
     if let Some(provider) = provider.as_ref() {
         command.arg("--provider").arg(provider);
     }
@@ -205,8 +224,9 @@ fn start_daemon(
     }
 
     let mut child = command
-        .current_dir(&root)
+        .current_dir(&runtime.workspace)
         .env("CRIX_AGENT_ENABLED", "1")
+        .env("CRIX_HOME", desktop_crix_home_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -228,7 +248,7 @@ fn start_daemon(
 
     {
         let mut root_state = state.root.lock().map_err(|_| "daemon root lock failed")?;
-        *root_state = Some(root.clone());
+        *root_state = Some(runtime.workspace.clone());
     }
     {
         let mut provider_state = state
@@ -269,7 +289,7 @@ fn start_daemon(
         state,
         json!({
             "type": "desktop_daemon_started",
-            "root": root.display().to_string(),
+            "root": runtime.workspace.display().to_string(),
             "provider": provider,
             "model": model
         }),
@@ -277,7 +297,7 @@ fn start_daemon(
 
     Ok(DaemonStatus {
         running: true,
-        root: Some(root.display().to_string()),
+        root: Some(runtime.workspace.display().to_string()),
         provider,
         model,
     })
@@ -301,6 +321,27 @@ fn crix_set_reasoning(level: String, state: State<DaemonState>) -> Result<(), St
     }
 
     write_daemon_command(state.inner(), json!({ "type": "reasoning", "level": level }))
+}
+
+#[tauri::command]
+fn crix_set_routing(routing: Value, state: State<DaemonState>) -> Result<(), String> {
+    // The owner's per-lane model assignments. Passed through verbatim; the
+    // daemon resolves it against @crix/core resolveRoute() on the live turn.
+    write_daemon_command(state.inner(), json!({ "type": "routing", "routing": routing }))
+}
+
+#[tauri::command]
+fn crix_set_openrouter_key(
+    key: String,
+    model: Option<String>,
+    state: State<DaemonState>,
+) -> Result<(), String> {
+    // The owner's OpenRouter API key (pasted in-app). Persisted to ui.json by
+    // the daemon; applied when the daemon next starts on the openrouter provider.
+    write_daemon_command(
+        state.inner(),
+        json!({ "type": "openrouter_key", "key": key, "model": model }),
+    )
 }
 
 #[tauri::command]
@@ -440,21 +481,21 @@ fn voice_python(root: &Path) -> std::ffi::OsString {
 /// Spawn voice_service/server.py headlessly. Best-effort: if Python / the venv /
 /// the script is missing, or the port is already taken by a manual sidecar, the
 /// child simply exits and chat is unaffected.
-fn start_voice_sidecar(state: &VoiceState) {
+fn start_voice_sidecar(app: &tauri::AppHandle, state: &VoiceState) {
     if let Ok(guard) = state.child.lock() {
         if guard.is_some() {
             return;
         }
     }
-    let Some((root, _)) = resolve_crix_cli() else {
+    let Some(runtime) = resolve_crix_runtime(Some(app)) else {
         return;
     };
-    let script = root.join("voice_service").join("server.py");
+    let script = runtime.app_root.join("voice_service").join("server.py");
     if !script.exists() {
         return;
     }
-    let mut command = Command::new(voice_python(&root));
-    command.arg(&script).current_dir(&root);
+    let mut command = Command::new(voice_python(&runtime.app_root));
+    command.arg(&script).current_dir(&runtime.app_root);
     #[cfg(windows)]
     {
         command.creation_flags(CREATE_NO_WINDOW);
@@ -501,7 +542,7 @@ fn main() {
             }
             // Auto-start the local voice sidecar so spoken replies work out of the box.
             if let Some(voice) = app.try_state::<VoiceState>() {
-                start_voice_sidecar(voice.inner());
+                start_voice_sidecar(&handle, voice.inner());
             }
             app.listen("tauri://close-requested", move |_| {
                 if let Some(state) = handle.try_state::<DaemonState>() {
@@ -534,6 +575,8 @@ fn main() {
             crix_restart_daemon,
             crix_send,
             crix_set_reasoning,
+            crix_set_routing,
+            crix_set_openrouter_key,
             crix_permission_response,
             crix_stop_daemon,
             crix_window_minimize,
@@ -733,16 +776,8 @@ fn load_agent_identity() -> AgentIdentity {
     if let Ok(home) = env::var("CRIX_HOME") {
         candidates.push(PathBuf::from(home).join("IDENTITY.md"));
     }
-    if let Some((root, _)) = resolve_crix_cli() {
-        candidates.push(root.join("IDENTITY.md"));
-        candidates.push(root.join(".crix").join("IDENTITY.md"));
-    }
-    if let Ok(current) = env::current_dir() {
-        candidates.push(current.join("IDENTITY.md"));
-        candidates.push(current.join(".crix").join("IDENTITY.md"));
-    }
-    if let Some(home) = user_home_dir() {
-        candidates.push(home.join(".crix").join("IDENTITY.md"));
+    if let Some(home) = desktop_crix_home() {
+        candidates.push(home.join("IDENTITY.md"));
     }
 
     for path in candidates {
@@ -767,14 +802,8 @@ fn load_self_model() -> Option<Value> {
     if let Ok(home) = env::var("CRIX_HOME") {
         candidates.push(PathBuf::from(home).join("self").join("model.json"));
     }
-    if let Some((root, _)) = resolve_crix_cli() {
-        candidates.push(root.join(".crix").join("self").join("model.json"));
-    }
-    if let Ok(current) = env::current_dir() {
-        candidates.push(current.join(".crix").join("self").join("model.json"));
-    }
-    if let Some(home) = user_home_dir() {
-        candidates.push(home.join(".crix").join("self").join("model.json"));
+    if let Some(home) = desktop_crix_home() {
+        candidates.push(home.join("self").join("model.json"));
     }
 
     for path in candidates {
@@ -925,8 +954,6 @@ fn ollama_model_roots() -> Vec<PathBuf> {
     if let Ok(value) = env::var("OLLAMA_MODELS") {
         push_model_root(&mut roots, PathBuf::from(value));
     }
-    push_model_root(&mut roots, PathBuf::from(r"D:\ollama\models"));
-    push_model_root(&mut roots, PathBuf::from(r"D:\ollama"));
     if let Ok(profile) = env::var("USERPROFILE") {
         push_model_root(
             &mut roots,
@@ -1204,7 +1231,13 @@ fn http_json(
     serde_json::from_str(body).map_err(|error| format!("invalid Ollama JSON: {error}"))
 }
 
-fn resolve_crix_cli() -> Option<(PathBuf, PathBuf)> {
+fn resolve_crix_runtime(app: Option<&tauri::AppHandle>) -> Option<CrixRuntime> {
+    if let Some(app) = app {
+        if let Some(runtime) = bundled_runtime(app) {
+            return Some(runtime);
+        }
+    }
+
     if let Ok(root) = env::var("CRIX_ROOT") {
         if let Some(found) = cli_in_root(Path::new(&root)) {
             return Some(found);
@@ -1232,15 +1265,84 @@ fn resolve_crix_cli() -> Option<(PathBuf, PathBuf)> {
     None
 }
 
-fn cli_in_root(root: &Path) -> Option<(PathBuf, PathBuf)> {
+fn bundled_runtime(app: &tauri::AppHandle) -> Option<CrixRuntime> {
+    let root = app.path().resource_dir().ok()?.join("runtime");
+    let cli = root.join("cli").join("crix-cli.mjs");
+    let node = root
+        .join("bin")
+        .join(if cfg!(windows) { "node.exe" } else { "node" });
+    if cli.exists() && node.exists() {
+        return Some(CrixRuntime {
+            app_root: root,
+            cli_entry: cli,
+            node,
+            workspace: desktop_workspace_dir(),
+        });
+    }
+    None
+}
+
+fn cli_in_root(root: &Path) -> Option<CrixRuntime> {
     let cli = root
         .join("packages")
         .join("cli")
         .join("dist")
         .join("entry.js");
     if cli.exists() {
-        Some((root.to_path_buf(), cli))
+        Some(CrixRuntime {
+            app_root: root.to_path_buf(),
+            cli_entry: cli,
+            node: PathBuf::from("node"),
+            workspace: env::var("CRIX_WORKSPACE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| root.to_path_buf()),
+        })
     } else {
         None
     }
+}
+
+fn desktop_workspace_dir() -> PathBuf {
+    if let Ok(value) = env::var("CRIX_WORKSPACE") {
+        return PathBuf::from(value);
+    }
+    user_desktop_dir()
+        .unwrap_or_else(|| user_home_dir().unwrap_or_else(|| PathBuf::from(".")))
+        .join("Crix Workspace")
+}
+
+fn desktop_crix_home() -> Option<PathBuf> {
+    if let Ok(value) = env::var("CRIX_HOME") {
+        return Some(PathBuf::from(value));
+    }
+    user_config_dir()
+        .or_else(|| user_home_dir().map(|home| home.join(".config")))
+        .map(|dir| dir.join("Crix").join("home"))
+}
+
+fn desktop_crix_home_string() -> String {
+    desktop_crix_home()
+        .unwrap_or_else(|| PathBuf::from(".crix-home"))
+        .display()
+        .to_string()
+}
+
+fn user_desktop_dir() -> Option<PathBuf> {
+    user_home_dir().map(|home| home.join("Desktop"))
+}
+
+fn user_config_dir() -> Option<PathBuf> {
+    if let Ok(value) = env::var("APPDATA") {
+        return Some(PathBuf::from(value));
+    }
+    if let Ok(value) = env::var("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(value));
+    }
+    user_home_dir().map(|home| {
+        if cfg!(target_os = "macos") {
+            home.join("Library").join("Application Support")
+        } else {
+            home.join(".config")
+        }
+    })
 }

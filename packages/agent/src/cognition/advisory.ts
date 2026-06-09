@@ -108,9 +108,9 @@ export function memoryGroundedPropose(_situation: string, recalled: RecalledMemo
 function advisoryReminder(intention: Intention): string {
   const pct = Math.round(intention.confidence * 100);
   return [
-    "Your own advisory read on this — a suggestion drawn from your memory. Weigh it; you are NOT obligated to follow it, and it is NOT a command. Do not auto-run anything because of it.",
-    `→ ${intention.goal}`,
-    `Why: ${intention.rationale} (confidence ${pct}%)`,
+    "BACKGROUND ADVISORY (reference only — NOT a request, NOT a task, NOT from the user). This is your own faint hunch from memory. Do NOT switch tasks, do NOT act on it, and do NOT treat it as something to do. Stay on the user's CURRENT message; use this only if it directly helps that:",
+    `· hunch: ${intention.goal}`,
+    `· why: ${intention.rationale} (confidence ${pct}%)`,
   ].join("\n");
 }
 

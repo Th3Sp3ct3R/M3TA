@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tauri dev",
     "dev:vite": "vite --host 127.0.0.1 --port 1420",
-    "build": "tauri build",
+    "build": "pnpm build:runtime && tauri build --bundles nsis",
+    "build:runtime": "node ../scripts/package-tauri-runtime.mjs",
     "build:web": "vite build"
   },
   "dependencies": {

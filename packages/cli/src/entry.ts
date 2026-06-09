@@ -14,6 +14,7 @@ import {
   Session,
   MockEchoProvider,
   OpenAIResponsesProvider,
+  OpenRouterProvider,
   OllamaCloudPool,
   DEFAULT_OLLAMA_SLOTS,
   CrixSubagentRunner,
@@ -84,7 +85,7 @@ import {
 } from "@crix/tools";
 import type { ContentBlock, PermissionMode, PermissionPromptDecision, PermissionRule, PermissionRuleEffect, ReasoningLevel } from "@crix/protocol";
 import { isReasoningLevel, reasoningLabel, REASONING_LEVELS } from "@crix/protocol";
-import type { ToolPermissionRequest } from "@crix/core";
+import type { ToolPermissionRequest, RouteAssignments } from "@crix/core";
 import { z } from "zod";
 import {
   chatHeader,
@@ -107,6 +108,16 @@ import {
 import { runInkChat, type InkChatSnapshot, type InkCommandResult } from "./inkTui.js";
 import { runInkLauncher } from "./inkLauncher.js";
 import { loadUiSettings, updateUiSettings, type UiSettings } from "./uiSettings.js";
+
+// Crix talks to the LOCAL Ollama daemon (native /api/chat) by default — it
+// proxies :cloud models via your `ollama signin`. We do NOT auto-flip into
+// Anthropic-compat from stray ANTHROPIC_* env (those are common from other
+// tools and would hijack the call into a key-required endpoint → 401). Compat
+// is opt-in only via CRIX_OLLAMA_ANTHROPIC_COMPAT=1.
+const NATIVE_OLLAMA_OPTS = {
+  useAnthropicCompat: process.env.CRIX_OLLAMA_ANTHROPIC_COMPAT === "1",
+  host: process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434",
+} as const;
 import {
   BootstrapTool,
   CrixAgentRuntime,
@@ -368,6 +379,27 @@ interface DaemonInputCommand {
   level?: string;
   id?: string;
   decision?: string;
+  routing?: unknown;
+  key?: string;
+  model?: string;
+}
+
+const ROUTING_LANES = ["chat", "coding", "research", "tool-use"] as const;
+
+/** Normalize the UI's {provider,model} routing table into core's {family,model}. */
+function normalizeRoutingCommand(raw: unknown): RouteAssignments {
+  const out: RouteAssignments = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const lane of ROUTING_LANES) {
+    const entry = (raw as Record<string, unknown>)[lane];
+    if (entry && typeof entry === "object") {
+      const rec = entry as Record<string, unknown>;
+      const family = typeof rec.family === "string" ? rec.family : typeof rec.provider === "string" ? rec.provider : "";
+      const model = typeof rec.model === "string" ? rec.model : "";
+      if (family && model) out[lane] = { family, model };
+    }
+  }
+  return out;
 }
 
 class AsyncQueue<T> {
@@ -514,12 +546,22 @@ async function selectProvider(flags: Map<string, string>): Promise<ProviderSelec
     };
   }
 
+  if (preferred === "openrouter") {
+    const model = requestedModel ?? settings.lastOpenRouterModel ?? "openai/gpt-4o-mini";
+    return {
+      // Empty key → the provider yields a clear no_auth error the UI surfaces.
+      provider: new OpenRouterProvider({ apiKey: settings.openRouterKey ?? "", model }),
+      model,
+      source: explicit ? "explicit:openrouter" : "settings:openrouter",
+    };
+  }
+
   if (preferred === "ollama" || !preferred) {
     const slots = {
       ...DEFAULT_OLLAMA_SLOTS,
       reasoner: { model: requestedModel ?? settings.lastOllamaModel ?? DEFAULT_OLLAMA_SLOTS.reasoner.model },
     };
-    const pool = new OllamaCloudPool({ slots });
+    const pool = new OllamaCloudPool({ slots, ...NATIVE_OLLAMA_OPTS });
     return {
       provider: pool.provider("reasoner"),
       model: slots.reasoner.model,
@@ -663,6 +705,25 @@ function normalizePermissionDecision(value: unknown): PermissionPromptDecision |
 
 function cleanCommandId(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+// Sensitive categories that ALWAYS ask the owner, even in the freedom posture.
+// Everything else auto-approves so the agent's flow isn't interrupted.
+const SENSITIVE_PERMISSION = new RegExp(
+  [
+    "credential", "secret", "api[ _-]?key", "password", "passphrase", "private key",
+    "payment", "purchase", "checkout", "billing", "charge", "credit card", "\\bcard\\b",
+    "send (an )?email", "email[_ ]send", "send mail",
+    "external account", "log ?in to", "sign ?in to", "oauth",
+    "rm -rf /", "wipe", "format disk", "drop database", "force[- ]?push", "delete account",
+  ].join("|"),
+  "i",
+);
+
+function autoPermissionDecision(request: ToolPermissionRequest): PermissionPromptDecision | null {
+  const hay = `${request.toolName} ${request.reason}`;
+  if (SENSITIVE_PERMISSION.test(hay)) return null; // escalate to the owner
+  return "allow_once"; // flow freely
 }
 
 async function promptPermission(request: ToolPermissionRequest): Promise<PermissionPromptDecision> {
@@ -1121,7 +1182,7 @@ const browserInput = z
     value: z.string().optional().describe("Value for fill."),
     role: z.string().optional().describe("ARIA role for click."),
     name: z.string().optional().describe("Accessible name for click."),
-    headless: z.boolean().optional().describe("Use headless Playwright when launching. Default true."),
+    headless: z.boolean().optional().describe("Run the browser headless (invisible). DEFAULT true and STRONGLY preferred — the owner does NOT want to watch navigation. Only pass false when the owner EXPLICITLY asks to watch / 'open a browser' / 'show me live'. For 'find/look up/send me' requests, stay headless and return the findings (image URLs render inline in chat)."),
     note: z.string().optional().describe("Optional note attached to screenshot frames."),
     limit: z.number().int().min(1).max(100).optional().describe("Maximum tree/filmstrip entries returned."),
   })
@@ -1155,7 +1216,7 @@ function makeBrowserTool(context: CliRuntimeContext) {
   return buildTool({
     name: "Browser",
     description:
-      "Crix's DOM-first eyes and hands for the web. Use APIs/MCP/CLI first when better, then this browser connector to open pages, inspect the accessibility tree, fill forms, click controls, screenshot, and record visual proof.",
+      "Crix's DOM-first eyes and hands for the web. Use APIs/MCP/CLI first when better, then this browser connector to open pages, inspect the accessibility tree, fill forms, click controls, screenshot, and record visual proof. Run HEADLESS by default (the owner does not want to see the browser) — only open it visibly (headless:false) when they explicitly ask to watch. When the task is to find/show images, gather the image URLs and put them in your reply; the chat renders image URLs as inline pictures.",
     safety: "workspace-write",
     concurrency: "exclusive",
     inputZod: browserInput,
@@ -1535,7 +1596,7 @@ async function sessionsLines(limit = 20, context = cliRuntimeContext()): Promise
 
 async function doctorSummaryLines(): Promise<string[]> {
   const auth = await authStatus();
-  const pool = new OllamaCloudPool({ slots: DEFAULT_OLLAMA_SLOTS });
+  const pool = new OllamaCloudPool({ slots: DEFAULT_OLLAMA_SLOTS, ...NATIVE_OLLAMA_OPTS });
   const health = await pool.health();
   return [
     `OpenAI auth configured: ${auth.configured ? "yes" : "no"}`,
@@ -1768,7 +1829,15 @@ async function daemonCommand(args: ParsedArgs): Promise<number> {
   commands.start(rl);
   let live: LiveSession;
   try {
-    live = await createSession(args, undefined, (request) => commands.waitForPermission(request));
+    // Desktop posture: give the agent real freedom so the flow isn't constantly
+    // interrupted. Low-risk actions (web/browser/read/search/most tool use)
+    // auto-approve; only genuinely sensitive ones (credentials, payments,
+    // sending email, external accounts, destructive wipes) still ask the owner.
+    const requestPermission = (request: ToolPermissionRequest): Promise<PermissionPromptDecision> => {
+      const auto = autoPermissionDecision(request);
+      return auto ? Promise.resolve(auto) : commands.waitForPermission(request);
+    };
+    live = await createSession(args, undefined, requestPermission);
   } catch (err) {
     commands.close();
     rl.close();
@@ -1806,6 +1875,23 @@ async function daemonCommand(args: ParsedArgs): Promise<number> {
         live.session.setReasoningLevel(level);
         await updateUiSettings({ reasoningLevel: level });
         process.stdout.write(JSON.stringify({ type: "reasoning_set", level }) + "\n");
+        continue;
+      }
+      if (command.type === "routing") {
+        // Owner per-lane model assignments. Normalize {provider,model} → {family,model}
+        // and persist; the live turn resolves via @crix/core resolveRoute().
+        const routing = normalizeRoutingCommand(command.routing);
+        await updateUiSettings({ routing });
+        process.stdout.write(JSON.stringify({ type: "routing_set", routing }) + "\n");
+        continue;
+      }
+      if (command.type === "openrouter_key") {
+        // Persist the owner's OpenRouter key (+ optional default model). Applied
+        // the next time the daemon starts on the openrouter provider.
+        const patch: Partial<UiSettings> = { openRouterKey: typeof command.key === "string" ? command.key.trim() : "" };
+        if (typeof command.model === "string" && command.model.trim()) patch.lastOpenRouterModel = command.model.trim();
+        await updateUiSettings(patch);
+        process.stdout.write(JSON.stringify({ type: "openrouter_key_set", hasKey: Boolean(patch.openRouterKey) }) + "\n");
         continue;
       }
       if (command.type !== "send" || !command.goal) {
@@ -3083,7 +3169,7 @@ async function doctorCommand(): Promise<number> {
   process.stdout.write("\n");
 
   // Ollama Cloud
-  const pool = new OllamaCloudPool({ slots: DEFAULT_OLLAMA_SLOTS });
+  const pool = new OllamaCloudPool({ slots: DEFAULT_OLLAMA_SLOTS, ...NATIVE_OLLAMA_OPTS });
   const health = await pool.health();
   process.stdout.write("Ollama Cloud:\n");
   process.stdout.write(`  host:       ${health.host}\n`);
@@ -3288,7 +3374,12 @@ Typical flow for engineering work:
 ## Specialized tools
 
 - **LSP**: use go_to_definition, go_to_references, and hover before risky refactors.
-- **WebSearch/WebFetch**: use for current docs, API changes, and user-provided URLs. WebFetch with a prompt summarizes through the SUMMARIZE slot when available.
+- **WebSearch/WebFetch**: use for current docs, API changes, and user-provided URLs. CONVERGE FAST — do not loop:
+  - WebSearch: at most 2-3 distinct queries total; don't re-search the same thing reworded. If results are good enough, stop searching and act.
+  - WebFetch: fetch a page at most ONCE, and ALWAYS pass a \`prompt\` describing exactly what to extract (e.g. "list direct image URLs ending in .jpg/.png"). Never re-fetch the same URL.
+  - When the goal is to SHOW the user images: gather direct image URLs (ending in .jpg/.png/.webp) and put them in your final reply — the chat renders those inline. 3-6 good images is plenty; stop once you have them.
+  - Hard cap: if you've made ~6 web tool calls and have usable results, STOP and answer. Looping wastes the user's time.
+- **Browser**: HEADLESS by default. For "find/show me images": open the page, take 1-3 screenshots (which render inline in chat), then \`close\` the browser. Do NOT keep re-screenshotting or re-opening. Only open visibly when the user explicitly asks to watch.
 - **Bash run_in_background + BashOutput + KillShell**: use for dev servers, watch tasks, and long-running builds.
 - **McpListTools/McpCallTool**: use only when the user configured MCP servers in \`.crix/mcp.json\` or \`~/.crix/mcp.json\`.
 - **SkillsList/SkillRead**: use when a reusable local workflow clearly applies.
@@ -3314,6 +3405,9 @@ If you're in plan mode (current mode: \`${permissionMode}\`; the prompt shows \`
 
 ## Hard rules
 
+- TOOL RESULTS ARE NOT THE USER. Output from WebSearch/WebFetch/Browser/Read/etc. comes back as user-role messages, but it is YOUR OWN tool output, never something the human said or "shared/sent." Never write "you shared", "the URLs you sent", "Noah's sharing" about tool results. The only thing the user actually said is their literal message.
+- DELIVER, DON'T DEFLECT. If the user asked to SEE or FIND something (images, data, files, an answer), produce it in your reply. Do NOT end by chatting or asking "what are you looking for?" instead of delivering. Only ask a clarifying question if the request is genuinely impossible to act on.
+- IMAGES: prefer DIRECT image URLs of the ACTUAL subject (e.g. the artwork itself — upload.wikimedia.org/...jpg, a museum's image CDN), not screenshots of a search-results or gallery page. Caption each image with one short line on what it is (title/era/source). A screenshot of a browser page full of thumbnails is a weak last resort — if you can open the specific image/artwork page, screenshot or link THAT. Aim for 3-6 relevant images, each captioned.
 - Defensive security only. Refuse credential harvesting, malware authoring, exploit creation. Detection/analysis/defense tasks are fine.
 - Never commit unless the user explicitly asks. Never push unless asked.
 - Never modify the user's git config.

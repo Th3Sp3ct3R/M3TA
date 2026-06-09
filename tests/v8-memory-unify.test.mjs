@@ -79,7 +79,7 @@ test("unified recall merges living + vector memory and dedupes overlap", async (
   assert.equal(out.sources.vector, 1);
   assert.ok(out.reminder.includes("Shared installer lesson"));
   assert.ok(out.reminder.includes("<- "), "association marker is preserved in the block");
-  assert.equal(out.reminder.split("Recalled from your memory").length, 2, "exactly ONE reminder block");
+  assert.equal(out.reminder.split("BACKGROUND MEMORY from earlier").length, 2, "exactly ONE reminder block");
 });
 
 test("unified recall works from living memory alone when no v4 store is given", async () => {

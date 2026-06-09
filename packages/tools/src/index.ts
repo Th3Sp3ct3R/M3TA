@@ -7,6 +7,7 @@ export { ReadTool } from "./Read.js";
 export { WriteTool } from "./Write.js";
 export { EditTool } from "./Edit.js";
 export { ApplyIntentTool, type ApplyIntentOutput } from "./ApplyIntent.js";
+export { safeOverwrite, assessShrink, type SafeOverwriteOptions, type SafeOverwriteResult, type ShrinkVerdict } from "./safeWrite.js";
 export { GlobTool } from "./Glob.js";
 export { GrepTool } from "./Grep.js";
 export { BashTool } from "./Bash.js";

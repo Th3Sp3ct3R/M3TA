@@ -462,6 +462,23 @@ export class QueryEngine {
         createdAt: new Date().toISOString(),
       });
 
+      // Convergence guard: after a soft cap of tool rounds, force the model to
+      // stop gathering and answer with what it has. Weak models otherwise loop
+      // (re-searching/re-fetching) and never deliver. Fires once.
+      const softCap = Math.min(12, maxIters - 1);
+      if (iter + 1 === softCap) {
+        this.messages.push({
+          id: cryptoId(),
+          role: "user",
+          content: [{
+            type: "system_reminder",
+            text: "You've gathered plenty — STOP calling tools now and write your final answer with what you already have. If the user asked to SEE images, include the image URLs / screenshots you already captured. Do not start new searches, fetches, or browser actions.",
+          }],
+          createdAt: new Date().toISOString(),
+        });
+        yield { type: "system_reminder_injected", text: "convergence: wrap up and answer now", source: "instructions" };
+      }
+
       // Loop continues: provider will see the new tool_result message.
       void stopReason; // tracked for telemetry; not used to break the loop
     }

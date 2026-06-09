@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { crixHome } from "@crix/core";
 import type { ReasoningLevel } from "@crix/protocol";
+import type { RouteAssignments } from "@crix/core";
 import type { ThemeName } from "./terminalUi.js";
 
 export interface UiSettings {
@@ -14,6 +15,12 @@ export interface UiSettings {
   dangerousBypass?: boolean;
   /** Owner-selected reasoning dial (low→max). Applies across providers. */
   reasoningLevel?: ReasoningLevel;
+  /** Owner-assigned per-lane model routing (chat/coding/research/tool-use). */
+  routing?: RouteAssignments;
+  /** OpenRouter API key (owner-pasted in-app). Bearer auth for openrouter.ai. */
+  openRouterKey?: string;
+  /** Last OpenRouter model id the owner selected. */
+  lastOpenRouterModel?: string;
 }
 
 export function uiSettingsPath(): string {

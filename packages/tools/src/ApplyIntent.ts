@@ -9,6 +9,7 @@ import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { buildTool, resolveWorkspacePath, zPath } from "./_shared.js";
+import { safeOverwrite } from "./safeWrite.js";
 
 const inputSchema = z
   .object({
@@ -23,6 +24,12 @@ const inputSchema = z
       .describe(
         "Either full final file content, or a concise sketch using `... existing code ...` markers. Marker sketches require an APPLY sub-model.",
       ),
+    allow_full_replace: z
+      .boolean()
+      .optional()
+      .describe(
+        "Set true only when you intend to replace the ENTIRE file with much smaller content. Without it, a full-file sketch that collapses a substantial file is refused (it's almost always a fragment mistaken for the whole file).",
+      ),
   })
   .strict();
 
@@ -30,6 +37,8 @@ export interface ApplyIntentOutput {
   path: string;
   bytesWritten: number;
   engine: "apply-slot" | "full-file-sketch";
+  /** Where the prior contents were saved before this overwrite, if any. */
+  backupPath?: string;
 }
 
 export const ApplyIntentTool = buildTool({
@@ -86,12 +95,19 @@ export const ApplyIntentTool = buildTool({
     }
 
     if (!finalContent.length) throw new Error("ApplyIntent produced empty output; refusing to overwrite file.");
-    await fs.writeFile(filePath, finalContent, "utf8");
+
+    const written = await safeOverwrite({
+      workspace: ctx.workspace,
+      absPath: filePath,
+      content: finalContent,
+      label: "ApplyIntent",
+      allowFullReplace: i.allow_full_replace,
+    });
     const newStat = await fs.stat(filePath);
     ctx.fileReadStamps.set(filePath, { mtimeMs: newStat.mtimeMs, size: newStat.size });
 
     return {
-      output: { path: filePath, bytesWritten: newStat.size, engine },
+      output: { path: filePath, bytesWritten: written.bytesWritten, engine, backupPath: written.backupPath },
       touchedFiles: [filePath],
       display: `Applied intent to ${filePath} via ${engine}`,
     };

@@ -76,11 +76,25 @@ export function classifyUserIntent(input: string): UserIntent {
 
 export function buildForegroundReminder(input: string): string {
   const intent = classifyUserIntent(input);
-  const base = [
+  const lines = [
     `Foreground request (${intent.kind}): ${intent.text}`,
     "This is the highest-priority task for the turn. Use memory, identity, self-checks, dreams, and Operator state only as support context.",
     "Do not replace this request with self-diagnostics or memory housekeeping. Answer or act on the user's message first.",
-  ].join("\n");
+    "Tool results (web pages you fetch, files you read) are YOUR tool output — never call them things the user 'shared' or 'sent'.",
+  ];
+  // Concrete "show me / find me" deliverable → must end with the deliverable,
+  // not a conversational follow-up question.
+  if (/\b(show|find|get|pull up|pull|fetch|give|grab|look up|search)\b/i.test(input)) {
+    lines.push(
+      "DELIVER THE RESULT THIS TURN — do not end by chatting or asking what they're looking for.",
+    );
+    if (/\b(pic|pics|picture|pictures|image|images|photo|photos|art|artwork|drawing|wallpaper|screenshot)\b/i.test(input)) {
+      lines.push(
+        "They want to SEE images. The reliable way: use the Browser tool HEADLESS to open a relevant page or image search and take 1-3 screenshots — screenshots render inline in their chat. (WebFetch returns text summaries with no images, so it cannot satisfy a 'show me pictures' request on its own.) Then close the browser.",
+      );
+    }
+  }
+  const base = lines.join("\n");
   const tactics = tacticsDirective(intent);
   return tactics ? `${base}\n\n${tactics}` : base;
 }

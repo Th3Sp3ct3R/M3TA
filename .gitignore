@@ -50,6 +50,7 @@ tauri/target-*.png
 # Tauri build outputs
 tauri/src-tauri/target/
 tauri/src-tauri/gen/
+tauri/src-tauri/runtime/
 tauri/dist/
 
 # Local research/scratch

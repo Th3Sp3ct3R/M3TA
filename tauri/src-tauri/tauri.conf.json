@@ -1,6 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Crix",
+  "mainBinaryName": "Crix",
   "version": "0.4.0-alpha.1",
   "identifier": "dev.crix.app",
   "build": {
@@ -9,7 +10,33 @@
     "beforeBuildCommand": "pnpm build:web",
     "frontendDist": "../dist"
   },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "resources": {
+      "runtime/": "runtime/"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "compression": "lzma",
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "nsis-hooks.nsh"
+      }
+    }
+  },
   "app": {
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: asset: http://asset.localhost; media-src 'self' data: asset: http://asset.localhost; connect-src ipc: http://ipc.localhost http://127.0.0.1:8765 ws://127.0.0.1:8765 https: http:",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$HOME/.crix/**", "$APPDATA/Crix/**", "$HOME/Desktop/Crix Workspace/**"]
+      }
+    },
     "windows": [
       {
         "title": "Crix",
@@ -18,7 +45,7 @@
         "minWidth": 1040,
         "minHeight": 680,
         "decorations": false,
-        "transparent": true,
+        "transparent": false,
         "shadow": true
       }
     ]

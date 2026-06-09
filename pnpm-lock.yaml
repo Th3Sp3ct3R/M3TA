@@ -14,6 +14,9 @@ importers:
       '@types/react':
         specifier: ^19.2.15
         version: 19.2.15
+      esbuild:
+        specifier: 0.27.7
+        version: 0.27.7
       typescript:
         specifier: ^5.7.0
         version: 5.9.3

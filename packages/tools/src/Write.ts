@@ -7,11 +7,18 @@ import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { buildTool, resolveWorkspacePath, zPath } from "./_shared.js";
+import { safeOverwrite } from "./safeWrite.js";
 
 const inputSchema = z
   .object({
     file_path: zPath,
     content: z.string().describe("Full file contents to write. Replaces any existing file."),
+    allow_full_replace: z
+      .boolean()
+      .optional()
+      .describe(
+        "Set true only when you intend to collapse a substantial existing file to much smaller content. Without it, such a shrink is refused as a likely fragment.",
+      ),
   })
   .strict();
 
@@ -19,6 +26,8 @@ export interface WriteOutput {
   path: string;
   created: boolean;
   bytesWritten: number;
+  /** Where the prior contents were saved before this overwrite, if any. */
+  backupPath?: string;
 }
 
 export const WriteTool = buildTool({
@@ -48,12 +57,17 @@ export const WriteTool = buildTool({
     if (existed && !ctx.fileReadStamps.has(filePath)) {
       throw new Error(`${filePath} exists; Read it before overwriting so you've seen the current contents.`);
     }
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(filePath, i.content, "utf8");
+    const written = await safeOverwrite({
+      workspace: ctx.workspace,
+      absPath: filePath,
+      content: i.content,
+      label: "Write",
+      allowFullReplace: i.allow_full_replace,
+    });
     const stat = await fs.stat(filePath);
     ctx.fileReadStamps.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size });
     return {
-      output: { path: filePath, created: !existed, bytesWritten: stat.size },
+      output: { path: filePath, created: written.created, bytesWritten: written.bytesWritten, backupPath: written.backupPath },
       touchedFiles: [filePath],
       display: existed ? `Updated ${filePath}` : `Created ${filePath}`,
     };

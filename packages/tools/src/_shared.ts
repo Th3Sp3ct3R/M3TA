@@ -234,8 +234,9 @@ export async function resolveWorkspacePath(
     // Unleashed (bypass): the owner runs Crix on their own machine and points it
     // wherever they like (their Desktop, home dir, another repo). No
     // out-of-workspace permission ritual — that's exactly the friction the owner
-    // posture drops. Pre-write undo checkpoints + the effects ledger still record
-    // every write, so it stays reversible.
+    // posture drops. Workspace checkpoints only cover files under the workspace,
+    // so out-of-workspace targets rely on safeOverwrite's per-file pre-write
+    // backup (.crix/backups) to stay reversible — plus the effects ledger.
     if (ctx.permissionMode === "bypass") return candidate;
     if (!ctx.requestPermission) {
       throw permissionDenied(`${label} escapes workspace and no permission prompt is available: ${candidate}`);

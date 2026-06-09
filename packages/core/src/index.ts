@@ -105,12 +105,28 @@ export {
   type OllamaCloudModel,
 } from "./providers/ollamaCloud.js";
 
+export {
+  OpenRouterProvider,
+  fetchOpenRouterModels,
+  OPENROUTER_BASE_URL,
+  type OpenRouterProviderOptions,
+  type OpenRouterModel,
+} from "./providers/openrouter.js";
+
 export { buildPromptCacheKey, type PromptCacheKey } from "./promptCache.js";
 
 export {
   routeModel,
+  resolveRoute,
+  laneForTask,
+  classifyLane,
   taskDefaults,
+  ROUTE_LANES,
   DEFAULT_PROVIDER_PROFILES,
+  type RouteLane,
+  type RouteAssignment,
+  type RouteAssignments,
+  type ResolvedRoute,
   type ModelTask,
   type ModelTaskKind,
   type ModelRoute,

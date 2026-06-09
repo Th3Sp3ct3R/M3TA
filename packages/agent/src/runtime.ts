@@ -72,7 +72,13 @@ export class CrixAgentRuntime {
       home: this.prepared.home,
       workspace: this.opts.workspace,
       config: this.prepared.config,
-      onAlert: (text) => this.opts.queueReminder(text, "memory"),
+      // Heartbeat alerts are AMBIENT background signals, never user requests.
+      // Label them so a weak model doesn't treat them as a task to act on.
+      onAlert: (text) =>
+        this.opts.queueReminder(
+          `BACKGROUND SIGNAL (ambient self-check — not a request, do not act on it unless it bears on the user's current message): ${text}`,
+          "memory",
+        ),
     });
   }
 

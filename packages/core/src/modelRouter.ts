@@ -252,3 +252,117 @@ export function routeModel(task: ModelTask, policy: ModelRoutingPolicy): ModelRo
 function clamp01(n: number): number {
   return Math.max(0, Math.min(1, Number.isFinite(n) ? n : 0));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// User-assigned routing (Nexus Phase 2) — the owner holds the dial.
+//
+// The heuristic above is the FALLBACK. When the owner has explicitly assigned a
+// provider+model to a task lane (chat / coding / research / tool-use), that
+// choice wins outright — Crix uses exactly what was picked. This is what the
+// labeled routing "pill" in the UI writes, and what the live turn reads. Still
+// pure + offline: assignment resolution is a deterministic lookup, and any lane
+// left unassigned falls through to routeModel().
+
+/** The owner-facing task lanes the pill assigns. Coarser than ModelTaskKind on
+ *  purpose — these are the buckets a human thinks in. */
+export type RouteLane = "chat" | "coding" | "research" | "tool-use";
+
+export const ROUTE_LANES: readonly RouteLane[] = ["chat", "coding", "research", "tool-use"] as const;
+
+/** One owner assignment: "this lane → this provider family + this concrete model". */
+export interface RouteAssignment {
+  family: string;
+  /** The concrete model id the provider expects (e.g. "qwen3-coder:480b", "anthropic/claude-opus-4"). */
+  model: string;
+}
+
+/** The full owner routing table. Lanes absent here fall back to the heuristic. */
+export type RouteAssignments = Partial<Record<RouteLane, RouteAssignment>>;
+
+/** Map a fine-grained ModelTaskKind onto the coarse owner lane it belongs to. */
+export function laneForTask(kind: ModelTaskKind): RouteLane {
+  switch (kind) {
+    case "code":
+      return "coding";
+    case "planning":
+    case "review":
+    case "workshop":
+      return "research";
+    case "tool-output-summary":
+      return "tool-use";
+    case "chat":
+    case "summarization":
+    case "memory":
+    case "vision":
+    default:
+      return "chat";
+  }
+}
+
+/**
+ * Classify a raw user goal into an owner lane via lightweight keyword heuristics.
+ * Deterministic + offline — a fast first-pass so live routing can pick a lane
+ * without a model round-trip. Coding signals win over research; default is chat.
+ */
+export function classifyLane(goal: string): RouteLane {
+  const g = ` ${goal.toLowerCase()} `;
+  const coding = /\b(code|coding|bug|debug|fix|refactor|function|class|method|implement|compile|build|stack ?trace|exception|typescript|javascript|python|rust|golang|api|endpoint|test|unit test|repo|git|commit|merge|lint|regex|sql|css|html|component|module|import|syntax)\b/;
+  const research = /\b(research|plan|planning|analyz|investigat|compare|comparison|evaluate|assess|design|architect|strateg|explain|why|how does|trade-?off|pros and cons|summar|review|deep dive|explore|options)\b/;
+  if (coding.test(g)) return "coding";
+  if (research.test(g)) return "research";
+  return "chat";
+}
+
+export interface ResolvedRoute {
+  family: string;
+  model?: string;
+  locality: Locality;
+  /** "assigned" = owner picked it explicitly; "heuristic" = routeModel() chose. */
+  source: "assigned" | "heuristic";
+  lane: RouteLane;
+  reasons: string[];
+  warnings: string[];
+  fallback: ModelRoute | null;
+}
+
+/**
+ * Resolve the route Crix will actually USE for a task. Owner assignment wins;
+ * otherwise defer to the heuristic routeModel(). Pure + deterministic.
+ */
+export function resolveRoute(
+  task: ModelTask,
+  policy: ModelRoutingPolicy,
+  assignments: RouteAssignments = {},
+): ResolvedRoute {
+  const lane = laneForTask(task.kind);
+  const pick = assignments[lane];
+
+  if (pick && pick.family && pick.model) {
+    const profile = policy.profiles.find((p) => p.family === pick.family);
+    const warnings: string[] = [];
+    if (!profile) warnings.push(`assigned provider "${pick.family}" is not in the active profile set`);
+    else if (!profile.available) warnings.push(`assigned provider "${profile.label}" is currently unavailable`);
+    return {
+      family: pick.family,
+      model: pick.model,
+      locality: profile?.locality ?? "cloud",
+      source: "assigned",
+      lane,
+      reasons: [`owner assigned ${lane} → ${profile?.label ?? pick.family} / ${pick.model}`],
+      warnings,
+      fallback: null,
+    };
+  }
+
+  const decision = routeModel(task, policy);
+  return {
+    family: decision.selected?.family ?? "",
+    model: decision.selected?.modelClass,
+    locality: decision.selected?.locality ?? "cloud",
+    source: "heuristic",
+    lane,
+    reasons: decision.reasons,
+    warnings: decision.warnings,
+    fallback: decision.fallback,
+  };
+}

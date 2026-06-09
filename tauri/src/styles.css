@@ -4196,26 +4196,413 @@ body {
   }
 }
 
-/* Final shell polish: force transparent rounded clipping and keep native controls clickable. */
+/* Shell base: the OS window is square + opaque (no transparency), so the root
+   containers are square edge-to-edge — no rounded clip can leave a corner
+   showing the desktop behind a transparent window. The optional "rounded"
+   appearance still rounds the inner .crix-app via --shell-radius below; the
+   square corners around it simply read as the opaque window backstop. */
 html,
 body,
 #root {
   overflow: hidden;
-  border-radius: 38px;
-  background: transparent !important;
+  border-radius: 0;
+  background: #05060b;
 }
 
 .crix-app,
 .crix-app[data-theme="signal"],
 .crix-app[data-theme="graphite"],
 .crix-app[data-theme="oxide"] {
-  border-radius: 38px;
-  clip-path: inset(0 round 38px);
   isolation: isolate;
 }
 
-.fxLayer {
-  clip-path: inset(0 round 38px);
+/* ── Owner model-routing pills ─────────────────────────────────────────── */
+.routingPills {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  border: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--panel, #11131c) 70%, transparent);
+}
+.routingHead {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.routingHead span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  font-size: 13px;
+}
+.routingHead small {
+  color: var(--muted, #9aa3b2);
+  font-size: 11.5px;
+}
+.routingRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: flex-start;
+}
+.routePill {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+.routePillFace {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--line) 65%, transparent);
+  background: color-mix(in srgb, var(--panel, #161824) 85%, transparent);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 160ms ease, transform 160ms ease, box-shadow 160ms ease;
+}
+.routePillFace:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent, #5b8cff) 60%, transparent);
+}
+.routePillFace.pinned {
+  border-color: color-mix(in srgb, var(--accent, #5b8cff) 75%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent, #5b8cff) 35%, transparent) inset;
+}
+.routePill.open .routePillFace {
+  border-color: var(--accent, #5b8cff);
+}
+.routeLane {
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted, #9aa3b2);
+}
+.routeTarget {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.routeEditor {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 40;
+  width: 260px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--accent, #5b8cff) 45%, transparent);
+  background: var(--panel, #11131c);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+  animation: routeEditorIn 160ms ease;
+}
+@keyframes routeEditorIn {
+  from { opacity: 0; transform: translateY(-6px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.routeEditor label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted, #9aa3b2);
+}
+.routeEditor select,
+.routeEditor input {
+  padding: 7px 9px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  background: color-mix(in srgb, var(--panel, #0d0f17) 60%, transparent);
+  color: inherit;
+  font-size: 12.5px;
+}
+.routeEditorActions {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 2px;
+}
+.routeEditorActions button {
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 12px;
+}
+.routeEditorActions .routeDone {
+  border-color: var(--accent, #5b8cff);
+  background: color-mix(in srgb, var(--accent, #5b8cff) 22%, transparent);
+}
+.routeEditorActions .routeClear:hover {
+  color: var(--danger, #ff6b6b);
+  border-color: color-mix(in srgb, var(--danger, #ff6b6b) 60%, transparent);
+}
+
+/* Reduced-motion / low-power: freeze all looping animation + transitions. */
+.crix-app[data-fx="off"],
+.crix-app[data-fx="off"] *,
+.crix-app[data-fx="off"] *::before,
+.crix-app[data-fx="off"] *::after {
+  animation: none !important;
+  transition: none !important;
+}
+
+/* ── Claude-style options bar (Reasoning · Route · Voice) ──────────────── */
+.optionsBar {
+  display: flex;
+  gap: 8px;
+  padding: 8px 18px 0;
+  flex-wrap: wrap;
+}
+/* When the bar sits low (above the composer), menus open UPWARD. */
+.optionsBar.dropUp {
+  padding: 0 18px 8px;
+}
+.optionsBar.dropUp .optionMenu {
+  top: auto;
+  bottom: calc(100% + 8px);
+  transform-origin: bottom left;
+}
+.optionsBar.dropUp .optionPill.active .optionChevron {
+  transform: rotate(0deg);
+}
+.optionsBar.dropUp .optionChevron {
+  transform: rotate(180deg);
+}
+.optionPillWrap {
+  position: relative;
+}
+.optionPill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+  background: color-mix(in srgb, var(--panel, #14161f) 80%, transparent);
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 150ms ease, transform 150ms ease, background 150ms ease;
+}
+.optionPill:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent, #5b8cff) 55%, transparent);
+}
+.optionPill.active {
+  border-color: var(--accent, #5b8cff);
+  background: color-mix(in srgb, var(--accent, #5b8cff) 16%, transparent);
+}
+.optionPillBody {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+  text-align: left;
+}
+.optionPillBody small {
+  font-size: 9.5px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted, #9aa3b2);
+}
+.optionPillBody strong {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.optionChevron {
+  opacity: 0.6;
+}
+.optionPill.active .optionChevron {
+  transform: rotate(180deg);
+}
+.optionMenu {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 80;
+  min-width: 210px;
+  max-width: calc(100vw - 32px);
+  display: flex;
+  flex-direction: column;
+  padding: 8px;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--accent, #5b8cff) 40%, transparent);
+  /* Solid surface — themes make --panel/--bg translucent, which leaked the chat
+     behind the menu. Text is light in every theme, so a solid dark menu is
+     readable everywhere. */
+  background: #12141d;
+  isolation: isolate;
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(0, 0, 0, 0.4);
+  transform-origin: top left;
+}
+/* Rightmost pills anchor their menus to the right edge so they never run off
+   the window when it isn't maximized. */
+.optionsBar .optionPillWrap:nth-last-child(-n + 2) .optionMenu {
+  left: auto;
+  right: 0;
+  transform-origin: top right;
+}
+.optionsBar.dropUp .optionPillWrap:nth-last-child(-n + 2) .optionMenu {
+  transform-origin: bottom right;
+}
+.optionMenu.withSub {
+  flex-direction: row;
+  min-width: 440px;
+  gap: 6px;
+}
+.optionMenuCol {
+  flex: 1 1 50%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.optionMenuSub {
+  flex: 1 1 50%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 8px 4px 4px 10px;
+  border-left: 1px solid color-mix(in srgb, var(--line) 45%, transparent);
+}
+.optionMenuHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px 6px;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted, #9aa3b2);
+}
+.reasoningTag {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 10px;
+  opacity: 0.8;
+}
+.reasoningTag.sync-syncing { color: var(--accent, #5b8cff); }
+.reasoningTag.sync-error { color: var(--danger, #ff6b6b); }
+.optionRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 12.5px;
+  text-align: left;
+  transition: background 130ms ease;
+}
+.optionRow:hover {
+  background: color-mix(in srgb, var(--accent, #5b8cff) 14%, transparent);
+}
+.optionRow.selected {
+  background: color-mix(in srgb, var(--accent, #5b8cff) 20%, transparent);
+}
+.laneText {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+.laneText small {
+  font-size: 10.5px;
+  color: var(--muted, #9aa3b2);
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.laneArrow {
+  opacity: 0.45;
+  transform: rotate(-90deg);
+}
+.subField {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted, #9aa3b2);
+  padding: 0 4px;
+}
+.subField select,
+.subField input[type="text"],
+.subField input:not([type]) {
+  padding: 7px 9px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  background: color-mix(in srgb, var(--panel, #0a0c14) 60%, transparent);
+  color: inherit;
+  font-size: 12.5px;
+}
+.subField input[type="range"] {
+  accent-color: var(--accent, #5b8cff);
+}
+.subReset {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin: 2px 4px 0;
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 12px;
+}
+.subReset:hover {
+  border-color: var(--accent, #5b8cff);
+}
+.voiceMenu {
+  min-width: 460px;
+}
+.modelMenu {
+  min-width: 300px;
+}
+.optionEmpty {
+  padding: 12px 10px;
+  font-size: 12px;
+  color: var(--muted, #9aa3b2);
+}
+.modelApply {
+  margin: 8px 4px 2px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--accent, #5b8cff);
+  background: color-mix(in srgb, var(--accent, #5b8cff) 24%, transparent);
+  color: inherit;
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.modelApply:disabled {
+  opacity: 0.45;
+  cursor: default;
+  border-color: color-mix(in srgb, var(--line) 60%, transparent);
+  background: transparent;
+}
+.voiceScroll {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 240px;
+  overflow-y: auto;
 }
 
 .windowButtons,
@@ -4632,19 +5019,23 @@ body,
   pointer-events: none;
 }
 
+/* The OS window is square + opaque, so the outer shell fills it edge-to-edge —
+   never rounded (a rounded outer shell would expose the dark window backstop in
+   the corners, the "pretend rounded" artifact). Inner panels keep their own
+   radii for the soft look. */
 .crix-app,
 .crix-app[data-theme="signal"],
 .crix-app[data-theme="graphite"],
 .crix-app[data-theme="oxide"],
 .crix-app[data-theme="matrix"],
 .crix-app[data-theme="storm"] {
-  border-radius: var(--shell-radius, 38px);
-  clip-path: inset(0 round var(--shell-radius, 38px));
+  border-radius: 0;
+  clip-path: none;
   outline: 0;
 }
 
 .fxLayer {
-  clip-path: inset(0 round var(--shell-radius, 38px));
+  clip-path: none;
 }
 
 .crix-app[data-corners="square"] .titlebar,
@@ -5614,34 +6005,39 @@ body,
   width: 256px;
   pointer-events: none;
   overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, rgba(135, 153, 176, 0.48));
   border-left: 3px solid var(--accent);
   border-radius: 12px;
   background:
-    linear-gradient(180deg, rgba(8, 10, 16, 0.92), rgba(8, 10, 16, 0.8)),
-    var(--panel);
-  backdrop-filter: var(--blur);
-  box-shadow: var(--shadow-soft), inset 0 0 30px color-mix(in srgb, var(--accent) 10%, transparent);
+    linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(239, 247, 255, 0.9)),
+    color-mix(in srgb, var(--panel) 16%, white);
+  color: #142033;
+  backdrop-filter: blur(18px) saturate(1.2);
+  box-shadow:
+    0 18px 40px rgba(18, 35, 66, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.82);
   padding: 12px 14px;
 }
 .crix-app[data-corners="square"] .corePanel {
   border-radius: 4px;
 }
 .corePanel.done {
-  border-color: var(--bad);
-  border-left-color: var(--bad);
-  box-shadow: 0 0 26px color-mix(in srgb, var(--bad) 38%, transparent), inset 0 0 30px color-mix(in srgb, var(--bad) 16%, transparent);
-  animation: coreBreach 0.45s steps(2, end) 2;
+  border-color: color-mix(in srgb, var(--accent-2) 54%, rgba(135, 153, 176, 0.42));
+  border-left-color: var(--accent-2);
+  box-shadow:
+    0 18px 40px rgba(18, 35, 66, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.82);
+  animation: none;
 }
 .corePanelScan {
   position: absolute;
   inset: 0;
-  background: repeating-linear-gradient(0deg, transparent 0 3px, color-mix(in srgb, var(--accent) 7%, transparent) 3px 4px);
-  opacity: 0.4;
+  background: repeating-linear-gradient(0deg, transparent 0 4px, rgba(37, 99, 235, 0.055) 4px 5px);
+  opacity: 0.34;
   pointer-events: none;
 }
 .corePanel.done .corePanelScan {
-  background: repeating-linear-gradient(0deg, transparent 0 3px, color-mix(in srgb, var(--bad) 9%, transparent) 3px 4px);
+  background: repeating-linear-gradient(0deg, transparent 0 4px, rgba(20, 184, 120, 0.06) 4px 5px);
 }
 .corePanelHead {
   position: relative;
@@ -5653,22 +6049,22 @@ body,
   font-weight: 800;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--accent);
+  color: #1d5fd6;
 }
 .corePanel.done .corePanelHead {
-  color: var(--bad);
+  color: #12815d;
 }
 .coreDot {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 8px var(--accent);
+  background: #2f80ff;
+  box-shadow: 0 0 0 4px rgba(47, 128, 255, 0.12);
   animation: corePulse 1.1s ease-in-out infinite;
 }
 .corePanel.done .coreDot {
-  background: var(--bad);
-  box-shadow: 0 0 8px var(--bad);
+  background: #16a36f;
+  box-shadow: 0 0 0 4px rgba(22, 163, 111, 0.12);
   animation: none;
 }
 .coreState {
@@ -5676,24 +6072,24 @@ body,
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.04em;
-  color: var(--faint);
-  text-transform: none;
+  color: #66758a;
+  text-transform: uppercase;
 }
 .coreActivityLabel {
   position: relative;
   font-size: 13px;
   line-height: 1.45;
-  color: var(--text);
+  color: #233248;
   white-space: pre-wrap;
   word-break: break-word;
 }
 .corePanel.done .coreActivityLabel {
-  font-size: 18px;
-  font-weight: 900;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--bad);
-  animation: coreGlitch 0.34s steps(2, end) 3;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: none;
+  color: #145c43;
+  animation: none;
 }
 @keyframes corePulse {
   0%, 100% { opacity: 0.5; transform: scale(0.8); }
@@ -6068,3 +6464,833 @@ body,
     opacity: 0.46;
   }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Header life + brand fix + composer polish (cross-theme, appended last)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* --- Top "Session" bar: a living header instead of an empty strip --- */
+.workspaceTop {
+  position: relative;
+  overflow: hidden;
+  align-items: center;
+}
+.workspaceHeading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  z-index: 1;
+}
+/* animated scan that sweeps the header bottom edge when the daemon is live */
+.workspaceScan {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--accent, #5b8cff) 0%, transparent) 8%,
+    var(--accent, #5b8cff) 50%,
+    transparent 92%
+  );
+  opacity: 0;
+  transform: translateX(-60%);
+  pointer-events: none;
+}
+.workspaceTop[data-live="1"] .workspaceScan {
+  opacity: 0.9;
+  animation: wsScan 3.4s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+@keyframes wsScan {
+  0% { transform: translateX(-70%); opacity: 0; }
+  18% { opacity: 0.9; }
+  82% { opacity: 0.9; }
+  100% { transform: translateX(70%); opacity: 0; }
+}
+.workspaceLive {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  padding: 6px 14px 6px 10px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+  background: color-mix(in srgb, var(--panel, #14161f) 55%, transparent);
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted, #9aa3b2);
+  z-index: 1;
+}
+.workspaceLiveText {
+  font-weight: 800;
+}
+.workspaceLive[data-on="1"] .workspaceLiveText { color: #36d39a; }
+.workspaceLive[data-fault="1"] .workspaceLiveText { color: #ff6b6b; }
+
+/* ── 2D frame-by-frame entity sprite (the "little runner") ──────────────── */
+.entitySprite {
+  position: relative;
+  display: inline-block;
+  width: 26px;
+  height: 24px;
+}
+.spriteRunner {
+  position: absolute;
+  left: 50%;
+  bottom: 4px;
+  width: 16px;
+  height: 18px;
+  margin-left: -8px;
+  transform-origin: bottom center;
+}
+/* choppy vertical bob — steps() gives the hand-drawn, frame-by-frame feel */
+.workspaceLive[data-on="1"] .spriteRunner {
+  animation: spriteHop 0.52s steps(2, jump-none) infinite;
+}
+@keyframes spriteHop {
+  0% { transform: translateY(0) rotate(-3deg); }
+  50% { transform: translateY(-5px) rotate(3deg); }
+  100% { transform: translateY(0) rotate(-3deg); }
+}
+.spriteBody {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 16px;
+  height: 13px;
+  border-radius: 8px 8px 7px 7px;
+  background: linear-gradient(160deg, #6fe9d0, #4aa8ff 70%, #3f7dff);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6), 0 2px 4px rgba(0, 0, 0, 0.3);
+}
+.spriteEye {
+  position: absolute;
+  right: 3px;
+  top: 4px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #0b1020;
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.85);
+}
+.workspaceLive[data-on="1"] .spriteEye {
+  animation: spriteBlink 2.4s steps(1) infinite;
+}
+@keyframes spriteBlink {
+  0%, 92%, 100% { transform: scaleY(1); }
+  96% { transform: scaleY(0.15); }
+}
+.spriteLegs {
+  position: absolute;
+  left: 2px;
+  bottom: -4px;
+  width: 12px;
+  height: 6px;
+}
+.spriteLegs i {
+  position: absolute;
+  bottom: 0;
+  width: 3px;
+  height: 6px;
+  border-radius: 2px;
+  background: #3f7dff;
+}
+.spriteLegs i:first-child { left: 1px; }
+.spriteLegs i:last-child { right: 1px; }
+/* legs alternate in 2 discrete frames → running cadence */
+.workspaceLive[data-on="1"] .spriteLegs i:first-child {
+  animation: spriteLegA 0.26s steps(2) infinite;
+}
+.workspaceLive[data-on="1"] .spriteLegs i:last-child {
+  animation: spriteLegB 0.26s steps(2) infinite;
+}
+@keyframes spriteLegA {
+  0% { transform: translateX(0) rotate(18deg); }
+  100% { transform: translateX(3px) rotate(-18deg); }
+}
+@keyframes spriteLegB {
+  0% { transform: translateX(0) rotate(-18deg); }
+  100% { transform: translateX(-3px) rotate(18deg); }
+}
+.spriteGround {
+  position: absolute;
+  left: 50%;
+  bottom: 1px;
+  width: 18px;
+  height: 3px;
+  margin-left: -9px;
+  border-radius: 50%;
+  background: radial-gradient(ellipse at center, rgba(0, 0, 0, 0.35), transparent 70%);
+}
+.workspaceLive[data-on="1"] .spriteGround {
+  animation: spriteShadow 0.52s steps(2, jump-none) infinite;
+}
+@keyframes spriteShadow {
+  0%, 100% { transform: scaleX(1); opacity: 0.5; }
+  50% { transform: scaleX(0.7); opacity: 0.28; }
+}
+
+/* --- Sidebar brand: stop "Crix" doubling / bleeding out of its panel --- */
+.brandBlock {
+  min-width: 0;
+  overflow: hidden;
+}
+.brandBlock > div {
+  min-width: 0;
+  overflow: hidden;
+}
+.brandBlock strong {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.15;
+}
+.brandBlock span {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- Composer: tighten the cluttered status row --- */
+.composerTools {
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.composerBar {
+  gap: 8px;
+}
+
+/* --- Option menus: legible on the fixed dark surface (theme-independent) --- */
+.optionMenu {
+  color: #e9eef7;
+  gap: 1px;
+}
+.optionMenu .optionMenuHead {
+  color: #93a0b4;
+  font-weight: 700;
+}
+.optionMenu .optionRow strong { color: #f2f5fb; }
+.optionMenu .optionRow small,
+.optionMenu .laneText small { color: #8b97aa; }
+.optionMenu .subField { color: #93a0b4; }
+.optionMenu .subField select,
+.optionMenu .subField input[type="text"],
+.optionMenu .subField input:not([type]) {
+  background: #1b1e29;
+  border-color: #2c3142;
+  color: #f2f5fb;
+}
+.optionMenu .optionMenuSub {
+  border-left-color: #2a2f3e;
+}
+.optionMenu .subReset {
+  border-color: #2c3142;
+  color: #cfd6e3;
+}
+.optionMenu .voiceScroll::-webkit-scrollbar { width: 8px; }
+.optionMenu .voiceScroll::-webkit-scrollbar-thumb {
+  background: #2c3142;
+  border-radius: 8px;
+}
+/* slightly roomier so the two-column voice/route menus don't feel cramped */
+.optionMenu.withSub { padding: 10px; gap: 8px; }
+.optionMenu.withSub .optionMenuSub { padding-left: 12px; }
+
+/* ═══ Entity runner — roaming, draggable 2D parkour sprite ═══════════════ */
+.workspace { position: relative; }
+.entityStage {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 92px;
+  pointer-events: none;
+  z-index: 7;
+  overflow: visible;
+}
+.entityRunner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 22px;
+  height: 24px;
+  pointer-events: auto;
+  cursor: grab;
+  will-change: transform;
+  transform: translate(0, 0);
+}
+.entityRunner:active { cursor: grabbing; }
+/* sprite-sheet mode: the runner box hugs the rendered frame */
+.entityRunner.sheetMode { width: auto; height: auto; }
+.entitySheet {
+  background-repeat: no-repeat;
+  background-position: 0 0;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  pointer-events: none;
+  transform: translate(-50%, -100%);
+  filter: drop-shadow(0 3px 3px rgba(0, 0, 0, 0.35));
+}
+.erShadow {
+  position: absolute;
+  left: 50%;
+  bottom: -3px;
+  width: 22px;
+  height: 4px;
+  margin-left: -11px;
+  border-radius: 50%;
+  background: radial-gradient(ellipse at center, rgba(0, 0, 0, 0.4), transparent 70%);
+}
+.erBody {
+  position: absolute;
+  left: 3px;
+  top: 0;
+  width: 16px;
+  height: 14px;
+  border-radius: 8px 8px 7px 7px;
+  background: linear-gradient(160deg, #76ecd4, #4aa8ff 65%, #3f7dff);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65), 0 2px 5px rgba(0, 0, 0, 0.35);
+  z-index: 2;
+}
+.erEye {
+  position: absolute;
+  right: 3px;
+  top: 4px;
+  width: 4.5px;
+  height: 4.5px;
+  border-radius: 50%;
+  background: #0b1020;
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.9);
+}
+.erLegs {
+  position: absolute;
+  left: 5px;
+  bottom: -2px;
+  width: 12px;
+  height: 6px;
+  z-index: 1;
+}
+.erLegs i {
+  position: absolute;
+  bottom: 0;
+  width: 3px;
+  height: 6px;
+  border-radius: 2px;
+  background: #356fe0;
+  transform-origin: top center;
+}
+.erLegs i:first-child { left: 0; }
+.erLegs i:last-child { right: 0; }
+.erArms {
+  position: absolute;
+  left: 2px;
+  top: 4px;
+  width: 18px;
+  height: 6px;
+  z-index: 3;
+}
+.erArms i {
+  position: absolute;
+  top: 0;
+  width: 2.5px;
+  height: 5px;
+  border-radius: 2px;
+  background: #56b0ff;
+  transform-origin: top center;
+}
+.erArms i:first-child { left: 0; }
+.erArms i:last-child { right: 0; }
+
+/* pose: run — legs + arms cycle in 2 discrete frames (frame-by-frame feel) */
+.entityRunner[data-pose="run"] .erLegs i:first-child { animation: erLegA 0.3s steps(2) infinite; }
+.entityRunner[data-pose="run"] .erLegs i:last-child { animation: erLegB 0.3s steps(2) infinite; }
+.entityRunner[data-pose="run"] .erArms i:first-child { animation: erArmA 0.3s steps(2) infinite; }
+.entityRunner[data-pose="run"] .erArms i:last-child { animation: erArmB 0.3s steps(2) infinite; }
+@keyframes erLegA { 0% { transform: rotate(38deg); } 100% { transform: rotate(-38deg); } }
+@keyframes erLegB { 0% { transform: rotate(-38deg); } 100% { transform: rotate(38deg); } }
+@keyframes erArmA { 0% { transform: rotate(-42deg); } 100% { transform: rotate(42deg); } }
+@keyframes erArmB { 0% { transform: rotate(42deg); } 100% { transform: rotate(-42deg); } }
+
+/* pose: jump — legs tucked, arms up */
+.entityRunner[data-pose="jump"] .erLegs i:first-child { transform: rotate(28deg) translateY(-1px); }
+.entityRunner[data-pose="jump"] .erLegs i:last-child { transform: rotate(-28deg) translateY(-1px); }
+.entityRunner[data-pose="jump"] .erArms i { transform: rotate(0deg) translateY(-3px); }
+
+/* pose: flip — limbs tucked tight (outer rotation comes from JS spin) */
+.entityRunner[data-pose="flip"] .erLegs i { transform: rotate(0deg) scaleY(0.7); }
+.entityRunner[data-pose="flip"] .erArms i { transform: translateY(-2px); }
+
+/* pose: slide — legs swept back, arm forward (outer lean from JS) */
+.entityRunner[data-pose="slide"] .erLegs i:first-child { transform: rotate(72deg); }
+.entityRunner[data-pose="slide"] .erLegs i:last-child { transform: rotate(60deg); }
+.entityRunner[data-pose="slide"] .erArms i:first-child { transform: rotate(-60deg); }
+
+/* pose: grab — arms thrown forward/up, latched onto the cursor */
+.entityRunner[data-pose="grab"] .erArms i { transform: rotate(0deg) translateY(-4px); height: 7px; }
+.entityRunner[data-pose="grab"] .erLegs i:first-child { transform: rotate(30deg); }
+.entityRunner[data-pose="grab"] .erLegs i:last-child { transform: rotate(-30deg); }
+
+/* pose: punch — arms jab forward fast, legs braced (attacking the cursor) */
+.entityRunner[data-pose="punch"] .erArms i:first-child { animation: erJabA 0.16s steps(2) infinite; height: 7px; }
+.entityRunner[data-pose="punch"] .erArms i:last-child { animation: erJabB 0.16s steps(2) infinite; height: 7px; }
+.entityRunner[data-pose="punch"] .erLegs i:first-child { transform: rotate(34deg); }
+.entityRunner[data-pose="punch"] .erLegs i:last-child { transform: rotate(-20deg); }
+@keyframes erJabA { 0% { transform: translateX(2px) rotate(80deg); } 100% { transform: translateX(8px) rotate(95deg); } }
+@keyframes erJabB { 0% { transform: translateX(6px) rotate(85deg); } 100% { transform: translateX(1px) rotate(70deg); } }
+
+/* pose: roll — body tucked into a ball (outer spin comes from JS rot) */
+.entityRunner[data-pose="roll"] .erLegs i { transform: rotate(0deg) scaleY(0.45); }
+.entityRunner[data-pose="roll"] .erArms i { transform: rotate(0deg) scaleY(0.5) translateY(2px); }
+.entityRunner[data-pose="roll"] .erBody { border-radius: 50%; }
+.entityRunner[data-pose="roll"] .erShadow { opacity: 0.25; }
+
+/* pose: sit — slumped, bored: body low, legs folded out front, slow look-around */
+.entityRunner[data-pose="sit"] .erBody { transform: translateY(4px) scaleY(0.86); animation: erLook 3.4s ease-in-out infinite; }
+.entityRunner[data-pose="sit"] .erLegs i:first-child { transform: rotate(82deg) translateY(2px); }
+.entityRunner[data-pose="sit"] .erLegs i:last-child { transform: rotate(-82deg) translateY(2px); }
+.entityRunner[data-pose="sit"] .erArms i { transform: rotate(70deg) translateY(2px); }
+@keyframes erLook { 0%, 100% { margin-left: 0; } 30% { margin-left: -1.5px; } 65% { margin-left: 1.5px; } }
+
+/* pose: work — one arm hammers down repeatedly (building in the den) */
+.entityRunner[data-pose="work"] .erArms i:first-child { animation: erHammer 0.34s steps(2) infinite; height: 7px; }
+.entityRunner[data-pose="work"] .erArms i:last-child { transform: rotate(-40deg); }
+.entityRunner[data-pose="work"] .erLegs i:first-child { transform: rotate(20deg); }
+.entityRunner[data-pose="work"] .erLegs i:last-child { transform: rotate(-20deg); }
+@keyframes erHammer { 0% { transform: rotate(-50deg) translateY(-2px); } 100% { transform: rotate(40deg) translateY(2px); } }
+
+/* tether — the grip line from the creature to the cursor while latched on */
+.entityTether {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 2px;
+  transform-origin: left center;
+  background: linear-gradient(90deg, #76ecd4, rgba(118, 236, 212, 0.1));
+  border-radius: 2px;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 6;
+}
+
+/* pose: idle — gentle breathing bob on the body only */
+.entityRunner[data-pose="idle"] .erBody { animation: erBreathe 2.2s ease-in-out infinite; }
+@keyframes erBreathe { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-1.5px); } }
+.entityRunner[data-pose="idle"] .erEye { animation: erBlink 3s steps(1) infinite; }
+@keyframes erBlink { 0%, 93%, 100% { transform: scaleY(1); } 96% { transform: scaleY(0.1); } }
+
+/* ═══ Compact composer — clean, tight input bar (cross-theme, last word) ══ */
+.chatShell .composerBar {
+  padding: 10px 12px;
+  gap: 8px;
+  border-radius: 16px;
+}
+.chatShell .composerInput {
+  grid-template-columns: auto minmax(0, 1fr) 52px;
+  gap: 8px;
+  align-items: end;
+}
+/* trim the textarea so it isn't a giant block */
+.chatShell .composerInput textarea {
+  min-height: 44px;
+  max-height: 130px;
+  padding: 11px 13px;
+  border-radius: 12px;
+  line-height: 1.4;
+}
+.chatShell .composerInput textarea::placeholder {
+  font-size: 13px;
+  opacity: 0.55;
+}
+/* icon cluster: compact horizontal strip instead of a tall column */
+.chatShell .composerIconCluster {
+  grid-auto-flow: column;
+  grid-template-columns: none;
+  align-content: center;
+  gap: 4px;
+  padding: 0 2px 2px;
+}
+.chatShell .composerIconCluster.voiceCluster { grid-template-columns: none; }
+.chatShell .composerIconButton {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+}
+/* send button matches the trimmed height */
+.chatShell .sendButton {
+  align-self: end;
+  height: 44px;
+  border-radius: 12px;
+}
+/* the activity strip (only shown while working now) — slim single line */
+.chatShell .liveActivityStrip {
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  gap: 8px;
+}
+/* status pills row sits tight when present */
+.chatShell .composerTools { gap: 6px; padding: 0 2px; }
+
+/* ═══ Activity flow rows — Hermes-style transparent tool stream ═══════════ */
+.flowRow {
+  margin: 1px 0;
+  border-radius: 8px;
+}
+.flowHead {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--muted, #9aa3b2);
+  cursor: default;
+  text-align: left;
+  font-size: 12.5px;
+  border-radius: 8px;
+  transition: background 130ms ease, color 130ms ease;
+}
+.flowHead:not(:disabled) { cursor: pointer; }
+.flowHead:not(:disabled):hover { background: color-mix(in srgb, var(--text, #fff) 6%, transparent); }
+.flowIcon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  opacity: 0.8;
+}
+.flowLabel {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.flowMeta {
+  flex: 0 0 auto;
+  font-size: 11px;
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
+.flowChevron { flex: 0 0 auto; opacity: 0.5; transition: transform 150ms ease; }
+.flowChevron.open { transform: rotate(180deg); }
+/* running state: brighter label + animated dots */
+.flowRow.state-running .flowLabel,
+.flowRow.state-planning .flowLabel,
+.flowRow.state-ready .flowLabel { color: var(--text, #eef); }
+.flowRow.state-completed .flowIcon { color: #36d39a; opacity: 0.9; }
+.flowRow.state-failed .flowLabel { color: #ff7a7a; }
+.flowRow.state-failed .flowIcon { color: #ff7a7a; }
+.flowBad { font-size: 10.5px; color: #ff7a7a; text-transform: uppercase; letter-spacing: 0.08em; }
+.flowDots { display: inline-flex; gap: 3px; align-items: center; }
+.flowDots i {
+  width: 4px; height: 4px; border-radius: 50%;
+  background: var(--accent, #5b8cff);
+  animation: flowDot 1s ease-in-out infinite;
+}
+.flowDots i:nth-child(2) { animation-delay: 0.15s; }
+.flowDots i:nth-child(3) { animation-delay: 0.3s; }
+@keyframes flowDot { 0%, 100% { opacity: 0.25; transform: translateY(0); } 50% { opacity: 1; transform: translateY(-2px); } }
+.flowDetail {
+  margin: 2px 8px 8px 31px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  background: #12141d;
+  color: #cdd5e3;
+  font-size: 11.5px;
+  line-height: 1.5;
+  max-height: 280px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ═══ Perf: a filled transcript over WebGL + animated layers tanked scroll.
+   Freeze the chat backdrop layers (keep them as a static gradient) and drop
+   blur in the scrolling region so paint stays cheap. ═══════════════════════ */
+/* freeze the spinning/drifting chat backdrop — decorative, and it repainted
+   under the scrolling transcript every frame */
+.chatAtmosphere .chatNebula,
+.chatAtmosphere .chatHoloGrid,
+.chatAtmosphere .chatOrbitRings,
+.chatAtmosphere .chatParticleField,
+.chatAtmosphere .chatSignalSweep {
+  animation: none !important;
+}
+.chatAtmosphere { opacity: 0.45; }
+/* the transcript itself must not run backdrop-filter while scrolling */
+.chatShell .transcript { backdrop-filter: none !important; }
+.chatShell .transcript,
+.chatShell .eventCard,
+.chatShell .flowRow { will-change: auto; }
+/* contain layout/paint so off-screen rows don't repaint on every scroll frame */
+.chatShell .eventCard,
+.chatShell .flowRow {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 60px;
+}
+
+/* inline images rendered from assistant messages */
+.chatImages {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+.chatImage {
+  display: block;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  aspect-ratio: 4 / 3;
+  background: color-mix(in srgb, var(--panel) 50%, transparent);
+  padding: 0;
+  cursor: zoom-in;
+}
+.chatImage img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform 200ms ease; }
+.chatImage:hover img { transform: scale(1.04); }
+
+/* full-screen image viewer */
+.imageLightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  place-items: center;
+  padding: 40px;
+  background: rgba(4, 6, 11, 0.86);
+  backdrop-filter: blur(8px);
+  cursor: zoom-out;
+}
+.imageLightbox img {
+  max-width: 92vw;
+  max-height: 88vh;
+  border-radius: 12px;
+  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.6);
+  cursor: default;
+}
+.lightboxClose {
+  position: absolute;
+  top: 18px;
+  right: 20px;
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  cursor: pointer;
+}
+.lightboxClose:hover { background: rgba(255, 255, 255, 0.2); }
+
+/* ── Cleaner chat bubbles (you / Crix) — light + minimal, matching the flow ──
+   Per-theme rules (.crix-app[data-theme=...] .eventCard.user .eventBody) outrank
+   plain selectors, so these use !important to win uniformly across every theme. */
+.chatShell .eventCard .eventBody {
+  background: color-mix(in srgb, var(--text, #fff) 5%, transparent) !important;
+  border: 1px solid color-mix(in srgb, var(--line) 35%, transparent) !important;
+  box-shadow: none !important;
+  border-radius: 14px !important;
+  backdrop-filter: none !important;
+}
+.chatShell .eventCard.user .eventBody {
+  background: color-mix(in srgb, var(--accent, #5b8cff) 16%, transparent) !important;
+}
+/* kill the moving sheen on chat bubbles — cleaner + cheaper */
+.chatShell .eventCard .eventBody::after { display: none !important; }
+.chatShell .eventCard.user .eventBody header time,
+.chatShell .eventCard.assistant .eventBody header time { display: none; }
+.chatShell .eventCard.user .eventAvatar,
+.chatShell .eventCard.assistant .eventAvatar {
+  width: 30px; height: 30px; border-radius: 9px;
+  background: color-mix(in srgb, var(--text, #fff) 6%, transparent) !important;
+  box-shadow: none !important;
+}
+.chatShell .eventCard.user .eventBody header strong,
+.chatShell .eventCard.assistant .eventBody header strong {
+  font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; opacity: 0.55;
+}
+.chatShell .eventCard.assistant .streamingText,
+.chatShell .eventCard.user .streamingText,
+.chatShell .eventCard.assistant pre,
+.chatShell .eventCard.user pre {
+  font-size: 13.5px; line-height: 1.55;
+}
+
+/* thinking flow detail reads as quiet reasoning, not a heavy box */
+.flowDetail.thinkingFlow {
+  background: color-mix(in srgb, var(--text, #fff) 4%, transparent);
+  color: var(--muted, #aab2c0);
+  font-style: italic;
+  border-left: 2px solid color-mix(in srgb, var(--accent, #5b8cff) 40%, transparent);
+}
+.flowRow.state-thinking .flowIcon { color: var(--accent, #7aa2ff); opacity: 0.85; }
+
+/* clean approval prompt — flow-styled, not a slab */
+.permissionFlow {
+  padding: 9px 10px;
+  border-radius: 11px;
+  border: 1px solid color-mix(in srgb, var(--accent, #5b8cff) 40%, transparent);
+  background: color-mix(in srgb, var(--accent, #5b8cff) 9%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.permissionFlow.waiting { border-color: color-mix(in srgb, #ffb454 55%, transparent); background: color-mix(in srgb, #ffb454 10%, transparent); }
+.permissionFlow.denied { border-color: color-mix(in srgb, #ff6b6b 50%, transparent); }
+.permFlowHead { display: flex; align-items: center; gap: 9px; font-size: 12.5px; }
+.permFlowHead .flowIcon { color: #ffce85; }
+.permFlowText { flex: 1 1 auto; min-width: 0; color: var(--text, #eef); }
+.permFlowText strong { font-weight: 700; }
+.permFlowPeek {
+  flex: 0 0 auto; border: 0; background: transparent; cursor: pointer;
+  color: var(--muted, #9aa3b2); font-size: 11px; text-decoration: underline; text-underline-offset: 2px;
+}
+.permFlowActions { display: flex; gap: 7px; }
+.permFlowActions button {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 6px 12px; border-radius: 999px; cursor: pointer; font-size: 12px; font-weight: 600;
+  border: 1px solid color-mix(in srgb, var(--line) 65%, transparent); background: transparent; color: var(--text, #eef);
+}
+.permFlowActions .pAllow { border-color: #36d39a; background: color-mix(in srgb, #36d39a 22%, transparent); }
+.permFlowActions .pAlways { border-color: color-mix(in srgb, var(--accent, #5b8cff) 70%, transparent); }
+.permFlowActions .pDeny:hover { border-color: #ff6b6b; color: #ff8a8a; }
+.permFlowResult { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); }
+.permFlowResult.allow { color: #36d39a; }
+.permFlowResult.deny { color: #ff7a7a; }
+
+/* ═══ OpenRouter panel — key paste + live model catalog ═══════════════════ */
+.orPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 4px;
+}
+.orKeyRow {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+.orKeyRow label {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.orKeyRow input {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  color: var(--text);
+  font-size: 13px;
+}
+.orCatalogHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.orFilter {
+  flex: 1 1 auto;
+  padding: 8px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 60%, transparent);
+  color: var(--text);
+  font-size: 12.5px;
+}
+.orCount { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.orList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.orModel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  background: color-mix(in srgb, var(--panel) 45%, transparent);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 140ms ease, transform 140ms ease;
+}
+.orModel:hover { transform: translateX(2px); border-color: color-mix(in srgb, var(--accent) 60%, transparent); }
+.orModel.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.orModelMain { display: flex; flex-direction: column; min-width: 0; }
+.orModelMain strong { font-size: 12.5px; }
+.orModelMain small { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.orEmpty { padding: 12px; font-size: 12px; color: var(--muted); }
+.orApplyRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 4px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 40%, transparent);
+}
+.orSelected { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* route suggestion banner (notify-and-confirm before a model switch) */
+.routeSuggest {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 9px 13px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent, #5b8cff) 55%, transparent);
+  background: color-mix(in srgb, var(--accent, #5b8cff) 14%, transparent);
+  font-size: 12.5px;
+}
+.routeSuggestText em { font-style: normal; font-weight: 700; }
+.routeSuggestActions { display: inline-flex; gap: 8px; }
+.routeSuggest button {
+  padding: 6px 13px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--line) 65%, transparent);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.routeSuggest .routeSwitch {
+  border-color: var(--accent, #5b8cff);
+  background: color-mix(in srgb, var(--accent, #5b8cff) 28%, transparent);
+}
+.routeSuggest button:hover { filter: brightness(1.12); }
+
+/* ═══ Side notifications: clear the composer + transcript, never occlude ═══ */
+.corePanel {
+  bottom: 132px !important;       /* sit above the composer (bottom:22 + ~bar height) */
+  right: 18px !important;
+  max-height: calc(100vh - 300px);
+  overflow: hidden;
+}
+.mindPanel {
+  left: 332px !important;          /* clear the sidebar (≈320px) */
+  bottom: 132px !important;
+  max-width: min(380px, calc(100vw - 360px)) !important;
+}
+/* image grids inside flow rows sit tight under the row */
+.flowImages { margin: 6px 0 8px 30px; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }

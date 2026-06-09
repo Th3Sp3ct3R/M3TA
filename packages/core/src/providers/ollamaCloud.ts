@@ -322,8 +322,11 @@ export class OllamaCloudPool {
               thinkingParts.push(part.text);
               yield { type: "thinking_delta", text: part.text };
             } else {
-              textParts.push(part.text);
-              yield { type: "text_delta", text: part.text };
+              const clean = stripControlTokens(part.text);
+              if (clean) {
+                textParts.push(clean);
+                yield { type: "text_delta", text: clean };
+              }
             }
           }
         }
@@ -357,8 +360,11 @@ export class OllamaCloudPool {
         thinkingParts.push(part.text);
         yield { type: "thinking_delta", text: part.text };
       } else {
-        textParts.push(part.text);
-        yield { type: "text_delta", text: part.text };
+        const clean = stripControlTokens(part.text);
+        if (clean) {
+          textParts.push(clean);
+          yield { type: "text_delta", text: clean };
+        }
       }
     }
 
@@ -843,6 +849,18 @@ interface ThinkingTagState {
 }
 
 type ThinkingSplitPart = { type: "text" | "thinking"; text: string };
+
+// Strip stray model control/channel tokens that some local models (e.g. gemma4
+// via Ollama's harmony-style parser) leak into visible content — these showed up
+// in chat as garbage like "thought\n<channel|>" or "<|tool_response>".
+function stripControlTokens(text: string): string {
+  // Only strip the actual control TOKENS (the angle-bracket/pipe markers) — never
+  // bare words like "final"/"thought", which are legitimate prose.
+  return text
+    .replace(/<\|[^>]*?>/g, "")                                  // <|tool_response>, <|...>
+    .replace(/<[^>\s]*?\|>/g, "")                                // <channel|>, <turn|>
+    .replace(/<\/?(?:start_of_turn|end_of_turn|eos|bos|pad|unk|mask)\b[^>]*>/gi, "");
+}
 
 function splitThinkingDelta(delta: string, state: ThinkingTagState): ThinkingSplitPart[] {
   state.buffer += delta;

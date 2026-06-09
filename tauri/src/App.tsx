@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { memo, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -40,7 +40,6 @@ import {
   VolumeX,
   Mic,
   MicOff,
-  Play,
   Wallet,
   Wrench,
   X,
@@ -49,7 +48,7 @@ import {
 import "./styles.css";
 
 type View = "chat" | "providers" | "mind" | "tools";
-type ProviderId = "ollama" | "openai" | "mock";
+type ProviderId = "ollama" | "openai" | "openrouter" | "mock";
 type ThemeName = "signal" | "graphite" | "oxide" | "matrix" | "storm";
 type CornerMode = "rounded" | "square";
 type HeartbeatStatus = "idle" | "active" | "alert" | "dreaming" | "error";
@@ -268,7 +267,7 @@ function CorePanel({ activity }: { activity: CoreActivity }) {
       <div className="corePanelHead">
         <span className="coreDot" />
         <strong>{activity.zone}</strong>
-        <span className="coreState">{done ? "" : "● active"}</span>
+        <span className="coreState">{done ? "done" : "active"}</span>
       </div>
       <div className="coreActivityLabel">{activity.label}</div>
     </motion.div>
@@ -310,6 +309,51 @@ interface AppearanceSettings {
   corners: CornerMode;
   voiceId: string;
   voiceSpeed: number;
+}
+
+// Owner-assigned model routing — the "pill" lets the user pin a provider+model
+// to each task lane. Mirrors @crix/core's RouteLane / RouteAssignments. A lane
+// left null falls back to Crix's heuristic router.
+type RouteLane = "chat" | "coding" | "research" | "tool-use";
+const ROUTE_LANES: readonly RouteLane[] = ["chat", "coding", "research", "tool-use"] as const;
+const ROUTE_LANE_LABELS: Record<RouteLane, string> = {
+  chat: "Chat",
+  coding: "Coding",
+  research: "Research",
+  "tool-use": "Tool use",
+};
+const ROUTE_LANE_HINTS: Record<RouteLane, string> = {
+  chat: "Everyday conversation, memory, quick answers",
+  coding: "Writing & editing code",
+  research: "Planning, review, deep reasoning",
+  "tool-use": "Driving tools & summarizing their output",
+};
+
+interface RouteTarget {
+  provider: string;
+  model: string;
+}
+
+type RoutingTable = Partial<Record<RouteLane, RouteTarget>>;
+
+// Mirror of @crix/core classifyLane — the Tauri app is a standalone bundle, so
+// the heuristic is duplicated here. Keep in sync with packages/core/modelRouter.
+function classifyLaneUI(goal: string): RouteLane {
+  const g = ` ${goal.toLowerCase()} `;
+  const coding = /\b(code|coding|bug|debug|fix|refactor|function|class|method|implement|compile|build|stack ?trace|exception|typescript|javascript|python|rust|golang|api|endpoint|test|unit test|repo|git|commit|merge|lint|regex|sql|css|html|component|module|import|syntax)\b/;
+  const research = /\b(research|plan|planning|analyz|investigat|compare|comparison|evaluate|assess|design|architect|strateg|explain|why|how does|trade-?off|pros and cons|summar|review|deep dive|explore|options)\b/;
+  if (coding.test(g)) return "coding";
+  if (research.test(g)) return "research";
+  return "chat";
+}
+
+interface PendingRoute {
+  lane: RouteLane;
+  target: RouteTarget;
+  goal: string;
+  displayText: string;
+  attachments: ChatAttachment[];
+  webSearch: boolean;
 }
 
 interface VoiceOption {
@@ -531,6 +575,12 @@ function buildProviderOptions(devMode: boolean, localOllamaModels: ProviderModel
     note: "OpenAI Responses through the existing Crix auth path.",
     models: OPENAI_MODELS,
   },
+  {
+    id: "openrouter",
+    label: "OpenRouter",
+    note: "Paste your OpenRouter key, then pick from its live model catalog.",
+    models: [],
+  },
   ];
   if (devMode) {
     providers.push({
@@ -571,11 +621,14 @@ const DEFAULT_APPEARANCE: AppearanceSettings = {
   voiceId: "af_heart",
   voiceSpeed: 1.15,
 };
+// Empty by default → every lane uses Crix's heuristic router until the owner pins one.
+const DEFAULT_ROUTING: RoutingTable = {};
 const UI_DEV_MODE = import.meta.env.VITE_CRIX_DEV === "1";
 const VOICE_TTS_ENDPOINT = "ws://127.0.0.1:8765/tts";
 const VOICE_HTTP_ENDPOINT = "http://127.0.0.1:8765/voices";
 const STT_ENDPOINT = "ws://127.0.0.1:8765/stt";
-const VOICE_PREVIEW_TEXT = "Systems online. I am Crix — your entity, ready when you are.";
+const WEB_PREVIEW_BRIDGE_URL = import.meta.env.VITE_CRIX_WEB_BRIDGE_URL ?? "http://127.0.0.1:1421";
+const VOICE_PREVIEW_TEXT = "Systems online. Your new entity is ready when you are.";
 // Flush speech in small, natural units so it is spoken as it streams rather than
 // in one block at the end. A clause (comma/clause break) is enough to start; a
 // sentence end always flushes. MIN keeps fragments from being absurdly short.
@@ -583,10 +636,81 @@ const VOICE_MIN_CHUNK_CHARS = 16;
 const VOICE_SOFT_FLUSH_CHARS = 48;
 const VOICE_HARD_FLUSH_CHARS = 100;
 
+installWebPreviewBridge();
+
+type PreviewTauriInternals = {
+  invoke?: (cmd: string, args?: Record<string, unknown>, options?: unknown) => Promise<unknown>;
+  transformCallback?: (callback: (payload: unknown) => void, once?: boolean) => number;
+  unregisterCallback?: (id: number) => void;
+  runCallback?: (id: number, payload: unknown) => void;
+  callbacks?: Record<number, (payload: unknown) => void>;
+  convertFileSrc?: (filePath: string, protocol?: string) => string;
+};
+
+function installWebPreviewBridge() {
+  if (typeof window === "undefined") return;
+  const target = window as unknown as {
+    __TAURI_INTERNALS__?: PreviewTauriInternals;
+    __TAURI_EVENT_PLUGIN_INTERNALS__?: { unregisterListener: () => void };
+  };
+  if (typeof target.__TAURI_INTERNALS__?.invoke === "function") return;
+  if (!["127.0.0.1", "localhost"].includes(window.location.hostname)) return;
+
+  let callbackId = 1;
+  const callbacks: Record<number, (payload: unknown) => void> = {};
+  target.__TAURI_INTERNALS__ = {
+    callbacks,
+    async invoke(cmd, args = {}) {
+      const response = await fetch(`${WEB_PREVIEW_BRIDGE_URL}/invoke`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cmd, args }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload?.ok === false) {
+        throw new Error(String(payload?.error ?? `Preview bridge failed: HTTP ${response.status}`));
+      }
+      return payload.value;
+    },
+    transformCallback(callback, once) {
+      const id = callbackId++;
+      callbacks[id] = once
+        ? (payload: unknown) => {
+            callback(payload);
+            delete callbacks[id];
+          }
+        : callback;
+      return id;
+    },
+    unregisterCallback(id) {
+      delete callbacks[id];
+    },
+    runCallback(id, payload) {
+      callbacks[id]?.(payload);
+    },
+    convertFileSrc(filePath) {
+      return `${WEB_PREVIEW_BRIDGE_URL}/file?path=${encodeURIComponent(filePath)}`;
+    },
+  };
+  target.__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => null };
+}
+
 function App() {
   const initial = loadDesktopSettings();
   const [theme, setTheme] = useState<ThemeName>(initial.theme);
   const [appearance, setAppearance] = useState<AppearanceSettings>(initial.appearance);
+  const [routing, setRouting] = useState<RoutingTable>(initial.routing);
+  const [pendingRoute, setPendingRoute] = useState<PendingRoute | null>(null);
+  // Reduced-motion / low-power mode: stills all looping animation + the WebGL
+  // scene. Driven by the OS preference or a "crix.nofx" flag (also lets headless
+  // preview capture an idle frame).
+  const reducedMotion = useMemo(
+    () =>
+      typeof window !== "undefined" &&
+      (window.localStorage.getItem("crix.nofx") === "1" ||
+        window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true),
+    [],
+  );
   const [activeView, setActiveView] = useState<View>("chat");
   const [selection, setSelection] = useState<Selection>(initial.selection);
   const [draftSelection, setDraftSelection] = useState<Selection>(initial.selection);
@@ -777,9 +901,14 @@ function App() {
   }, []);
 
   useEffect(() => {
-    saveDesktopSettings({ theme, selection, appearance });
+    saveDesktopSettings({ theme, selection, appearance, routing });
     if (hasNativeBridge()) void invoke("crix_set_theme", { name: theme }).catch(() => null);
-  }, [theme, selection, appearance]);
+  }, [theme, selection, appearance, routing]);
+
+  // Push the owner's routing table to the daemon so the live turn uses it.
+  useEffect(() => {
+    if (hasNativeBridge()) void invoke("crix_set_routing", { routing }).catch(() => null);
+  }, [routing]);
 
   useEffect(() => {
     saveModelUsage(usageByModel);
@@ -1365,23 +1494,53 @@ function App() {
     }
   }
 
-  async function sendMessage(event: React.FormEvent) {
-    event.preventDefault();
-    const cleanMessage = message.trim();
-    const hasAttachments = attachments.length > 0;
-    if ((!cleanMessage && !hasAttachments) || !running) return;
-    const displayText = cleanMessage || "Inspect the attached image.";
-    const goal = buildOutgoingGoal(displayText, attachments, webSearchMode);
-    setMessage("");
-    setAttachments([]);
+  async function dispatchSend(goal: string, displayText: string, atts: ChatAttachment[], webSearch: boolean) {
     if (voiceEnabledRef.current) stopVoicePlayback();
-    appendToActiveSession({ type: "user_send", text: displayText, attachments, webSearch: webSearchMode });
+    appendToActiveSession({ type: "user_send", text: displayText, attachments: atts, webSearch });
     try {
       await invoke("crix_send", { goal });
     } catch (error) {
       setStatus("error");
       appendToActiveSession({ type: "desktop_error", text: String(error) });
     }
+  }
+
+  async function sendMessage(event: React.FormEvent) {
+    event.preventDefault();
+    const cleanMessage = message.trim();
+    const hasAttachments = attachments.length > 0;
+    if ((!cleanMessage && !hasAttachments) || !running) return;
+    const displayText = cleanMessage || "Inspect the attached image.";
+    const atts = attachments;
+    const webSearch = webSearchMode;
+    const goal = buildOutgoingGoal(displayText, atts, webSearch);
+    setMessage("");
+    setAttachments([]);
+    // ── live routing: does this task want a model other than what's running? ──
+    const lane = classifyLaneUI(displayText);
+    const target = routing[lane];
+    if (target && (target.provider !== selection.provider || target.model !== selection.model)) {
+      setPendingRoute({ lane, target, goal, displayText, attachments: atts, webSearch });
+      return; // notify-and-confirm: wait for the owner's call
+    }
+    await dispatchSend(goal, displayText, atts, webSearch);
+  }
+
+  async function confirmRouteSwitch() {
+    const pr = pendingRoute;
+    if (!pr) return;
+    setPendingRoute(null);
+    if (providers.some((p) => p.id === pr.target.provider)) {
+      await restartWith({ provider: pr.target.provider as ProviderId, model: pr.target.model });
+    }
+    await dispatchSend(pr.goal, pr.displayText, pr.attachments, pr.webSearch);
+  }
+
+  function keepCurrentRoute() {
+    const pr = pendingRoute;
+    if (!pr) return;
+    setPendingRoute(null);
+    void dispatchSend(pr.goal, pr.displayText, pr.attachments, pr.webSearch);
   }
 
   async function addAttachmentFiles(files: FileList | File[]) {
@@ -1526,6 +1685,7 @@ function App() {
       className="crix-app"
       data-corners={appearance.corners}
       data-theme={theme}
+      data-fx={reducedMotion ? "off" : "on"}
       data-native={hasNativeBridge() ? "1" : "0"}
       style={{
         "--glass-opacity": appearance.opacity,
@@ -1534,6 +1694,7 @@ function App() {
     >
       <ThreeScene running={running} status={status} theme={theme} />
       <FxLayer status={status} running={running} />
+      <ImageLightbox />
       <div className="commandHud" data-active={status === "active" ? "1" : "0"} aria-hidden="true" />
       <EvolutionPulseDeck pulses={pulses} />
       <AnimatePresence>
@@ -1547,8 +1708,8 @@ function App() {
         <div className="brandBlock">
           <div className="brandMark" data-hot={running ? "1" : "0"}><CrixAvatar identity={agentIdentity} /></div>
           <div>
-            <strong>Crix</strong>
-            <span>{identitySubtitle(agentIdentity, running ? "daemon linked" : daemon)}</span>
+            <strong>{cleanIdentityValue(agentIdentity.name) ?? "New entity"}</strong>
+            <span>{running ? "daemon linked" : daemon}</span>
           </div>
         </div>
 
@@ -1636,45 +1797,23 @@ function App() {
 
         <div className="sidebarFooter">
           <span className={running ? "connectionDot online" : "connectionDot"} />
-          <span>{root || "D:\\Crix"}</span>
+          <span>{root || "Desktop\\Crix Workspace"}</span>
         </div>
       </aside>
 
       <section className="workspace">
-        <header className="workspaceTop">
-          <div>
+        <EntityRunner energy={running} busy={status === "active"} />
+        <header className="workspaceTop" data-live={running ? "1" : "0"}>
+          <div className="workspaceScan" aria-hidden="true" />
+          <div className="workspaceHeading">
             <h1>{activeViewTitle(activeView)}</h1>
             <p>{selection.provider} / {selection.model}</p>
           </div>
+          <div className="workspaceLive" data-on={running ? "1" : "0"} data-fault={daemon === "error" ? "1" : "0"}>
+            <span className="workspaceLiveDot" data-on={running ? "1" : "0"} />
+            <span className="workspaceLiveText">{running ? "online" : daemon === "error" ? "fault" : "standby"}</span>
+          </div>
           <div className="modelDock">
-            <label>
-              <span>Provider</span>
-              <select value={draftSelection.provider} onChange={(event) => updateDraftProvider(event.target.value as ProviderId)}>
-                {providers.map((item) => (
-                  <option key={item.id} value={item.id}>{item.label}</option>
-                ))}
-              </select>
-              <ChevronDown size={14} />
-            </label>
-            <label className="wide">
-              <span>Model</span>
-              <select value={visibleModels.some((item) => item.id === draftSelection.model) ? draftSelection.model : "__custom"} onChange={(event) => updateDraftModel(event.target.value)}>
-                {visibleModels.map((item) => (
-                  <option key={item.id} value={item.id}>{item.id}</option>
-                ))}
-                <option value="__custom">Custom...</option>
-              </select>
-              <ChevronDown size={14} />
-            </label>
-            <label className={`reasoningDial sync-${reasoningSync}`} title="Reasoning depth updates the live daemon immediately and affects the next model call">
-              <span>Reasoning <small>{reasoningSyncLabel(reasoningSync)}</small></span>
-              <select value={reasoningLevel} onChange={(event) => changeReasoning(event.target.value as ReasoningLevel)}>
-                {REASONING_OPTIONS.map((opt) => (
-                  <option key={opt.id} value={opt.id}>{opt.label}</option>
-                ))}
-              </select>
-              <ChevronDown size={14} />
-            </label>
             <button
               className="iconAction modelRestartAction"
               disabled={!modelSelectionChanged}
@@ -1708,6 +1847,8 @@ function App() {
                 onModel={updateDraftModel}
                 onProvider={updateDraftProvider}
                 providers={providers}
+                routing={routing}
+                onRouting={setRouting}
                 ollamaDiscovery={ollamaDiscovery}
                 running={running}
                 usageByModel={usageByModel}
@@ -1752,6 +1893,26 @@ function App() {
                 voiceEnabled={voiceEnabled}
                 voiceStatus={voiceStatus}
                 webSearchMode={webSearchMode}
+                reasoningLevel={reasoningLevel}
+                onReasoning={changeReasoning}
+                reasoningSync={reasoningSync}
+                routing={routing}
+                onRouting={setRouting}
+                providers={providers}
+                selection={selection}
+                draftSelection={draftSelection}
+                onProvider={updateDraftProvider}
+                onModel={updateDraftModel}
+                onApply={() => restartWith({ ...draftSelection, model: draftSelection.model === "__custom" ? customModel : draftSelection.model })}
+                voiceId={appearance.voiceId}
+                voiceSpeed={appearance.voiceSpeed}
+                voiceCatalog={voiceCatalog}
+                onVoice={(id) => setAppearance({ ...appearance, voiceId: id })}
+                onSpeed={(speed) => setAppearance({ ...appearance, voiceSpeed: speed })}
+                onPreviewVoice={previewVoice}
+                pendingRoute={pendingRoute}
+                onConfirmRoute={confirmRouteSwitch}
+                onKeepRoute={keepCurrentRoute}
               />
             )}
           </motion.div>
@@ -1916,6 +2077,14 @@ function ThreeScene({ running, status, theme }: { running: boolean; status: stri
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    // Escape hatch: skip the WebGL scene for low-power mode, reduced-motion
+    // preference, or headless preview/screenshot capture (which hangs on GPU
+    // readback from a live render loop).
+    const fxDisabled =
+      typeof window !== "undefined" &&
+      (window.localStorage.getItem("crix.nofx") === "1" ||
+        window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
+    if (fxDisabled) return;
     const mode: SceneMode = theme;
     const palette = scenePalette(mode);
     const renderer = new THREE.WebGLRenderer({
@@ -1925,7 +2094,7 @@ function ThreeScene({ running, status, theme }: { running: boolean; status: stri
       powerPreference: "high-performance",
     });
     renderer.setClearColor(0x000000, 0);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.75));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.22;
 
@@ -1990,6 +2159,12 @@ function ThreeScene({ running, status, theme }: { running: boolean; status: stri
     const mood = moodByMode[mode] ?? moodByMode.signal;
     let energy = runningRef.current ? 0.72 : mood.idle;
     const animate = () => {
+      // Skip rendering while the window is hidden — no point burning GPU/CPU on
+      // an invisible WebGL scene (keeps the UI responsive when backgrounded).
+      if (typeof document !== "undefined" && document.hidden) {
+        raf = window.requestAnimationFrame(animate);
+        return;
+      }
       // Energy ramps smoothly toward its target, so the scene SURGES when Crix
       // starts thinking/streaming and settles when it goes idle — never snaps.
       const active = statusRef.current === "active";
@@ -2317,11 +2492,6 @@ function CrixAvatar({ identity }: { identity?: CrixIdentity }) {
   return <CrixGlyph />;
 }
 
-function identitySubtitle(identity: CrixIdentity, status: string) {
-  const name = cleanIdentityValue(identity.name);
-  return name && name.toLowerCase() !== "crix" ? `${name} · ${status}` : status;
-}
-
 function cleanIdentityValue(value?: string | null) {
   const trimmed = value?.trim();
   return trimmed || null;
@@ -2400,6 +2570,365 @@ function Titlebar({ identity }: { identity: CrixIdentity }) {
   );
 }
 
+// ── The entity: an autonomous, draggable 2D creature that lives on the header.
+// It is NOT on a fixed track — a tiny behavior brain (steering + a weighted
+// decision loop) makes it wander, idle, pull off parkour tricks, and — when
+// your cursor strays into its turf — chase it down, leap, grab it, and hang on
+// tugging. Grab IT with the mouse and it dangles from your pointer; let go and
+// it falls (gravity) and carries on. `energy` (daemon live) just makes it
+// friskier — it roams either way.
+type RunnerPose = "idle" | "run" | "jump" | "flip" | "roll" | "slide" | "punch" | "sit" | "work";
+type RunnerMode = "idle" | "wander" | "trick" | "roll" | "chase" | "grab" | "held" | "fall" | "sit" | "work";
+
+const FLOOR = 1; // y of the header floor (0 = top ledge)
+const ENTITY_KEY = "crix.entity.v1";
+
+// ── Sprite-sheet engine config ──────────────────────────────────────────────
+// Drop a sheet at tauri/public/entity.png and set the grid below. Until then,
+// the engine auto-falls back to the CSS creature (the app keeps working).
+//
+// HOW TO CONFIGURE after you add your sheet:
+//   • frameW/frameH = pixel size of ONE frame cell
+//   • cols          = how many frame columns the sheet has
+//   • displayH      = on-screen height in px (width scales to keep the frame ratio)
+//   • clips         = for each action: { row (0-based), from (first col), count, fps }
+//     Map your sheet's rows to: idle / walk / jump / roll / attack / sit.
+interface SheetClip { row: number; from: number; count: number; fps: number; }
+interface SheetConfig {
+  src: string;
+  frameW: number;
+  frameH: number;
+  cols: number;
+  displayH: number;
+  clips: Record<"idle" | "walk" | "jump" | "roll" | "attack" | "sit", SheetClip>;
+}
+const ENTITY_SHEET: SheetConfig = {
+  src: "/entity.png",
+  frameW: 32,
+  frameH: 32,
+  cols: 7,
+  displayH: 34,
+  clips: {
+    idle: { row: 0, from: 0, count: 1, fps: 4 },
+    walk: { row: 1, from: 0, count: 7, fps: 12 },
+    jump: { row: 2, from: 0, count: 3, fps: 9 },
+    roll: { row: 3, from: 0, count: 6, fps: 16 },
+    attack: { row: 4, from: 0, count: 5, fps: 16 },
+    sit: { row: 0, from: 0, count: 1, fps: 2 },
+  },
+};
+type ClipName = keyof SheetConfig["clips"];
+function poseToClip(pose: RunnerPose): ClipName {
+  switch (pose) {
+    case "run": return "walk";
+    case "jump":
+    case "flip": return "jump";
+    case "roll":
+    case "slide": return "roll";
+    case "punch":
+    case "work": return "attack";
+    case "sit": return "sit";
+    case "idle":
+    default: return "idle";
+  }
+}
+
+function EntityRunner({ energy, busy }: { energy: boolean; busy: boolean }) {
+  const stageRef = useRef<HTMLDivElement>(null);
+  const spriteRef = useRef<HTMLDivElement>(null);
+  const tetherRef = useRef<HTMLDivElement>(null);
+  const frameRef = useRef<HTMLDivElement>(null);
+  const [pose, setPose] = useState<RunnerPose>("idle");
+  const [sheetReady, setSheetReady] = useState(false);
+  const sheetReadyRef = useRef(false);
+  const frameAnim = useRef({ clip: "idle" as ClipName, idx: 0, acc: 0 });
+
+  // Mutable agent state — kept in a ref so the rAF loop never re-renders.
+  const A = useRef({
+    x: 0.88, y: FLOOR, vx: 0, vy: 0,
+    mode: "idle" as RunnerMode, t: 0, dur: 1000,
+    target: 0.88, rot: 0, face: 1, spin: 0, airborne: false,
+    combo: 0, boredom: 0,
+  });
+  const cursor = useRef({ x: 0.5, y: 0.5, inside: false });
+  const heldRef = useRef(false);
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+
+  const draw = (ts: number) => {
+    const stage = stageRef.current;
+    const sprite = spriteRef.current;
+    if (!stage || !sprite) return;
+    const w = stage.clientWidth - 24;
+    const h = stage.clientHeight - 28;
+    const a = A.current;
+    const px = Math.max(0, Math.min(1, a.x)) * w;
+    let py = Math.max(0, Math.min(1, a.y)) * h;
+    // per-stride bob so running/working reads as steps, not a glide
+    if ((a.mode === "wander" || a.mode === "chase") && !a.airborne) {
+      py -= Math.abs(Math.sin(ts / 90)) * 3.2;
+    }
+    sprite.style.transform = `translate(${px}px, ${py}px) rotate(${a.rot}deg) scaleX(${a.face})`;
+    const tether = tetherRef.current;
+    if (tether) {
+      if (a.mode === "grab") {
+        const cx = cursor.current.x * w, cy = cursor.current.y * h;
+        const dx = cx - px, dy = cy - py;
+        tether.style.opacity = "1";
+        tether.style.width = `${Math.hypot(dx, dy)}px`;
+        tether.style.transform = `translate(${px + 11}px, ${py + 6}px) rotate(${Math.atan2(dy, dx)}rad)`;
+      } else {
+        tether.style.opacity = "0";
+      }
+    }
+  };
+
+  const setMode = (m: RunnerMode, dur: number) => {
+    const a = A.current;
+    a.mode = m; a.t = 0; a.dur = dur; a.spin = 0;
+  };
+
+  // launch one trick: half the time a backflip arc, half a ground roll
+  const startTrick = () => {
+    const a = A.current;
+    if (Math.random() < 0.55) {
+      a.target = Math.max(0.08, Math.min(0.92, a.x + (Math.random() - 0.5) * 0.55));
+      setMode("trick", 720);
+      a.vy = -2.9; a.vx = (a.target - a.x) * 1.6; a.airborne = true;
+      a.spin = a.vx < 0 ? 360 : -360;
+    } else {
+      const dir = Math.random() < 0.5 ? -1 : 1;
+      a.target = Math.max(0.08, Math.min(0.92, a.x + dir * (0.3 + Math.random() * 0.3)));
+      setMode("roll", 620);
+      a.vx = dir * 1.1; a.spin = dir * 560;
+    }
+  };
+
+  const think = () => {
+    const a = A.current;
+    const c = cursor.current;
+    // tools are working → go home and "work" (the seed of the containment core)
+    if (busyRef.current && Math.random() < 0.72) {
+      a.target = 0.86; setMode("work", 1600 + Math.random() * 1800); a.boredom = 0; return;
+    }
+    // cursor in the den → hunt it
+    if (c.inside) {
+      const home = Math.abs(c.x - 0.88) < 0.25;
+      if (home || Math.random() < (energy ? 0.66 : 0.4)) { setMode("chase", 4500); a.boredom = 0; return; }
+    }
+    const r = Math.random();
+    if (a.boredom > 4 && r < 0.5) { setMode("sit", 1800 + Math.random() * 1800); a.boredom = 0; return; }
+    if (r < 0.26) { setMode("idle", 700 + Math.random() * 1100); a.boredom++; }
+    else if (r < 0.56) { a.target = 0.08 + Math.random() * 0.84; setMode("wander", 3200); a.boredom = 0; }
+    else if (r < 0.68) { setMode("sit", 1300 + Math.random() * 1400); a.boredom = 0; } // occasional chill
+    else { a.combo = energy ? 2 + Math.floor(Math.random() * 3) : 1 + Math.floor(Math.random() * 2); a.boredom = 0; startTrick(); } // show off
+  };
+
+  // probe for the sprite sheet; upgrade from the CSS creature if it's present
+  useEffect(() => {
+    const img = new Image();
+    img.onload = () => { sheetReadyRef.current = true; setSheetReady(true); };
+    img.onerror = () => { sheetReadyRef.current = false; setSheetReady(false); };
+    img.src = ENTITY_SHEET.src;
+  }, []);
+
+  // restore last known position
+  useEffect(() => {
+    try {
+      const s = JSON.parse(localStorage.getItem(ENTITY_KEY) || "{}");
+      if (typeof s.x === "number") A.current.x = Math.max(0, Math.min(1, s.x));
+    } catch { /* ignore */ }
+    const id = window.setInterval(() => {
+      try { localStorage.setItem(ENTITY_KEY, JSON.stringify({ x: A.current.x })); } catch { /* ignore */ }
+    }, 4000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const stage = stageRef.current;
+      if (!stage) return;
+      const r = stage.getBoundingClientRect();
+      const nx = (e.clientX - r.left) / r.width;
+      const ny = (e.clientY - r.top) / r.height;
+      cursor.current.inside = nx >= -0.05 && nx <= 1.05 && ny >= -0.2 && ny <= 1.4;
+      cursor.current.x = Math.max(0, Math.min(1, nx));
+      cursor.current.y = Math.max(0, Math.min(1, ny));
+    };
+    window.addEventListener("mousemove", onMove, { passive: true });
+    return () => window.removeEventListener("mousemove", onMove);
+  }, []);
+
+  useEffect(() => {
+    let raf = 0, last = 0;
+    let curPose: RunnerPose = "idle";
+    const G = 9.5;       // gravity (norm/s²)
+    const RUN = 0.34;    // run speed (norm/s) — slow enough that strides read
+
+    const nextTrickOrThink = () => {
+      const a = A.current;
+      if (a.combo > 0) { a.combo--; startTrick(); } else think();
+    };
+
+    const step = (ts: number) => {
+      if (!last) last = ts;
+      const dt = Math.min(0.048, (ts - last) / 1000);
+      last = ts;
+      const a = A.current;
+      const c = cursor.current;
+      let nextPose: RunnerPose = "idle";
+
+      if (heldRef.current) {
+        a.x += (c.x - a.x) * Math.min(1, dt * 16);
+        a.y += (c.y + 0.12 - a.y) * Math.min(1, dt * 16);
+        a.rot = Math.sin(ts / 80) * 14;
+        a.airborne = true; a.vy = 0;
+        nextPose = "punch";
+      } else {
+        a.t += dt * 1000;
+        switch (a.mode) {
+          case "idle": { a.vx = 0; if (a.t > a.dur) think(); nextPose = "idle"; break; }
+          case "sit": { a.vx = 0; if (a.t > a.dur) think(); nextPose = "sit"; break; }
+          case "work": {
+            // walk to the den, then hammer away
+            const dx = a.target - a.x;
+            if (Math.abs(dx) > 0.02) { a.vx = Math.sign(dx) * RUN; a.x += a.vx * dt; a.face = a.vx < 0 ? -1 : 1; nextPose = "run"; }
+            else { a.vx = 0; a.face = 1; nextPose = "work"; }
+            if (a.t > a.dur) think();
+            break;
+          }
+          case "wander": {
+            const dx = a.target - a.x;
+            a.vx = Math.sign(dx) * RUN; a.x += a.vx * dt; a.face = a.vx < 0 ? -1 : 1;
+            if (Math.abs(dx) < 0.02 || a.t > a.dur) think();
+            nextPose = "run"; break;
+          }
+          case "trick": {
+            a.vy += G * dt; a.x += a.vx * dt; a.y += a.vy * dt;
+            a.face = a.vx < 0 ? -1 : 1; a.rot = (a.rot + a.spin * dt) % 360;
+            nextPose = "flip";
+            if (a.y >= FLOOR) { a.y = FLOOR; a.vy = 0; a.airborne = false; a.rot = 0; nextTrickOrThink(); }
+            break;
+          }
+          case "roll": {
+            a.x += a.vx * dt; a.rot = (a.rot + a.spin * dt) % 360; a.face = a.vx < 0 ? -1 : 1;
+            nextPose = "roll";
+            if (a.t > a.dur || a.x <= 0.04 || a.x >= 0.96) { a.rot = 0; nextTrickOrThink(); }
+            break;
+          }
+          case "chase": {
+            const dx = c.x - a.x;
+            a.vx = Math.sign(dx) * RUN * 1.6; a.x += a.vx * dt; a.face = a.vx < 0 ? -1 : 1;
+            a.y += (Math.min(FLOOR, c.y) - a.y) * Math.min(1, dt * 4);
+            const near = Math.hypot(c.x - a.x, c.y - a.y);
+            nextPose = "run";
+            if (!c.inside || a.t > a.dur) setMode("fall", 0);
+            else if (near < 0.07) setMode("grab", 1600 + Math.random() * 1800);
+            break;
+          }
+          case "grab": {
+            // latched on → PUNCH the cursor, lunging with each jab
+            const jab = Math.sin(ts / 55);
+            a.x += (c.x - 0.02 * a.face - a.x) * Math.min(1, dt * 13) + jab * 0.004;
+            a.y += (c.y + 0.08 - a.y) * Math.min(1, dt * 13);
+            a.face = c.x < a.x ? -1 : 1;
+            a.rot = jab * 8;
+            nextPose = "punch";
+            if (!c.inside || a.t > a.dur) { a.rot = 0; setMode("fall", 0); a.vy = -1.2; }
+            break;
+          }
+          case "fall": {
+            a.vy += G * dt; a.y += a.vy * dt; a.x += a.vx * dt; a.rot *= 0.9;
+            nextPose = "jump";
+            if (a.y >= FLOOR) { a.y = FLOOR; a.vy = 0; a.vx = 0; a.rot = 0; think(); }
+            break;
+          }
+        }
+      }
+
+      a.x = Math.max(0, Math.min(1, a.x));
+      a.y = Math.max(0, Math.min(1, a.y));
+      draw(ts);
+      if (curPose !== nextPose) { curPose = nextPose; setPose(nextPose); }
+
+      // advance the sprite-sheet frame for the active clip
+      if (sheetReadyRef.current) {
+        const clipName = poseToClip(nextPose);
+        const fa = frameAnim.current;
+        if (fa.clip !== clipName) { fa.clip = clipName; fa.idx = 0; fa.acc = 0; }
+        const clip = ENTITY_SHEET.clips[clipName];
+        fa.acc += dt;
+        if (fa.acc >= 1 / clip.fps) { fa.acc = 0; fa.idx = (fa.idx + 1) % Math.max(1, clip.count); }
+        const frame = frameRef.current;
+        if (frame) {
+          const scale = ENTITY_SHEET.displayH / ENTITY_SHEET.frameH;
+          const col = clip.from + fa.idx;
+          frame.style.backgroundPosition = `${-col * ENTITY_SHEET.frameW * scale}px ${-clip.row * ENTITY_SHEET.frameH * scale}px`;
+        }
+      }
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [energy]);
+
+  const onPointerDown = (e: React.PointerEvent) => {
+    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+    heldRef.current = true;
+    setPose("punch");
+  };
+  const onPointerMove = (e: React.PointerEvent) => {
+    if (!heldRef.current) return;
+    const stage = stageRef.current;
+    if (!stage) return;
+    const r = stage.getBoundingClientRect();
+    cursor.current.x = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+    cursor.current.y = Math.max(0, Math.min(1, (e.clientY - r.top) / r.height));
+  };
+  const onPointerUp = () => {
+    if (!heldRef.current) return;
+    heldRef.current = false;
+    const a = A.current;
+    a.mode = "fall"; a.t = 0; a.dur = 0; a.vy = -0.6; a.vx = 0;
+  };
+
+  return (
+    <div className="entityStage" ref={stageRef} aria-hidden="true">
+      <div className="entityTether" ref={tetherRef} />
+      <div
+        className={sheetReady ? "entityRunner sheetMode" : "entityRunner"}
+        ref={spriteRef}
+        data-pose={pose}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+      >
+        {sheetReady ? (
+          <div
+            className="entitySheet"
+            ref={frameRef}
+            style={{
+              width: `${ENTITY_SHEET.frameW * (ENTITY_SHEET.displayH / ENTITY_SHEET.frameH)}px`,
+              height: `${ENTITY_SHEET.displayH}px`,
+              backgroundImage: `url(${ENTITY_SHEET.src})`,
+              backgroundSize: `${ENTITY_SHEET.cols * ENTITY_SHEET.frameW * (ENTITY_SHEET.displayH / ENTITY_SHEET.frameH)}px auto`,
+            }}
+          />
+        ) : (
+          <>
+            <span className="erShadow" />
+            <span className="erArms"><i /><i /></span>
+            <span className="erBody"><i className="erEye" /></span>
+            <span className="erLegs"><i /><i /></span>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ChatView({
   attachments,
   daemon,
@@ -2425,6 +2954,26 @@ function ChatView({
   voiceEnabled,
   voiceStatus,
   webSearchMode,
+  reasoningLevel,
+  onReasoning,
+  reasoningSync,
+  routing,
+  onRouting,
+  providers,
+  selection,
+  draftSelection,
+  onProvider,
+  onModel,
+  onApply,
+  voiceId,
+  voiceSpeed,
+  voiceCatalog,
+  onVoice,
+  onSpeed,
+  onPreviewVoice,
+  pendingRoute,
+  onConfirmRoute,
+  onKeepRoute,
 }: {
   attachments: ChatAttachment[];
   daemon: DaemonState;
@@ -2450,10 +2999,40 @@ function ChatView({
   voiceEnabled: boolean;
   voiceStatus: VoiceStatus;
   webSearchMode: boolean;
+  reasoningLevel: ReasoningLevel;
+  onReasoning: (level: ReasoningLevel) => void;
+  reasoningSync: ReasoningSync;
+  routing: RoutingTable;
+  onRouting: (next: RoutingTable) => void;
+  providers: ProviderOption[];
+  selection: Selection;
+  draftSelection: Selection;
+  onProvider: (value: ProviderId) => void;
+  onModel: (value: string) => void;
+  onApply: () => void;
+  voiceId: string;
+  voiceSpeed: number;
+  voiceCatalog: VoiceOption[];
+  onVoice: (id: string) => void;
+  onSpeed: (speed: number) => void;
+  onPreviewVoice: (id: string) => void;
+  pendingRoute: PendingRoute | null;
+  onConfirmRoute: () => void;
+  onKeepRoute: () => void;
 }) {
-  const chatEvents = events.filter(isChatVisibleEvent);
-  const clippedCount = Math.max(0, chatEvents.length - 90);
-  const visibleEvents = clippedCount > 0 ? chatEvents.slice(-90) : chatEvents;
+  // Filter + clip once per events-change, not on every render (status/activity
+  // ticks re-render ChatView constantly during a turn).
+  const { chatEvents, visibleEvents, clippedCount } = useMemo(() => {
+    const all = events.filter(isChatVisibleEvent);
+    // Drop orphaned empty "Thinking" rows (turn_start seeds one; if a tool/text
+    // lands before any thinking_delta it's left blank) — keep one only if it's
+    // the last event (the live "thinking…" indicator).
+    const ce = all.filter((e, i) =>
+      !(e.type === "thinking_stream" && !(e.text && e.text.trim()) && i !== all.length - 1),
+    );
+    const clipped = Math.max(0, ce.length - 90);
+    return { chatEvents: ce, visibleEvents: clipped > 0 ? ce.slice(-90) : ce, clippedCount: clipped };
+  }, [events]);
   const chatActive = running && (status === "active" || liveActivity.tone === "active");
   return (
     <section className="chatShell" data-active={chatActive ? "1" : "0"}>
@@ -2477,7 +3056,7 @@ function ChatView({
             {visibleEvents.map((event, index) => (
               <EventCard
                 event={event}
-                key={`${event.id ?? event.type}-${chatEvents.length - visibleEvents.length + index}`}
+                key={eventKey(event, index)}
                 onPermissionDecision={onPermissionDecision}
               />
             ))}
@@ -2485,30 +3064,62 @@ function ChatView({
         )}
       </div>
       <form className="composerBar" onSubmit={onSend}>
-        <div className="composerTools">
-          <StatusPill label="Daemon" value={daemon} tone={running ? "ok" : daemon === "error" ? "bad" : "warn"} />
-          <StatusPill label="Turns" value={String(stats.turns)} />
-          <StatusPill label="Tools" value={String(stats.tools)} />
-          <StatusPill label="Tokens" value={formatNumber(stats.tokens)} />
-          {webSearchMode ? <StatusPill label="Web" value="on" tone="ok" /> : null}
-          {voiceEnabled ? (
-            <StatusPill
-              label="Voice"
-              value={voiceStatusLabel(voiceStatus)}
-              tone={voiceStatus === "error" ? "bad" : voiceStatus === "ready" || voiceStatus === "speaking" ? "ok" : "warn"}
-            />
-          ) : null}
-          {sttStatus === "listening" || sttStatus === "transcribing" ? (
-            <StatusPill label="Mic" value={sttStatus} tone="ok" />
-          ) : sttStatus === "error" ? (
-            <StatusPill label="Mic" value="offline" tone="bad" />
-          ) : null}
-          {attachments.length > 0 ? <StatusPill label="Images" value={String(attachments.length)} tone="ok" /> : null}
-        </div>
+        {pendingRoute ? (
+          <div className="routeSuggest">
+            <span className="routeSuggestText">
+              <strong>{ROUTE_LANE_LABELS[pendingRoute.lane]} task</strong>
+              {providers.some((p) => p.id === pendingRoute.target.provider)
+                ? <> — switch to <em>{pendingRoute.target.provider} / {pendingRoute.target.model}</em>?</>
+                : <> — pinned to <em>{pendingRoute.target.provider} / {pendingRoute.target.model}</em> (not available yet)</>}
+            </span>
+            <span className="routeSuggestActions">
+              {providers.some((p) => p.id === pendingRoute.target.provider) ? (
+                <button type="button" className="routeSwitch" onClick={onConfirmRoute}>Switch &amp; send</button>
+              ) : null}
+              <button type="button" className="routeKeep" onClick={onKeepRoute}>Send on current</button>
+            </span>
+          </div>
+        ) : null}
+        <OptionsBar
+          dropUp
+          reasoningLevel={reasoningLevel}
+          onReasoning={onReasoning}
+          reasoningSync={reasoningSync}
+          routing={routing}
+          onRouting={onRouting}
+          providers={providers}
+          selection={selection}
+          draftSelection={draftSelection}
+          onProvider={onProvider}
+          onModel={onModel}
+          onApply={onApply}
+          running={running}
+          voiceId={voiceId}
+          voiceSpeed={voiceSpeed}
+          voiceCatalog={voiceCatalog}
+          onVoice={onVoice}
+          onSpeed={onSpeed}
+          onPreviewVoice={onPreviewVoice}
+        />
+        {(webSearchMode || (voiceEnabled && voiceStatus !== "off") || sttStatus === "listening" || sttStatus === "transcribing") ? (
+          <div className="composerTools">
+            {webSearchMode ? <StatusPill label="Web" value="on" tone="ok" /> : null}
+            {voiceEnabled && voiceStatus !== "off" ? (
+              <StatusPill
+                label="Voice"
+                value={voiceStatusLabel(voiceStatus)}
+                tone={voiceStatus === "error" ? "bad" : voiceStatus === "ready" || voiceStatus === "speaking" ? "ok" : "warn"}
+              />
+            ) : null}
+            {sttStatus === "listening" || sttStatus === "transcribing" ? (
+              <StatusPill label="Mic" value={sttStatus} tone="ok" />
+            ) : null}
+          </div>
+        ) : null}
         {attachments.length > 0 ? (
           <AttachmentTray attachments={attachments} onRemove={onAttachmentRemove} />
         ) : null}
-        <LiveActivityStrip activity={liveActivity} />
+        {liveActivity.tone !== "idle" ? <LiveActivityStrip activity={liveActivity} /> : null}
         <div className="composerInput">
           <div className={voiceEnabled ? "composerIconCluster voiceCluster" : "composerIconCluster"}>
             <input
@@ -2593,7 +3204,8 @@ function ChatView({
                 event.currentTarget.form?.requestSubmit();
               }
             }}
-            placeholder="Message Crix..."
+            placeholder="Message your entity..."
+            rows={1}
             disabled={!running}
           />
           <button className="sendButton" disabled={!running || (message.trim().length === 0 && attachments.length === 0)} type="submit" title="Send">
@@ -2602,6 +3214,589 @@ function ChatView({
         </div>
       </form>
     </section>
+  );
+}
+
+// OpenRouter: paste a key, load the live catalog, pick a model. The key is sent
+// to the daemon (persisted to ui.json) and used as Bearer auth; the model list
+// comes from OpenRouter's public /models endpoint (fetched in-webview).
+interface OpenRouterModelRow { id: string; name: string; context?: number; price?: string }
+function OpenRouterPanel({
+  draftSelection,
+  onPick,
+  onApply,
+  running,
+}: {
+  draftSelection: Selection;
+  onPick: (modelId: string) => void;
+  onApply: () => void;
+  running: boolean;
+}) {
+  const [key, setKey] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [models, setModels] = useState<OpenRouterModelRow[]>([]);
+  const [status, setStatus] = useState<"idle" | "loading" | "error" | "loaded">("idle");
+  const [error, setError] = useState("");
+  const [filter, setFilter] = useState("");
+
+  const loadModels = async (withKey?: string) => {
+    setStatus("loading");
+    setError("");
+    try {
+      const headers: Record<string, string> = {};
+      if (withKey) headers.Authorization = `Bearer ${withKey}`;
+      const res = await fetch("https://openrouter.ai/api/v1/models", { headers });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const rows: OpenRouterModelRow[] = (Array.isArray(json.data) ? json.data : []).map((r: Record<string, unknown>) => ({
+        id: String(r.id),
+        name: typeof r.name === "string" ? r.name : String(r.id),
+        context: typeof r.context_length === "number" ? r.context_length : undefined,
+        price: typeof (r.pricing as Record<string, unknown> | undefined)?.prompt === "string" ? String((r.pricing as Record<string, unknown>).prompt) : undefined,
+      }));
+      rows.sort((a, b) => a.id.localeCompare(b.id));
+      setModels(rows);
+      setStatus("loaded");
+    } catch (err) {
+      setStatus("error");
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  useEffect(() => {
+    void loadModels();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const saveKey = async () => {
+    const trimmed = key.trim();
+    try {
+      if (hasNativeBridge()) await invoke("crix_set_openrouter_key", { key: trimmed, model: draftSelection.model });
+      setSaved(true);
+      window.setTimeout(() => setSaved(false), 1800);
+      void loadModels(trimmed || undefined);
+    } catch {
+      setStatus("error");
+      setError("Could not save key to the daemon.");
+    }
+  };
+
+  const shown = filter.trim()
+    ? models.filter((m) => (m.id + " " + m.name).toLowerCase().includes(filter.trim().toLowerCase()))
+    : models;
+
+  return (
+    <section className="orPanel">
+      <div className="orKeyRow">
+        <label>
+          <span>OpenRouter API key</span>
+          <input
+            type="password"
+            value={key}
+            placeholder="sk-or-…  (stored locally, sent only to OpenRouter)"
+            onChange={(e) => setKey(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") void saveKey(); }}
+          />
+        </label>
+        <button type="button" className="primaryAction" onClick={() => void saveKey()}>
+          {saved ? <><Check size={15} /> Saved</> : "Save key"}
+        </button>
+      </div>
+      <div className="orCatalogHead">
+        <input className="orFilter" value={filter} placeholder="Filter models…" onChange={(e) => setFilter(e.target.value)} />
+        <span className="orCount">
+          {status === "loading" ? "Loading…" : status === "error" ? `Error: ${error}` : `${shown.length} models`}
+        </span>
+        <button type="button" className="iconAction" title="Reload catalog" onClick={() => void loadModels(key.trim() || undefined)}>
+          <RefreshCw size={14} />
+        </button>
+      </div>
+      <div className="orList">
+        {shown.slice(0, 400).map((m) => (
+          <button
+            key={m.id}
+            type="button"
+            className={m.id === draftSelection.model ? "orModel selected" : "orModel"}
+            onClick={() => onPick(m.id)}
+          >
+            <span className="orModelMain">
+              <strong>{m.id}</strong>
+              <small>{m.name}{m.context ? ` · ${Math.round(m.context / 1000)}k ctx` : ""}</small>
+            </span>
+            {m.id === draftSelection.model ? <Check size={15} /> : null}
+          </button>
+        ))}
+        {status === "loaded" && shown.length === 0 ? <div className="orEmpty">No models match.</div> : null}
+      </div>
+      <div className="orApplyRow">
+        <span className="orSelected">{draftSelection.model || "no model selected"}</span>
+        <button className="primaryAction" type="button" onClick={onApply}>
+          <Play size={15} /> {running ? "Restart with model" : "Start with model"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+// The owner-facing routing pills: one labeled pill per task lane. Each shows
+// its current target (or "Auto" → heuristic router) and expands to assign a
+// provider + model. Writing here flows to localStorage + the daemon, and the
+// live turn resolves the route via @crix/core resolveRoute().
+function RoutingPills({
+  routing,
+  providers,
+  onRouting,
+}: {
+  routing: RoutingTable;
+  providers: ProviderOption[];
+  onRouting: (next: RoutingTable) => void;
+}) {
+  const [editing, setEditing] = useState<RouteLane | null>(null);
+  const providerLabel = (id: string) => providers.find((p) => p.id === id)?.label ?? id;
+
+  const setLane = (lane: RouteLane, target: RouteTarget | null) => {
+    const next: RoutingTable = { ...routing };
+    if (target) next[lane] = target;
+    else delete next[lane];
+    onRouting(next);
+  };
+
+  return (
+    <section className="routingPills">
+      <header className="routingHead">
+        <span><Sparkles size={15} /> Model routing</span>
+        <small>Pin a model to a task — or leave it on Auto for the smart router.</small>
+      </header>
+      <div className="routingRow">
+        {ROUTE_LANES.map((lane) => {
+          const target = routing[lane];
+          const open = editing === lane;
+          return (
+            <div className={open ? "routePill open" : "routePill"} key={lane}>
+              <button
+                type="button"
+                className={target ? "routePillFace pinned" : "routePillFace"}
+                onClick={() => setEditing(open ? null : lane)}
+                title={ROUTE_LANE_HINTS[lane]}
+              >
+                <span className="routeLane">{ROUTE_LANE_LABELS[lane]}</span>
+                <span className="routeTarget">
+                  {target ? `${providerLabel(target.provider)} · ${target.model}` : "Auto"}
+                </span>
+              </button>
+              {open ? (
+                <div className="routeEditor">
+                  <label>
+                    <span>Provider</span>
+                    <select
+                      value={target?.provider ?? providers[0]?.id ?? ""}
+                      onChange={(event) =>
+                        setLane(lane, { provider: event.target.value, model: target?.model ?? "" })
+                      }
+                    >
+                      {providers.map((p) => (
+                        <option key={p.id} value={p.id}>{p.label}</option>
+                      ))}
+                      <option value="openrouter">OpenRouter</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Model id</span>
+                    <input
+                      value={target?.model ?? ""}
+                      placeholder="e.g. qwen3-coder:480b-cloud"
+                      onChange={(event) =>
+                        setLane(lane, {
+                          provider: target?.provider ?? providers[0]?.id ?? "ollama",
+                          model: event.target.value,
+                        })
+                      }
+                    />
+                  </label>
+                  <div className="routeEditorActions">
+                    <button
+                      type="button"
+                      className="routeClear"
+                      onClick={() => {
+                        setLane(lane, null);
+                        setEditing(null);
+                      }}
+                    >
+                      Reset to Auto
+                    </button>
+                    <button type="button" className="routeDone" onClick={() => setEditing(null)}>
+                      Done
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+// The three route lanes the owner steers from the bar (tool-use stays Auto).
+const ROUTE_PILL_LANES: { lane: RouteLane; label: string; hint: string }[] = [
+  { lane: "chat", label: "Main", hint: "Normal chat & quick answers" },
+  { lane: "coding", label: "Coding", hint: "Writing & editing code" },
+  { lane: "research", label: "Research", hint: "Planning, review, deep reasoning" },
+];
+
+// Claude-style options bar: a row of labeled pills (Reasoning · Route · Voice),
+// each opening an animated dropdown. Route + Voice fan out to a nested side
+// panel for per-option customization (provider + model).
+function OptionsBar({
+  reasoningLevel,
+  onReasoning,
+  reasoningSync,
+  routing,
+  onRouting,
+  providers,
+  selection,
+  draftSelection,
+  onProvider,
+  onModel,
+  onApply,
+  running,
+  voiceId,
+  voiceSpeed,
+  voiceCatalog,
+  onVoice,
+  onSpeed,
+  onPreviewVoice,
+  dropUp = false,
+}: {
+  reasoningLevel: ReasoningLevel;
+  onReasoning: (level: ReasoningLevel) => void;
+  reasoningSync: ReasoningSync;
+  routing: RoutingTable;
+  onRouting: (next: RoutingTable) => void;
+  providers: ProviderOption[];
+  selection: Selection;
+  draftSelection: Selection;
+  onProvider: (value: ProviderId) => void;
+  onModel: (value: string) => void;
+  onApply: () => void;
+  running: boolean;
+  voiceId: string;
+  voiceSpeed: number;
+  voiceCatalog: VoiceOption[];
+  onVoice: (id: string) => void;
+  onSpeed: (speed: number) => void;
+  onPreviewVoice: (id: string) => void;
+  dropUp?: boolean;
+}) {
+  const [open, setOpen] = useState<null | "provider" | "model" | "reasoning" | "route" | "voice">(null);
+  const [activeLane, setActiveLane] = useState<RouteLane>("chat");
+  const barRef = useRef<HTMLDivElement>(null);
+
+  const activeProvider = providers.find((p) => p.id === draftSelection.provider) ?? providers[0];
+  const draftModels = activeProvider?.models ?? [];
+  const modelDirty =
+    draftSelection.provider !== selection.provider || draftSelection.model !== selection.model;
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (event: MouseEvent) => {
+      if (barRef.current && !barRef.current.contains(event.target as Node)) setOpen(null);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  const providerLabel = (id: string) =>
+    providers.find((p) => p.id === id)?.label ?? (id === "openrouter" ? "OpenRouter" : id);
+  const pinnedCount = ROUTE_PILL_LANES.filter(({ lane }) => routing[lane]).length;
+  const activeTarget = routing[activeLane];
+  const activeVoice = voiceCatalog.find((v) => v.id === voiceId);
+
+  const setLane = (lane: RouteLane, target: RouteTarget | null) => {
+    const next: RoutingTable = { ...routing };
+    if (target) next[lane] = target;
+    else delete next[lane];
+    onRouting(next);
+  };
+
+  const menuMotion = {
+    initial: { opacity: 0, y: dropUp ? 8 : -8, scale: 0.97 },
+    animate: { opacity: 1, y: 0, scale: 1 },
+    exit: { opacity: 0, y: dropUp ? 8 : -8, scale: 0.97 },
+    transition: { duration: 0.16, ease: [0.16, 0.84, 0.24, 1] as [number, number, number, number] },
+  };
+
+  return (
+    <div className={dropUp ? "optionsBar dropUp" : "optionsBar"} ref={barRef}>
+      {/* ── Provider ──────────────────────────────────────────── */}
+      <div className="optionPillWrap">
+        <button
+          type="button"
+          className={open === "provider" ? "optionPill active" : "optionPill"}
+          onClick={() => setOpen(open === "provider" ? null : "provider")}
+        >
+          <Cloud size={14} />
+          <span className="optionPillBody">
+            <small>Provider</small>
+            <strong>{activeProvider?.label ?? draftSelection.provider}</strong>
+          </span>
+          <ChevronDown size={13} className="optionChevron" />
+        </button>
+        <AnimatePresence>
+          {open === "provider" ? (
+            <motion.div className="optionMenu" {...menuMotion}>
+              <div className="optionMenuHead">Provider</div>
+              {providers.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  className={p.id === draftSelection.provider ? "optionRow selected" : "optionRow"}
+                  onClick={() => {
+                    onProvider(p.id);
+                    setOpen("model");
+                  }}
+                >
+                  <span className="laneText">
+                    <strong>{p.label}</strong>
+                    <small>{p.note}</small>
+                  </span>
+                  {p.id === draftSelection.provider ? <Check size={14} /> : null}
+                </button>
+              ))}
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+      </div>
+
+      {/* ── Model ─────────────────────────────────────────────── */}
+      <div className="optionPillWrap">
+        <button
+          type="button"
+          className={open === "model" ? "optionPill active" : "optionPill"}
+          onClick={() => setOpen(open === "model" ? null : "model")}
+        >
+          <Layers size={14} />
+          <span className="optionPillBody">
+            <small>Model{modelDirty ? " •" : ""}</small>
+            <strong>{draftSelection.model}</strong>
+          </span>
+          <ChevronDown size={13} className="optionChevron" />
+        </button>
+        <AnimatePresence>
+          {open === "model" ? (
+            <motion.div className="optionMenu modelMenu" {...menuMotion}>
+              <div className="optionMenuHead">{activeProvider?.label ?? "Model"}</div>
+              <div className="voiceScroll">
+                {draftModels.length === 0 ? (
+                  <div className="optionEmpty">No models discovered for this provider.</div>
+                ) : (
+                  draftModels.map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      className={m.id === draftSelection.model ? "optionRow selected" : "optionRow"}
+                      onClick={() => onModel(m.id)}
+                    >
+                      <span className="laneText">
+                        <strong>{m.id}</strong>
+                        {m.hint ? <small>{m.hint}</small> : null}
+                      </span>
+                      {m.id === draftSelection.model ? <Check size={14} /> : null}
+                    </button>
+                  ))
+                )}
+              </div>
+              <button
+                type="button"
+                className="modelApply"
+                disabled={!modelDirty}
+                onClick={() => {
+                  onApply();
+                  setOpen(null);
+                }}
+              >
+                {running ? "Restart with this model" : "Start with this model"}
+              </button>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+      </div>
+
+      {/* ── Reasoning ─────────────────────────────────────────── */}
+      <div className="optionPillWrap">
+        <button
+          type="button"
+          className={open === "reasoning" ? "optionPill active" : "optionPill"}
+          onClick={() => setOpen(open === "reasoning" ? null : "reasoning")}
+        >
+          <Brain size={14} />
+          <span className="optionPillBody">
+            <small>Reasoning</small>
+            <strong>{reasoningLabel(reasoningLevel)}</strong>
+          </span>
+          <ChevronDown size={13} className="optionChevron" />
+        </button>
+        <AnimatePresence>
+          {open === "reasoning" ? (
+            <motion.div className="optionMenu" {...menuMotion}>
+              <div className="optionMenuHead">Reasoning effort <small className={`reasoningTag sync-${reasoningSync}`}>{reasoningSyncLabel(reasoningSync)}</small></div>
+              {REASONING_OPTIONS.map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  className={opt.id === reasoningLevel ? "optionRow selected" : "optionRow"}
+                  onClick={() => {
+                    onReasoning(opt.id);
+                    setOpen(null);
+                  }}
+                >
+                  <span>{opt.label}</span>
+                  {opt.id === reasoningLevel ? <Check size={14} /> : null}
+                </button>
+              ))}
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+      </div>
+
+      {/* ── Route ─────────────────────────────────────────────── */}
+      <div className="optionPillWrap">
+        <button
+          type="button"
+          className={open === "route" ? "optionPill active" : "optionPill"}
+          onClick={() => setOpen(open === "route" ? null : "route")}
+        >
+          <Gauge size={14} />
+          <span className="optionPillBody">
+            <small>Route</small>
+            <strong>{pinnedCount > 0 ? `${pinnedCount} pinned` : "Auto"}</strong>
+          </span>
+          <ChevronDown size={13} className="optionChevron" />
+        </button>
+        <AnimatePresence>
+          {open === "route" ? (
+            <motion.div className="optionMenu withSub" {...menuMotion}>
+              <div className="optionMenuCol">
+                <div className="optionMenuHead">Route by task</div>
+                {ROUTE_PILL_LANES.map(({ lane, label, hint }) => {
+                  const target = routing[lane];
+                  return (
+                    <button
+                      key={lane}
+                      type="button"
+                      className={activeLane === lane ? "optionRow lane selected" : "optionRow lane"}
+                      onMouseEnter={() => setActiveLane(lane)}
+                      onClick={() => setActiveLane(lane)}
+                    >
+                      <span className="laneText">
+                        <strong>{label}</strong>
+                        <small>{target ? `${providerLabel(target.provider)} · ${target.model}` : hint}</small>
+                      </span>
+                      <ChevronDown size={13} className="laneArrow" />
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="optionMenuSub">
+                <div className="optionMenuHead">{ROUTE_PILL_LANES.find((l) => l.lane === activeLane)?.label}</div>
+                <label className="subField">
+                  <span>Provider</span>
+                  <select
+                    value={activeTarget?.provider ?? providers[0]?.id ?? ""}
+                    onChange={(event) =>
+                      setLane(activeLane, { provider: event.target.value, model: activeTarget?.model ?? "" })
+                    }
+                  >
+                    {providers.map((p) => (
+                      <option key={p.id} value={p.id}>{p.label}</option>
+                    ))}
+                    <option value="openrouter">OpenRouter</option>
+                  </select>
+                </label>
+                <label className="subField">
+                  <span>Model id</span>
+                  <input
+                    value={activeTarget?.model ?? ""}
+                    placeholder="e.g. qwen3-coder:480b-cloud"
+                    onChange={(event) =>
+                      setLane(activeLane, {
+                        provider: activeTarget?.provider ?? providers[0]?.id ?? "ollama",
+                        model: event.target.value,
+                      })
+                    }
+                  />
+                </label>
+                <button type="button" className="subReset" onClick={() => setLane(activeLane, null)}>
+                  Reset to Auto
+                </button>
+              </div>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+      </div>
+
+      {/* ── Voice ─────────────────────────────────────────────── */}
+      <div className="optionPillWrap">
+        <button
+          type="button"
+          className={open === "voice" ? "optionPill active" : "optionPill"}
+          onClick={() => setOpen(open === "voice" ? null : "voice")}
+        >
+          <Volume2 size={14} />
+          <span className="optionPillBody">
+            <small>Voice</small>
+            <strong>{activeVoice?.label ?? voiceId}</strong>
+          </span>
+          <ChevronDown size={13} className="optionChevron" />
+        </button>
+        <AnimatePresence>
+          {open === "voice" ? (
+            <motion.div className="optionMenu withSub voiceMenu" {...menuMotion}>
+              <div className="optionMenuCol">
+                <div className="optionMenuHead">Voice <small className="reasoningTag">Local · Kokoro</small></div>
+                <div className="voiceScroll">
+                  {voiceCatalog.map((v) => (
+                    <button
+                      key={v.id}
+                      type="button"
+                      className={v.id === voiceId ? "optionRow selected" : "optionRow"}
+                      onClick={() => {
+                        onVoice(v.id);
+                        onPreviewVoice(v.id);
+                      }}
+                    >
+                      <span className="laneText">
+                        <strong>{v.label}</strong>
+                        <small>{v.accent} · {v.character}</small>
+                      </span>
+                      {v.id === voiceId ? <Check size={14} /> : null}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="optionMenuSub">
+                <div className="optionMenuHead">Tuning</div>
+                <label className="subField">
+                  <span>Speed <strong>{voiceSpeed.toFixed(2)}×</strong></span>
+                  <input
+                    type="range"
+                    min="0.7"
+                    max="1.5"
+                    step="0.05"
+                    value={voiceSpeed}
+                    onChange={(event) => onSpeed(Number(event.target.value))}
+                  />
+                </label>
+                <button type="button" className="subReset" onClick={() => onPreviewVoice(voiceId)}>
+                  <Volume2 size={13} /> Preview
+                </button>
+              </div>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+      </div>
+    </div>
   );
 }
 
@@ -2614,6 +3809,8 @@ function ProvidersView({
   onModel,
   onProvider,
   providers,
+  routing,
+  onRouting,
   running,
   usageByModel,
 }: {
@@ -2625,6 +3822,8 @@ function ProvidersView({
   onModel: (value: string) => void;
   onProvider: (value: ProviderId) => void;
   providers: ProviderOption[];
+  routing: RoutingTable;
+  onRouting: (next: RoutingTable) => void;
   running: boolean;
   usageByModel: Record<string, ModelUsage>;
 }) {
@@ -2669,6 +3868,17 @@ function ProvidersView({
           </div>
         </div>
 
+        <RoutingPills routing={routing} providers={providers} onRouting={onRouting} />
+
+        {activeProvider.id === "openrouter" ? (
+          <OpenRouterPanel
+            draftSelection={draftSelection}
+            onPick={(id) => onModel(id)}
+            onApply={onApply}
+            running={running}
+          />
+        ) : null}
+
         {activeProvider.id === "ollama" ? (
           <div className={ollamaDiscovery.reachable ? "discoveryBar online" : "discoveryBar"}>
             {ollamaDiscovery.reachable ? <Check size={15} /> : <AlertTriangle size={15} />}
@@ -2680,28 +3890,32 @@ function ProvidersView({
           </div>
         ) : null}
 
-        <ModelInspector
-          model={selectedModel}
-          onSelect={() => onModel(selectedModel.id)}
-          provider={activeProvider}
-          selected={selectedModel.id === draftSelection.model}
-          usage={selectedUsage}
-          localRoot={ollamaDiscovery.localRoot}
-        />
+        {activeProvider.id !== "openrouter" ? (
+          <>
+            <ModelInspector
+              model={selectedModel}
+              onSelect={() => onModel(selectedModel.id)}
+              provider={activeProvider}
+              selected={selectedModel.id === draftSelection.model}
+              usage={selectedUsage}
+              localRoot={ollamaDiscovery.localRoot}
+            />
 
-        <div className="customModel">
-          <label>
-            <span>Exact model id</span>
-            <input value={customModel} onChange={(event) => {
-              onCustomModel(event.target.value);
-              onModel("__custom");
-            }} />
-          </label>
-          <button className="primaryAction" type="button" onClick={onApply}>
-            <Play size={15} />
-            {running ? "Restart with model" : "Start with model"}
-          </button>
-        </div>
+            <div className="customModel">
+              <label>
+                <span>Exact model id</span>
+                <input value={customModel} onChange={(event) => {
+                  onCustomModel(event.target.value);
+                  onModel("__custom");
+                }} />
+              </label>
+              <button className="primaryAction" type="button" onClick={onApply}>
+                <Play size={15} />
+                {running ? "Restart with model" : "Start with model"}
+              </button>
+            </div>
+          </>
+        ) : null}
 
         {activeProvider.id === "ollama" ? (
           <ModelSection
@@ -3177,7 +4391,85 @@ function ToolsView({ events }: { events: CrixEvent[] }) {
   );
 }
 
-function EventCard({
+// Hermes-style compact activity flow row for a tool call: one line —
+// [icon] what it's doing ............... duration — expandable for detail,
+// instead of a heavy stacked card. Running = pulsing; done = quiet; failed = red.
+function flowIcon(name?: string, activity?: string) {
+  const s = `${name ?? ""} ${activity ?? ""}`.toLowerCase();
+  if (/web|search|browser|fetch|http|open|navigat|url|page/.test(s)) return Globe2;
+  if (/read|file|cat|view|edit|write|patch|diff|code/.test(s)) return Code2;
+  if (/bash|shell|command|run|exec|terminal|npm|git|build/.test(s)) return TerminalSquare;
+  if (/memory|recall|remember|store|db/.test(s)) return Database;
+  return Wrench;
+}
+
+// Walk a tool's output for LOCAL image files (browser screenshot frames,
+// filmstrip captures) so they render inline as actual pictures via Tauri's
+// convertFileSrc — this is how "find me images" shows results headlessly.
+function collectToolImagePaths(output: unknown, acc: string[] = [], depth = 0): string[] {
+  if (acc.length >= 6 || depth > 5 || output == null) return acc;
+  if (typeof output === "string") {
+    if (/[\\/][^\\/]+\.(png|jpe?g|webp|gif)$/i.test(output) && /^[a-z]:[\\/]|^\//i.test(output)) acc.push(output);
+    return acc;
+  }
+  if (Array.isArray(output)) {
+    for (const v of output) collectToolImagePaths(v, acc, depth + 1);
+    return acc;
+  }
+  if (typeof output === "object") {
+    for (const v of Object.values(output as Record<string, unknown>)) collectToolImagePaths(v, acc, depth + 1);
+  }
+  return acc;
+}
+
+function ToolFlowRow({ event }: { event: CrixEvent }) {
+  const [open, setOpen] = useState(false);
+  const status = event.status ?? "running";
+  const Icon = flowIcon(event.name, event.activityDescription);
+  const label = event.activityDescription || (event.name ? `Running ${event.name}` : "Working");
+  const dur = typeof event.durationMs === "number" ? formatToolDuration(event.durationMs) : "";
+  const detail = status === "failed"
+    ? (typeof event.error === "string" ? event.error : previewValue(event.error))
+    : [event.display, event.output !== undefined ? previewValue(event.output) : ""].filter(Boolean).join("\n");
+  const hasDetail = Boolean(detail && detail.trim());
+  const imagePaths = useMemo(
+    () => (status === "completed" ? collectToolImagePaths(event.output) : []),
+    [status, event.output],
+  );
+  return (
+    <motion.div
+      className={`flowRow state-${status}`}
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
+    >
+      <button type="button" className="flowHead" onClick={() => hasDetail && setOpen((v) => !v)} disabled={!hasDetail}>
+        <span className="flowIcon"><Icon size={14} /></span>
+        <span className="flowLabel">{label}</span>
+        {status === "running" ? (
+          <span className="flowDots"><i /><i /><i /></span>
+        ) : status === "failed" ? (
+          <span className="flowBad">failed</span>
+        ) : null}
+        {dur ? <span className="flowMeta">{dur}</span> : null}
+        {hasDetail ? <ChevronDown size={12} className={open ? "flowChevron open" : "flowChevron"} /> : null}
+      </button>
+      {imagePaths.length > 0 ? (
+        <div className="chatImages flowImages">
+          {imagePaths.map((p) => <ChatImageThumb key={p} src={hasNativeBridge() ? convertFileSrc(p) : p} />)}
+        </div>
+      ) : null}
+      {open && hasDetail ? <pre className="flowDetail">{detail}</pre> : null}
+    </motion.div>
+  );
+}
+
+function formatToolDuration(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+const EventCard = memo(function EventCard({
   event,
   compact = false,
   onPermissionDecision,
@@ -3187,6 +4479,8 @@ function EventCard({
   onPermissionDecision?: (id: string | undefined, decision: PermissionDecision) => void;
 }) {
   if (event.type === "thinking_stream") return <ThinkingTrace event={event} compact={compact} />;
+  if (event.type === "tool_call") return <ToolFlowRow event={event} />;
+  if (event.type === "permission_gate") return <PermissionFlow event={event} onDecision={onPermissionDecision} />;
   const kind = eventKind(event);
   const title = eventTitle(event);
   const text = eventText(event);
@@ -3195,7 +4489,6 @@ function EventCard({
   return (
     <motion.article
       className={`eventCard ${kind}${state ? ` state-${state}` : ""}${compact ? " compact" : ""}`}
-      layout
       initial={{ opacity: 0, y: 12, scale: 0.985 }}
       animate={{ opacity: 1, y: 0, scale: 1 }}
       transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
@@ -3204,15 +4497,13 @@ function EventCard({
       <div className="eventBody">
         <header>
           <strong>{title}</strong>
-          {event.type === "tool_call" && event.name ? <small className="eventToolName">{event.name}</small> : null}
-          <time>{event.type === "tool_call" ? event.status : event.type}</time>
+          <time>{event.type}</time>
         </header>
-        {event.type === "permission_gate" ? (
-          <PermissionGate event={event} onDecision={onPermissionDecision} />
-        ) : event.type === "tool_call" ? (
-          <ToolCallShow event={event} text={text} />
-        ) : event.type === "assistant_stream" && text ? (
-          <StreamingText text={text} />
+        {event.type === "assistant_stream" && text ? (
+          <>
+            <StreamingText text={text} />
+            <ChatImages text={text} />
+          </>
         ) : text ? (
           <pre>{text}</pre>
         ) : null}
@@ -3225,6 +4516,54 @@ function EventCard({
         ) : null}
       </div>
     </motion.article>
+  );
+}, (a, b) => a.event === b.event && a.compact === b.compact);
+
+// Clean flow-styled approval prompt — matches the activity rows instead of the
+// old heavy card. Reason inline, input collapsed, compact actions.
+function PermissionFlow({
+  event,
+  onDecision,
+}: {
+  event: CrixEvent;
+  onDecision?: (id: string | undefined, decision: PermissionDecision) => void;
+}) {
+  const [showInput, setShowInput] = useState(false);
+  const waiting = event.status === "waiting";
+  const decision = normalizeDecision(event.decision);
+  const tool = event.toolName || "Action";
+  return (
+    <motion.div
+      className={`flowRow permissionFlow ${waiting ? "waiting" : decision === "deny" ? "denied" : "allowed"}`}
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
+    >
+      <div className="permFlowHead">
+        <span className="flowIcon"><ShieldCheck size={14} /></span>
+        <span className="permFlowText">
+          <strong>{tool}</strong> {event.reason || "needs approval"}
+        </span>
+        {event.input !== undefined ? (
+          <button type="button" className="permFlowPeek" onClick={() => setShowInput((v) => !v)}>
+            {showInput ? "hide" : "details"}
+          </button>
+        ) : null}
+      </div>
+      {showInput && event.input !== undefined ? <pre className="flowDetail">{previewValue(event.input)}</pre> : null}
+      {waiting ? (
+        <div className="permFlowActions">
+          <button type="button" className="pAllow" onClick={() => onDecision?.(event.id, "allow_once")}><Check size={13} /> Allow</button>
+          <button type="button" className="pAlways" onClick={() => onDecision?.(event.id, "allow_always")}><ShieldCheck size={13} /> Always</button>
+          <button type="button" className="pDeny" onClick={() => onDecision?.(event.id, "deny")}><X size={13} /> Deny</button>
+        </div>
+      ) : (
+        <div className={`permFlowResult ${decision === "deny" ? "deny" : "allow"}`}>
+          {decision === "deny" ? <X size={12} /> : <Check size={12} />}
+          {decision ? permissionDecisionLabel(decision) : "Answered"}
+        </div>
+      )}
+    </motion.div>
   );
 }
 
@@ -3323,59 +4662,113 @@ function AttachmentStrip({ attachments }: { attachments: ChatAttachment[] }) {
 }
 
 function ThinkingTrace({ event, compact = false }: { event: CrixEvent; compact?: boolean }) {
-  const [expanded, setExpanded] = useState(true);
+  const [open, setOpen] = useState(true);
   const text = eventText(event);
-  const charCount = text.length;
+  const meta = text.length > 0 ? `${formatNumber(text.length)} chars` : "";
   return (
-    <motion.article
-      className={`eventCard thinking${compact ? " compact" : ""}`}
-      layout
-      initial={{ opacity: 0, y: 10, scale: 0.985 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      transition={{ duration: 0.22, ease: [0.2, 0.8, 0.2, 1] }}
+    <motion.div
+      className={`flowRow state-thinking${compact ? " compact" : ""}`}
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
     >
-      <div className="eventAvatar"><Brain size={16} /></div>
-      <div className="thinkingPanel">
-        <button
-          aria-expanded={expanded}
-          className="thinkingToggle"
-          onClick={() => setExpanded((value) => !value)}
-          type="button"
-        >
-          <span className="thinkingPulse" />
-          <strong>Thinking</strong>
-          <span className="thinkingMeta">{charCount > 0 ? `${formatNumber(charCount)} chars streaming` : "waiting"}</span>
-          <ChevronDown className={expanded ? "thinkingChevron open" : "thinkingChevron"} size={16} />
-        </button>
-        <AnimatePresence initial={false}>
-          {expanded ? (
-            <motion.div
-              animate={{ height: "auto", opacity: 1, filter: "blur(0px)" }}
-              className="thinkingContent"
-              exit={{ height: 0, opacity: 0, filter: "blur(6px)" }}
-              initial={{ height: 0, opacity: 0, filter: "blur(6px)" }}
-              transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
-            >
-              <StreamingText text={text || "Thinking..."} />
-            </motion.div>
-          ) : null}
-        </AnimatePresence>
-      </div>
-    </motion.article>
+      <button type="button" className="flowHead" onClick={() => setOpen((v) => !v)}>
+        <span className="flowIcon"><Brain size={14} /></span>
+        <span className="flowLabel">Thinking</span>
+        {meta ? <span className="flowMeta">{meta}</span> : <span className="flowDots"><i /><i /><i /></span>}
+        <ChevronDown size={12} className={open ? "flowChevron open" : "flowChevron"} />
+      </button>
+      {open && text ? (
+        <div className="flowDetail thinkingFlow"><StreamingText text={text} /></div>
+      ) : null}
+    </motion.div>
   );
 }
 
-function StreamingText({ text }: { text: string }) {
-  const stable = text.length > 90 ? text.slice(0, -90) : "";
-  const live = text.length > 90 ? text.slice(-90) : text;
+// Pull image URLs out of an assistant message (markdown images + bare image
+// links) so they render as actual pictures in the chat instead of raw links.
+function extractImageUrls(text: string): string[] {
+  const urls = new Set<string>();
+  const md = /!\[[^\]]*\]\(([^)\n]+)\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = md.exec(text))) {
+    const candidate = m[1].trim();
+    if (isRenderableChatImage(candidate)) urls.add(candidate);
+  }
+  const bare = /(https?:\/\/[^\s)<>"']+\.(?:png|jpe?g|gif|webp|avif)(?:\?[^\s)<>"']*)?)/gi;
+  while ((m = bare.exec(text))) urls.add(m[1]);
+  const local = /((?:[a-z]:[\\/]|\/)[^\s)<>"']+\.(?:png|jpe?g|gif|webp))/gi;
+  while ((m = local.exec(text))) urls.add(m[1]);
+  return [...urls].slice(0, 12);
+}
+
+// Open the full-screen lightbox for an image. Decoupled via a window event so
+// deeply-nested (memoized) image components don't need a callback prop.
+function openLightbox(src: string) {
+  window.dispatchEvent(new CustomEvent("crix:lightbox", { detail: { src } }));
+}
+
+function ChatImageThumb({ src }: { src: string }) {
   return (
-    <pre className="streamingText">
-      {stable}
-      {[...live].map((char, index) => (
-        <span key={`${index}-${char}`} style={{ animationDelay: `${index * 8}ms` }}>{char}</span>
-      ))}
-    </pre>
+    <button type="button" className="chatImage" onClick={() => openLightbox(src)} title="Click to expand">
+      <img src={src} alt="" loading="lazy" onError={(e) => { (e.currentTarget.closest(".chatImage") as HTMLElement).style.display = "none"; }} />
+    </button>
   );
+}
+
+function ChatImages({ text }: { text: string }) {
+  const urls = useMemo(() => extractImageUrls(text), [text]);
+  if (urls.length === 0) return null;
+  return (
+    <div className="chatImages">
+      {urls.map((url) => {
+        const src = looksLikeLocalImagePath(url) && hasNativeBridge() ? convertFileSrc(url) : url;
+        return <ChatImageThumb key={url} src={src} />;
+      })}
+    </div>
+  );
+}
+
+// Full-screen image viewer: click any chat image to expand, X / Esc / backdrop to close.
+function ImageLightbox() {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => {
+    const onOpen = (e: Event) => setSrc((e as CustomEvent<{ src: string }>).detail?.src ?? null);
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setSrc(null); };
+    window.addEventListener("crix:lightbox", onOpen as EventListener);
+    window.addEventListener("keydown", onKey);
+    return () => { window.removeEventListener("crix:lightbox", onOpen as EventListener); window.removeEventListener("keydown", onKey); };
+  }, []);
+  return (
+    <AnimatePresence>
+      {src ? (
+        <motion.div
+          className="imageLightbox"
+          initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+          transition={{ duration: 0.16 }}
+          onClick={() => setSrc(null)}
+        >
+          <button type="button" className="lightboxClose" onClick={() => setSrc(null)} title="Close (Esc)"><X size={20} /></button>
+          <motion.img
+            src={src} alt="" onClick={(e) => e.stopPropagation()}
+            initial={{ scale: 0.94 }} animate={{ scale: 1 }} exit={{ scale: 0.94 }}
+            transition={{ duration: 0.18, ease: [0.16, 0.84, 0.24, 1] }}
+          />
+        </motion.div>
+      ) : null}
+    </AnimatePresence>
+  );
+}
+
+function isRenderableChatImage(value: string) {
+  return /^(https?:\/\/|data:image\/)/i.test(value) || looksLikeLocalImagePath(value);
+}
+
+// Plain text — the old per-character animated spans created dozens of animating
+// nodes per message and re-laid-out on every stream tick, which tanked the UI
+// once the transcript filled up. Streaming already updates the text live.
+function StreamingText({ text }: { text: string }) {
+  return <pre className="streamingText">{text}</pre>;
 }
 
 function ToolCallShow({ event, text }: { event: CrixEvent; text: string }) {
@@ -3692,6 +5085,14 @@ function collectStats(events: CrixEvent[]) {
   return { turns, tools, tokens, dreams, recalls };
 }
 
+// Stable per-event key. tool_call carries an id; stream/thinking carry a
+// creation-time startedAt that is preserved across delta updates (the spread in
+// appendEvent keeps it). Using these instead of the visible-window index avoids
+// remounting every card once the transcript clips past 90 (a real perf cliff).
+function eventKey(event: CrixEvent, index: number): string {
+  return `${event.type}-${event.id ?? event.startedAt ?? index}`;
+}
+
 function isChatVisibleEvent(event: CrixEvent): boolean {
   if (event.type === "user_send" || event.type === "assistant_stream" || event.type === "thinking_stream") return true;
   if (event.type === "tool_call") return true;
@@ -3851,7 +5252,7 @@ function modelForProvider(id: ProviderId, providers: ProviderOption[] = PROVIDER
 }
 
 function isProviderId(value: string): boolean {
-  return value === "ollama" || value === "openai" || value === "mock";
+  return value === "ollama" || value === "openai" || value === "openrouter" || value === "mock";
 }
 
 function groupedModels(models: ProviderModel[]): Array<[string, ProviderModel[]]> {
@@ -4123,9 +5524,9 @@ function formatContext(value: number): string {
   return String(value);
 }
 
-function loadDesktopSettings(): { theme: ThemeName; selection: Selection; appearance: AppearanceSettings } {
+function loadDesktopSettings(): { theme: ThemeName; selection: Selection; appearance: AppearanceSettings; routing: RoutingTable } {
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(SETTINGS_KEY) ?? "{}") as Partial<{ theme: ThemeName; selection: Selection; appearance: Partial<AppearanceSettings> }>;
+    const parsed = JSON.parse(window.localStorage.getItem(SETTINGS_KEY) ?? "{}") as Partial<{ theme: ThemeName; selection: Selection; appearance: Partial<AppearanceSettings>; routing: unknown }>;
     const allowMock = Boolean(import.meta.env.DEV) || window.localStorage.getItem("crix.dev") === "1";
     const parsedProvider = parsed.selection?.provider;
     const provider =
@@ -4140,13 +5541,30 @@ function loadDesktopSettings(): { theme: ThemeName; selection: Selection; appear
       theme: normalizeTheme(parsed.theme),
       selection,
       appearance: normalizeAppearance(parsed.appearance),
+      routing: normalizeRouting(parsed.routing),
     };
   } catch {
-    return { theme: "signal", selection: DEFAULT_SELECTION, appearance: DEFAULT_APPEARANCE };
+    return { theme: "signal", selection: DEFAULT_SELECTION, appearance: DEFAULT_APPEARANCE, routing: DEFAULT_ROUTING };
   }
 }
 
-function saveDesktopSettings(settings: { theme: ThemeName; selection: Selection; appearance: AppearanceSettings }) {
+function normalizeRouting(value: unknown): RoutingTable {
+  if (!value || typeof value !== "object") return {};
+  const out: RoutingTable = {};
+  for (const lane of ROUTE_LANES) {
+    const entry = (value as Record<string, unknown>)[lane];
+    if (entry && typeof entry === "object") {
+      const provider = (entry as Record<string, unknown>).provider;
+      const model = (entry as Record<string, unknown>).model;
+      if (typeof provider === "string" && provider && typeof model === "string" && model) {
+        out[lane] = { provider, model };
+      }
+    }
+  }
+  return out;
+}
+
+function saveDesktopSettings(settings: { theme: ThemeName; selection: Selection; appearance: AppearanceSettings; routing: RoutingTable }) {
   try {
     window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   } catch {
@@ -4191,7 +5609,17 @@ function runWindowCommand(command: "crix_window_minimize" | "crix_window_toggle_
 }
 
 function hasNativeBridge(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  // Require a REAL invoke — some sandboxes (and the web preview) inject a partial
+  // __TAURI_INTERNALS__ with no working invoke, which made the guard pass and the
+  // daemon calls throw "Cannot read properties of undefined (reading 'invoke')".
+  if (typeof window === "undefined") return false;
+  const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke?: unknown } }).__TAURI_INTERNALS__;
+  return typeof internals?.invoke === "function";
 }
 
-createRoot(document.getElementById("root")!).render(<App />);
+// Create the React root once and reuse it across HMR updates. Calling
+// createRoot() again on the same container spawns overlapping React trees that
+// fight over one DOM node (stale/frozen state, duplicate effects).
+const container = document.getElementById("root")! as HTMLElement & { __crixRoot?: ReturnType<typeof createRoot> };
+const root = container.__crixRoot ?? (container.__crixRoot = createRoot(container));
+root.render(<App />);

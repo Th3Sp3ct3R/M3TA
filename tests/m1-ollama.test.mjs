@@ -115,6 +115,25 @@ test("OllamaCloudPool: parses text + tool_call from streaming NDJSON", async () 
   assert.equal(done.usage.outputTokens, 5);
 });
 
+test("OllamaCloudPool: strips leaked gemma4 channel/control tokens from visible text", async () => {
+  const chunks = [
+    { message: { role: "assistant", content: "thought\n<channel|>" }, done: false },
+    { message: { role: "assistant", content: "Here is the answer." }, done: false },
+    { message: { role: "assistant", content: "<|tool_response>" }, done: false },
+    { message: { role: "assistant", content: "" }, done: true, prompt_eval_count: 5, eval_count: 5 },
+  ];
+  const pool = new OllamaCloudPool({ slots, fetchImpl: mockChat(chunks), useAnthropicCompat: false });
+  const events = [];
+  for await (const e of pool.stream("reasoner", baseReq)) events.push(e);
+  const text = events.filter((e) => e.type === "text_delta").map((e) => e.text).join("");
+  assert.ok(!text.includes("<channel|>"), "channel token stripped from deltas");
+  assert.ok(!text.includes("<|tool_response>"), "tool_response token stripped from deltas");
+  assert.ok(text.includes("Here is the answer."), "real text preserved");
+  const done = events.at(-1);
+  const textBlock = done.message.content.find((b) => b.type === "text");
+  assert.ok(textBlock && !/<channel\|>|<\|tool_response>/.test(textBlock.text), "final message text is clean");
+});
+
 test("OllamaCloudPool: serializes every tool_result as its own tool message", async () => {
   const chunks = [
     { message: { role: "assistant", content: "done" }, done: false },

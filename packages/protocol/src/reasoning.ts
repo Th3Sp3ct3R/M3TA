@@ -19,17 +19,20 @@ export function reasoningLabel(level: ReasoningLevel): string {
   return level === "max" ? "Extra High" : level.charAt(0).toUpperCase() + level.slice(1);
 }
 
-/** OpenAI Responses `reasoning.effort`. "max" → "xhigh" (the deepest tier). */
-export function openAIReasoningEffort(level: ReasoningLevel): "low" | "medium" | "high" | "xhigh" {
+/**
+ * OpenAI Responses `reasoning.effort`. The API accepts low | medium | high
+ * (newer models also accept "minimal"). There is NO "xhigh" tier — sending one
+ * is rejected — so "max" maps to the deepest valid value, "high".
+ */
+export function openAIReasoningEffort(level: ReasoningLevel): "low" | "medium" | "high" {
   switch (level) {
     case "low":
       return "low";
     case "medium":
       return "medium";
     case "high":
-      return "high";
     case "max":
-      return "xhigh";
+      return "high";
   }
 }
 

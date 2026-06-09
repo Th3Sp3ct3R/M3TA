@@ -71,9 +71,9 @@ test("advisory: the suggestion is injected as non-binding context, never a comma
   });
   assert.ok(out.intention, "a suggestion was formed from memory");
   assert.match(out.reminder, /advisory/i, "the block announces itself as advisory");
-  assert.match(out.reminder, /not a command/i, "explicitly not a command");
-  assert.match(out.reminder, /do not auto-run/i, "explicitly forbids auto-execution");
-  assert.ok(out.reminder.includes("→"), "renders a non-binding suggestion arrow, not a tool call");
+  assert.match(out.reminder, /not a request|not a task/i, "explicitly not a request/task");
+  assert.match(out.reminder, /do not\b.*\bact on it/i, "explicitly forbids acting on it");
+  assert.ok(out.reminder.includes("hunch"), "renders as a non-binding hunch, not a directive");
 });
 
 // ── 5. thought stream order ───────────────────────────────────────────────────
