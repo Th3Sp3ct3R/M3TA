@@ -51,7 +51,7 @@ import {
   sideQueryJson,
   QueryEngine,
 } from "@ares/core";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { createInterface } from "node:readline/promises";
@@ -201,6 +201,7 @@ import {
   rejectCapabilityDraft,
   verificationSpecSummary,
   runCrucibleTrials,
+  TrustGovernor,
   type Goal,
   type CapabilityNode,
   type CapabilityEvidence,
@@ -1330,13 +1331,38 @@ function makeBrowserTool(context: CliRuntimeContext) {
   });
 }
 
+/**
+ * V8 — which leash governs outward effects:
+ *   unleashed (default): the owner's dial, wide open (ownerLeash).
+ *   guarded (dangerousBypass: false): autonomy is EARNED — the TrustGovernor
+ *   derives each domain's leash from the Crucible (confirmed procedures with
+ *   net-positive records), and every level change lands in leash.jsonl next to
+ *   the effects ledger with the evidence that justified it.
+ */
+async function resolveLeash(context: CliRuntimeContext): Promise<(domain: string) => number> {
+  const settings = await loadUiSettings();
+  if (settings.dangerousBypass !== false) return ownerLeash();
+  try {
+    const store = await MemoryStore.open(context.mind.memoryFile);
+    const leashLog = path.join(context.effects.effectsDir, "leash.jsonl");
+    const governor = new TrustGovernor({
+      nodes: () => store.all(),
+      append: (change) => appendFile(leashLog, JSON.stringify(change) + "\n").catch(() => undefined),
+    });
+    return (domain) => governor.leashOf(domain);
+  } catch {
+    // No readable memory: guarded mode falls back to the shortest leash.
+    return ownerLeash({ trust: 1 });
+  }
+}
+
 async function browserRailsContext(context: CliRuntimeContext) {
   const paths = context.effects;
   return {
     ledger: await Ledger.open(paths.ledgerFile),
     budget: new Budget(),
     killSwitch: new KillSwitch(paths.killSwitchFile),
-    leashOf: ownerLeash(),
+    leashOf: await resolveLeash(context),
   };
 }
 

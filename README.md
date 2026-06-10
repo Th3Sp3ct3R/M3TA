@@ -40,6 +40,8 @@ pnpm voice:tts                     # start the local Kokoro-82M voice sidecar
 - `@ares/effects`: budgets, ledger, kill switch, and side-effect rails.
 - `@ares/connectors`: browser connector, browser effects, filmstrip proof.
 - `@ares/cli`: command-line and terminal UI entrypoint.
+- `@ares/garrison`: the always-on daemon (sessions, gateway, scheduler). `ares garrison serve` / `ares attach`.
+- `@ares/channels`: channel bridges as gateway clients (Telegram).
 
 ## Repository Layout
 

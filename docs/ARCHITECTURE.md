@@ -21,6 +21,19 @@ Ares is a TypeScript-first coding-agent harness. The CLI is the composition root
 - `@ares/effects`: budgets, ledger, kill switch, owner leash, and guarded effect execution.
 - `@ares/connectors`: browser connector and browser effect integration.
 - `@ares/cli`: command-line entrypoint, terminal UI, provider routing, command handlers, and tool registration.
+- `@ares/garrison`: the always-on daemon — session manager (sessions outlive clients and reboots via rollout rehydration), localhost WebSocket+HTTP gateway (wire protocol v1, token auth), and the scheduler whose dream tick runs the Crucible trial. Boot with `ares garrison serve`; attach with `ares attach`.
+- `@ares/channels`: channel bridges as pure gateway clients (Telegram first — sessions per chat, approvals as inline keyboards).
+
+## The Crucible (V5-V8)
+
+Ares is the battle-tested agent: learning is empirical, not archival.
+
+1. **Witness** (V5, `agent/crucible/witness.ts`) — after each substantive turn, a cheap sideQuery fork reviews the conversation and proposes candidate hypotheses (belief / user_fact / feedback / procedure), each optionally carrying a falsifiable check. Deterministic intake validates, dedupes, and caps; candidates land in living memory with `status: "candidate"`.
+2. **Consequence wiring** (V6, mind schema v3) — recall threads the injected node ids through the turn; at turn end every artifact in play gets the outcome recorded (`recordOutcome`): wins reinforce, losses weaken multiplicatively, evidence accumulates (capped at 20). Strength tracks usefulness, not recall popularity.
+3. **Crucible trials** (V7, `operator/crucible.ts`) — `ares mind crucible`, and every Garrison dream tick: candidates face their checks (run as reality probes) and records; survivors promote to confirmed, losers archive with the failure reason written back as a post-mortem memory, confirmed knowledge with a failing check is demoted. Deterministic; no model opinion in the trial.
+4. **Leash dividend** (V8, `operator/leash.ts`) — in guarded mode (`dangerousBypass: false`), the TrustGovernor derives each domain's effects leash from the Crucible: 1 + confirmed procedural nodes with net-positive records (cap 5). Every change lands in `leash.jsonl` with the records that justified it. Learning and safety are one system.
+
+The rule everywhere: **deterministic spine, LLM judgment, deterministic verification.**
 
 ## Desktop Companion
 
