@@ -20,6 +20,9 @@ importers:
       typescript:
         specifier: ^5.7.0
         version: 5.9.3
+      ws:
+        specifier: ^8.18.0
+        version: 8.21.0
 
   packages/agent:
     dependencies:
@@ -39,6 +42,19 @@ importers:
       sqlite-vec:
         specifier: ^0.1.7
         version: 0.1.9
+
+  packages/channels:
+    dependencies:
+      '@ares/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      ws:
+        specifier: ^8.18.0
+        version: 8.21.0
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.5.13
+        version: 8.18.1
 
   packages/cli:
     dependencies:
@@ -100,6 +116,37 @@ importers:
       '@ares/protocol':
         specifier: workspace:*
         version: link:../protocol
+
+  packages/garrison:
+    dependencies:
+      '@ares/agent':
+        specifier: workspace:*
+        version: link:../agent
+      '@ares/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ares/effects':
+        specifier: workspace:*
+        version: link:../effects
+      '@ares/mind':
+        specifier: workspace:*
+        version: link:../mind
+      '@ares/operator':
+        specifier: workspace:*
+        version: link:../operator
+      '@ares/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@ares/tools':
+        specifier: workspace:*
+        version: link:../tools
+      ws:
+        specifier: ^8.18.0
+        version: 8.21.0
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.5.12
+        version: 8.18.1
 
   packages/mind: {}
 
@@ -670,6 +717,9 @@ packages:
 
   '@types/react@19.2.15':
     resolution: {integrity: sha512-eRwcGNHve+E8qtEQSSRl6urh+rFop4v8gm6O8rGv25CodbvFdLjA1vVQ1KkiFE0w0UPOnb8tDiFKL5lp0rtY5Q==}
+
+  '@types/ws@8.18.1':
+    resolution: {integrity: sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg==}
 
   '@vitejs/plugin-react@5.2.0':
     resolution: {integrity: sha512-YmKkfhOAi3wsB1PhJq5Scj3GXMn3WvtQ/JC0xoopuHoXSdmtdStOpFrYaT1kie2YgFBcIe64ROzMYRjCrYOdYw==}
@@ -1607,6 +1657,10 @@ snapshots:
   '@types/react@19.2.15':
     dependencies:
       csstype: 3.2.3
+
+  '@types/ws@8.18.1':
+    dependencies:
+      '@types/node': 22.19.19
 
   '@vitejs/plugin-react@5.2.0(vite@7.3.3(@types/node@22.19.19))':
     dependencies:

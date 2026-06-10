@@ -1,0 +1,19 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "dist/.tsbuildinfo"
+  },
+  "references": [
+    { "path": "../protocol" },
+    { "path": "../core" },
+    { "path": "../tools" },
+    { "path": "../agent" },
+    { "path": "../mind" },
+    { "path": "../operator" },
+    { "path": "../effects" }
+  ],
+  "include": ["src/**/*.ts"]
+}

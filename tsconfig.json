@@ -10,6 +10,8 @@
     { "path": "./packages/effects" },
     { "path": "./packages/connectors" },
     { "path": "./packages/mind" },
-    { "path": "./packages/cli" }
+    { "path": "./packages/cli" },
+    { "path": "./packages/garrison" },
+    { "path": "./packages/channels" }
   ]
 }

@@ -1,0 +1,33 @@
+{
+  "name": "@ares/garrison",
+  "version": "0.5.0-alpha.1",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "description": "The Garrison: Ares's always-on daemon — session manager over QueryEngine, heartbeat/dream scheduler, and a token-authed localhost WebSocket+HTTP gateway every client attaches through.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "dependencies": {
+    "@ares/protocol": "workspace:*",
+    "@ares/core": "workspace:*",
+    "@ares/tools": "workspace:*",
+    "@ares/agent": "workspace:*",
+    "@ares/mind": "workspace:*",
+    "@ares/operator": "workspace:*",
+    "@ares/effects": "workspace:*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.12"
+  }
+}
