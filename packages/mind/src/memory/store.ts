@@ -17,6 +17,7 @@ import { writeFileAtomic } from "../io.js";
 import { mindPaths } from "../paths.js";
 import { currentStrength, reinforce } from "./strength.js";
 import { recall, type RecallOptions, type RecallResult } from "./recall.js";
+import { contentHash, type EmbedIndex, type Embedder } from "./embedIndex.js";
 import { buildIdf } from "./idf.js";
 import { clusterByConcept, detectRecurringFailures, type Phraser } from "./synthesis.js";
 import { MEMORY_SCHEMA_VERSION, type MemoryKind, type MemoryNode } from "./types.js";
@@ -40,6 +41,9 @@ export interface SynthesisReport {
 const PRUNE_FLOOR = 0.05;
 const MIN_RECURRENCE = 3;
 const MAX_MEMORY_CONTENT_CHARS = 2_000;
+/** Hard ceiling on how long remember() will wait for a cue embedding. */
+const CUE_EMBED_TIMEOUT_MS = 300;
+const EMBED_BATCH = 64;
 const THEME_STOPWORDS = new Set([
   "about", "after", "again", "also", "always", "before", "being", "built", "check",
   "clean", "could", "ares", "data", "directly", "doing", "done", "error", "files",
@@ -62,6 +66,12 @@ function salientTokens(content: string): string[] {
 }
 
 export class MemoryStore {
+  /** V4 semantic seeds: optional embedder + sidecar index. Absent → classic store. */
+  private embedder?: Embedder;
+  private embedIndex?: EmbedIndex;
+  /** Serializes background embedding refreshes; errors never escape the chain. */
+  private embedQueue: Promise<void> = Promise.resolve();
+
   private constructor(
     private readonly file: string,
     private readonly nodes: Map<string, MemoryNode>,
@@ -162,7 +172,111 @@ export class MemoryStore {
     };
     this.nodes.set(node.id, node);
     await this.persist();
+    // Embed at write time — but in the background. A turn never waits on a model.
+    this.scheduleEmbedRefresh();
     return node;
+  }
+
+  /**
+   * Wire semantic seeding: an embedder plus the sidecar vector index. From here
+   * on add() refreshes vectors in the background, consolidate() settles them,
+   * and remember() blends embedding similarity into its seeds — using only
+   * vectors already in the index, never blocking a recall on embedding work.
+   */
+  attachEmbedder(embedder: Embedder, index: EmbedIndex): void {
+    this.embedder = embedder;
+    this.embedIndex = index;
+  }
+
+  /** Embed every stale node now and persist the sidecar. Embedder errors propagate. */
+  async reindex(): Promise<void> {
+    await this.embedQueue.catch(() => {});
+    await this.refreshEmbeddings();
+  }
+
+  /** Background, best-effort refresh — serialized so writes never interleave. */
+  private scheduleEmbedRefresh(): void {
+    if (!this.embedder || !this.embedIndex) return;
+    this.embedQueue = this.embedQueue
+      .catch(() => {})
+      .then(() => this.refreshEmbeddings())
+      .catch(() => {
+        // Best-effort by design: an unreachable embedder costs freshness, never
+        // a turn. reindex() is the path that surfaces the error.
+      });
+  }
+
+  /** Drop vectors for deleted nodes, embed stale ones, persist if anything moved. */
+  private async refreshEmbeddings(): Promise<void> {
+    const embedder = this.embedder;
+    const index = this.embedIndex;
+    if (!embedder || !index) return;
+    let changed = false;
+    for (const id of index.ids()) {
+      if (!this.nodes.has(id)) {
+        index.remove(id);
+        changed = true;
+      }
+    }
+    const live = this.all().map((n) => ({ id: n.id, content: n.content }));
+    const contentById = new Map(live.map((n) => [n.id, n.content]));
+    const stale = index.staleIds(live);
+    for (let i = 0; i < stale.length; i += EMBED_BATCH) {
+      const batch = stale.slice(i, i + EMBED_BATCH);
+      const vectors = await embedder.embed(batch.map((id) => contentById.get(id) ?? ""));
+      for (let j = 0; j < batch.length; j++) {
+        const vector = vectors[j];
+        if (!Array.isArray(vector) || vector.length === 0) continue;
+        const content = contentById.get(batch[j]);
+        if (content === undefined) continue;
+        index.upsert(batch[j], contentHash(content), vector);
+        changed = true;
+      }
+    }
+    if (changed) await index.persist();
+  }
+
+  /**
+   * Embed the cue with a hard timeout. Anything but a prompt, well-formed
+   * vector — slow model, network error, empty result — yields undefined and
+   * recall proceeds purely lexical. The embedder is not even consulted when the
+   * index holds no vectors (nothing to compare against).
+   */
+  private async embedCue(cue: string): Promise<Float32Array | undefined> {
+    const embedder = this.embedder;
+    const index = this.embedIndex;
+    if (!embedder || !index || index.size === 0) return undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const timeout = new Promise<undefined>((resolve) => {
+        // Deliberately NOT unref'd: this timer is the guarantee that a hung
+        // embedder cannot hang remember() — an unref'd timer never fires when
+        // it is the only thing left on the loop. Cleared in finally; worst
+        // case it holds the process open for 300ms.
+        timer = setTimeout(() => resolve(undefined), CUE_EMBED_TIMEOUT_MS);
+      });
+      const embedded = embedder.embed([cue]).then((vs) => vs[0]);
+      // A rejection landing AFTER the timeout won the race must never surface
+      // as an unhandled rejection — mark it handled up front.
+      embedded.catch(() => {});
+      const vector = await Promise.race([embedded, timeout]);
+      if (!Array.isArray(vector) || vector.length === 0) return undefined;
+      return Float32Array.from(vector);
+    } catch {
+      return undefined;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /** Recall options with vector seeding wired in — or untouched when unavailable. */
+  private async withCueVectors(cue: string, opts: RecallOptions): Promise<RecallOptions> {
+    if (opts.vectors) return opts; // caller brought their own
+    const index = this.embedIndex;
+    if (!index) return opts;
+    const cueVector = await this.embedCue(cue);
+    if (!cueVector) return opts; // lexical fallback — the V4 invariant
+    return { ...opts, vectors: { get: (id) => index.get(id), cueVector } };
   }
 
   async link(aId: string, bId: string): Promise<void> {
@@ -195,7 +309,7 @@ export class MemoryStore {
    */
   async remember(cue: string, opts: RecallOptions = {}): Promise<RecallResult[]> {
     const now = opts.now ?? new Date();
-    const results = recall(cue, this.all(), opts);
+    const results = recall(cue, this.all(), await this.withCueVectors(cue, opts));
     for (const r of results) {
       const current = this.nodes.get(r.node.id);
       if (current) this.nodes.set(current.id, reinforce(current, now));
@@ -269,6 +383,10 @@ export class MemoryStore {
     }
 
     await this.persist();
+    // Settle vectors with sleep: prune deleted ids, embed new/edited nodes.
+    // Best-effort — consolidation must succeed even with the embedder down.
+    await this.embedQueue.catch(() => {});
+    await this.refreshEmbeddings().catch(() => {});
     return { pruned, deduped, promoted, kept: this.nodes.size };
   }
 

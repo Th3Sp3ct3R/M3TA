@@ -9,7 +9,16 @@
 
 export { MemoryStore, type ConsolidationReport, type SynthesisReport } from "./memory/store.js";
 export { diagnoseMemory, type MemoryDoctorReport, type DuplicateMemoryGroup } from "./memory/doctor.js";
-export { recall, type RecallResult, type RecallOptions } from "./memory/recall.js";
+export { recall, type RecallResult, type RecallOptions, type RecallVectors } from "./memory/recall.js";
+export {
+  EmbedIndex,
+  ollamaEmbedder,
+  cosine,
+  contentHash,
+  type Embedder,
+  type OllamaEmbedderOptions,
+} from "./memory/embedIndex.js";
+export { migrateLegacyVectors, V4_PROVENANCE_TAG, type MigrateVectorsReport } from "./memory/migrateVectorStore.js";
 export { buildIdf, idfWeight, jaccard, tokenizeSalient, type IdfMap } from "./memory/idf.js";
 export {
   clusterByConcept,

@@ -9,10 +9,14 @@
 // a corpus IDF map, recall upgrades to salience-weighted relevance (rare cue
 // tokens dominate common ones) AND multi-hop spreading whose association edges
 // are weighted by how related the two memories actually are (Jaccard overlap).
-// Without an IDF map the behavior is byte-identical to the classic recall.
+// When the caller passes vectors (V4 semantic seeds), seed relevance blends
+// lexical with embedding cosine 50/50 — so a paraphrase with ZERO token overlap
+// can still seed. A node without a vector falls back to pure lexical; without
+// the vectors option (or an IDF map) the behavior is byte-identical to classic.
 
 import { currentStrength } from "./strength.js";
 import { idfWeight, jaccard, type IdfMap } from "./idf.js";
+import { cosine } from "./embedIndex.js";
 import type { MemoryNode } from "./types.js";
 
 export interface RecallResult {
@@ -20,6 +24,13 @@ export interface RecallResult {
   score: number;
   /** True if it surfaced by association, not by matching the cue directly. */
   viaAssociation?: boolean;
+}
+
+/** Sidecar vector access for semantic seeding (V4). */
+export interface RecallVectors {
+  get(id: string): Float32Array | undefined;
+  /** Embedded cue. Absent (e.g. embed timed out) → recall stays pure lexical. */
+  cueVector?: Float32Array;
 }
 
 export interface RecallOptions {
@@ -30,6 +41,8 @@ export interface RecallOptions {
   depth?: number;
   /** When present, recall keys on IDF-weighted relevance + Jaccard multi-hop spread. */
   corpusIdf?: IdfMap;
+  /** When present with a cueVector, seed relevance blends lexical + cosine 50/50. */
+  vectors?: RecallVectors;
   now?: Date;
 }
 
@@ -74,8 +87,21 @@ export function recall(cue: string, nodes: readonly MemoryNode[], opts: RecallOp
   const idf = opts.corpusIdf;
 
   // Seeds: directly relevant memories, weighted by how vivid they are right now.
+  // With vectors present, relevance blends lexical and embedding cosine 50/50 so
+  // a zero-overlap paraphrase can seed; a node missing its vector (or holding one
+  // of a different dimension — a model swap) stays pure lexical, the invariant.
+  const cueVector = opts.vectors?.cueVector;
   const seeds = nodes
-    .map((node) => ({ node, score: relevance(cue, node.content, idf) * (0.2 + currentStrength(node, now)) }))
+    .map((node) => {
+      let rel = relevance(cue, node.content, idf);
+      if (cueVector) {
+        const nodeVector = opts.vectors?.get(node.id);
+        if (nodeVector && nodeVector.length === cueVector.length) {
+          rel = 0.5 * rel + 0.5 * Math.max(0, cosine(nodeVector, cueVector));
+        }
+      }
+      return { node, score: rel * (0.2 + currentStrength(node, now)) };
+    })
     .filter((r) => r.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
