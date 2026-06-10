@@ -14,7 +14,8 @@
     { "path": "../operator" },
     { "path": "../effects" },
     { "path": "../connectors" },
-    { "path": "../mind" }
+    { "path": "../mind" },
+    { "path": "../garrison" }
   ],
   "include": ["src/**/*.ts"]
 }

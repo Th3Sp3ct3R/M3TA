@@ -247,6 +247,12 @@ export class GarrisonServer {
             model: frame.model,
             workspace: frame.workspace,
           });
+          // The creator is auto-attached: a client that just made a session
+          // always wants its events. Explicit session.attach stays for peers.
+          const detach = sessions.attach(session.id, (event) =>
+            this.enqueueFrame(client, { type: "event", sessionId: session.id, event }),
+          );
+          client.detachBySession.set(session.id, detach);
           this.enqueueFrame(client, { type: "session.created", session });
         } catch (err) {
           this.enqueueError(client, errorMessage(err));

@@ -24,6 +24,11 @@
     "@ares/tools": "workspace:*",
     "ink": "^7.0.4",
     "react": "^19.2.6",
-    "zod": "^3.23.8"
+    "zod": "^3.23.8",
+    "@ares/garrison": "workspace:*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13"
   }
 }

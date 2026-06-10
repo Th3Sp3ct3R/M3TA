@@ -70,6 +70,9 @@ importers:
       '@ares/effects':
         specifier: workspace:*
         version: link:../effects
+      '@ares/garrison':
+        specifier: workspace:*
+        version: link:../garrison
       '@ares/mind':
         specifier: workspace:*
         version: link:../mind
@@ -88,9 +91,16 @@ importers:
       react:
         specifier: ^19.2.6
         version: 19.2.6
+      ws:
+        specifier: ^8.18.0
+        version: 8.21.0
       zod:
         specifier: ^3.23.8
         version: 3.25.76
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.5.13
+        version: 8.18.1
 
   packages/connectors:
     dependencies:

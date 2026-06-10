@@ -49,6 +49,7 @@ import {
   type LatencyPreference,
   type ModelTouch,
   sideQueryJson,
+  QueryEngine,
 } from "@ares/core";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -147,6 +148,7 @@ import {
   snapshotBrain,
   unifiedRecallForTurn,
   runWitness,
+  runHeartbeatTick,
 } from "@ares/agent";
 import {
   QueryEngineDispatcher,
@@ -209,6 +211,7 @@ import {
   type VerificationSpec,
 } from "@ares/operator";
 import { bridgeLegacyEnv, buildForegroundReminder, classifyUserIntent, diagnoseMemory, MemoryStore, mindPaths, type MemoryKind } from "@ares/mind";
+import { SessionManager, GarrisonServer, Scheduler, tokenPath, DEFAULT_GARRISON_PORT, type GatewayServerFrame } from "@ares/garrison";
 import {
   Filmstrip,
   clickEffect,
@@ -4110,6 +4113,227 @@ function csvFlag(value: string | undefined): string[] | undefined {
 }
 
 // ─── mind command (Ares v6 — Living Memory feed for the UI + you) ───────
+// ── ARES V2 (slice): the Garrison as a CLI verb ──────────────────────────
+//
+// `ares garrison serve` boots the always-on daemon: real provider, full tool
+// catalog, sessions that outlive clients, and the scheduler whose dream hook
+// RUNS THE CRUCIBLE TRIAL — dreams become the trial, literally.
+// `ares attach` is the first thin client over the wire protocol.
+
+async function garrisonCommand(args: ParsedArgs): Promise<number> {
+  const sub = args.positionals[0] ?? "serve";
+  if (sub !== "serve") {
+    process.stderr.write("error: usage: ares garrison serve [--port N] [--provider mock|openai|ollama] [--model X]\n");
+    return 2;
+  }
+  const selection = await selectProvider(args.flags);
+  const context = cliRuntimeContext({ home: args.flags.get("home") ?? process.env.ARES_HOME });
+  const pathPermissions = await AresPathPermissionStore.load(context);
+  const commandPermissions = await AresCommandPermissionStore.load(context);
+  const settings = await loadUiSettings();
+  const runtime: AresRuntimeState = { permissionMode: settings.dangerousBypass === false ? "workspace-write" : "bypass" };
+  // V1 slice tradeoff: one shared tool harness across daemon sessions (shell
+  // registry and todo state are daemon-global). Per-session isolation arrives
+  // with the full V2 composition.
+  const shellRegistry = new ShellRegistry();
+  const todoStore = new TodoStore();
+  const tools = await buildEngineTools(pathPermissions, commandPermissions, selection, runtime, context, shellRegistry, todoStore);
+  const isMock = selection.provider.name.startsWith("mock");
+  const agent = await prepareAresAgent({
+    home: context.home,
+    workspace: context.workspace,
+    enabled: process.env.ARES_AGENT_ENABLED === "1" || (!isMock && process.env.ARES_AGENT_ENABLED !== "0"),
+  });
+  const systemPrompt = agent.composeSystemPrompt(buildSystemPrompt(runtime.permissionMode, context));
+
+  const sessions = new SessionManager({
+    home: context.home,
+    factory: (req) => ({
+      engine: new QueryEngine(
+        {
+          provider: selection.provider,
+          model: req.model ?? selection.model,
+          systemPrompt,
+          tools,
+          workspace: req.workspace ?? context.workspace,
+          signal: req.signal,
+          requestPermission: req.requestPermission,
+          reasoningLevel: resolveReasoningLevel(settings),
+          maxOutputTokens: chatMaxOutputTokens(),
+          contextBudgetTokens: chatContextBudget(selection),
+        },
+        req.sessionId,
+      ),
+      providerName: selection.provider.name,
+      model: req.model ?? selection.model,
+      workspace: req.workspace ?? context.workspace,
+    }),
+  });
+  const restored = await sessions.rehydrate();
+
+  const scheduler = new Scheduler({
+    hooks: {
+      heartbeat: () => runHeartbeatTick({ home: context.home, workspace: context.workspace, config: agent.config }),
+      // Dreams become the trial: every dream tick runs the Crucible first,
+      // then the existing deep-dream consolidation.
+      dream: async () => {
+        const store = await MemoryStore.open(context.mind.memoryFile);
+        const trial = await runCrucibleTrials({ store, workspace: context.workspace });
+        if (agent.config.dreaming.enabled) {
+          await runDeepDream({ home: context.home, workspace: context.workspace, config: agent.config }).catch(() => undefined);
+        }
+        return trial;
+      },
+    },
+    lastActivityAt: () => sessions.lastActivityAt(),
+  });
+
+  const requestedPort = Number(args.flags.get("port") ?? process.env.ARES_GARRISON_PORT ?? DEFAULT_GARRISON_PORT);
+  const server = new GarrisonServer({ home: context.home, sessions, scheduler, port: requestedPort });
+  const bound = await server.start();
+  scheduler.start();
+
+  process.stdout.write(
+    notice(
+      "Garrison · standing watch",
+      [
+        `gateway   ws://${bound.host}:${bound.port}  (health: http://${bound.host}:${bound.port}/health)`,
+        `provider  ${selection.provider.name} · ${selection.model}`,
+        `sessions  ${restored.length} rehydrated`,
+        `token     ${tokenPath(context.home)}`,
+        `attach    ares attach${bound.port === DEFAULT_GARRISON_PORT ? "" : ` --port ${bound.port}`}`,
+      ],
+      "success",
+    ),
+  );
+
+  return await new Promise<number>((resolve) => {
+    const shutdown = () => {
+      process.stdout.write("\ngarrison: standing down…\n");
+      scheduler.stop();
+      void sessions.flush().finally(() => server.close().finally(() => resolve(0)));
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+  });
+}
+
+async function attachCommand(args: ParsedArgs): Promise<number> {
+  const context = cliRuntimeContext({ home: args.flags.get("home") ?? process.env.ARES_HOME });
+  const port = Number(args.flags.get("port") ?? process.env.ARES_GARRISON_PORT ?? DEFAULT_GARRISON_PORT);
+  const url = args.flags.get("url") ?? `ws://127.0.0.1:${port}`;
+  let token: string;
+  try {
+    token = (await readFile(tokenPath(context.home), "utf8")).trim();
+  } catch {
+    process.stderr.write(`error: no garrison token at ${tokenPath(context.home)} — is the Garrison running? (ares garrison serve)\n`);
+    return 2;
+  }
+
+  const { default: WebSocket } = await import("ws");
+  const ws = new WebSocket(url);
+  const send = (frame: unknown) => ws.send(JSON.stringify(frame));
+  let sessionId = args.flags.get("session");
+  let streaming = false;
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const prompt = () => {
+    if (!streaming) rl.prompt();
+  };
+  rl.setPrompt("ares> ");
+
+  return await new Promise<number>((resolve) => {
+    const bail = (message: string, code: number) => {
+      process.stderr.write(`${message}\n`);
+      rl.close();
+      try {
+        ws.close();
+      } catch {
+        // already closed
+      }
+      resolve(code);
+    };
+
+    ws.on("open", () => send({ type: "hello", token, client: "cli-attach", proto: 1 }));
+    ws.on("error", (err: Error) => bail(`gateway error: ${err.message}`, 1));
+    ws.on("close", () => bail("gateway closed", 0));
+    ws.on("message", (raw: Buffer) => {
+      let frame: GatewayServerFrame;
+      try {
+        frame = JSON.parse(String(raw)) as GatewayServerFrame;
+      } catch {
+        return;
+      }
+      if (frame.type === "error") {
+        process.stderr.write(notice("Gateway", [frame.message], "warn"));
+        streaming = false;
+        prompt();
+        return;
+      }
+      if (frame.type === "welcome") {
+        if (frame.sessions.length > 0) {
+          process.stdout.write(
+            notice(
+              "Garrison · sessions",
+              frame.sessions.map((s) => `${s.busy ? "●" : "○"} ${s.id}  ${s.title}`),
+              "info",
+            ),
+          );
+        }
+        if (sessionId) {
+          send({ type: "session.attach", sessionId });
+          process.stdout.write(dim(`attached to ${sessionId}\n`));
+          prompt();
+        } else {
+          send({ type: "session.create" });
+        }
+        return;
+      }
+      if (frame.type === "session.created") {
+        sessionId = frame.session.id;
+        process.stdout.write(dim(`session ${sessionId} (${frame.session.provider} · ${frame.session.model})\n`));
+        prompt();
+        return;
+      }
+      if (frame.type === "event" && frame.sessionId === sessionId) {
+        const event = frame.event as { type: string } & Record<string, unknown>;
+        if (event.type === "text_delta") {
+          streaming = true;
+          process.stdout.write(String(event.text ?? ""));
+        } else if (event.type === "tool_start") {
+          process.stderr.write(dim(`\n· ${String(event.activityDescription ?? event.name ?? "tool")}\n`));
+        } else if (event.type === "turn_end") {
+          streaming = false;
+          process.stdout.write("\n");
+          if (event.status !== "completed") {
+            process.stderr.write(notice("Turn", [`status ${String(event.status)}`], "warn"));
+          }
+          prompt();
+        }
+      }
+    });
+
+    rl.on("line", (line: string) => {
+      const text = line.trim();
+      if (!text) {
+        prompt();
+        return;
+      }
+      if (text === "/quit" || text === "/exit") {
+        bail("detached (the session lives on in the Garrison)", 0);
+        return;
+      }
+      if (!sessionId) {
+        process.stderr.write("no session yet — waiting for the gateway\n");
+        return;
+      }
+      streaming = true;
+      send({ type: "session.send", sessionId, text });
+    });
+    rl.on("SIGINT", () => bail("detached (the session lives on in the Garrison)", 0));
+  });
+}
+
 function glyphFor(action: "promoted" | "archived" | "demoted" | "held"): string {
   return action === "promoted" ? "+" : action === "archived" ? "x" : action === "demoted" ? "v" : "~";
 }
@@ -4306,6 +4530,12 @@ async function main(): Promise<void> {
       return;
     case "mind":
       process.exit(await mindCommand(args));
+      return;
+    case "garrison":
+      process.exit(await garrisonCommand(args));
+      return;
+    case "attach":
+      process.exit(await attachCommand(args));
       return;
     case "eval":
       process.exit(await evalCommand(args));
