@@ -20,7 +20,9 @@ The ARES laws still bind: deterministic spine, LLM judgment, deterministic verif
 **TEST:** edit introducing a type error → next model turn receives the diagnostic reminder; clean edit → no noise.
 
 ## C2 — Repo cartography (kills #1)
-**WHAT:** At session start in a repo, inject a compact repo map: tree (depth-capped), package/module boundaries, entry points, build/test commands (from package.json/Makefile), and conventions (detected: ESM/CJS, test framework, formatter). Cached per repo + git-hash, rebuilt when stale. Plus: CodebaseSearch upgraded with the V4 embed index over symbols/file summaries — semantic code search for "where is auth handled".
+**WHAT:** Two systems, built separately (they have different staleness rules and failure modes):
+- **C2a Static cartography** — deterministic, cheap, per repo + git-hash: tree (depth-capped), package/module boundaries, entry points, build/test commands (from package.json/Makefile), detected conventions (ESM/CJS, test framework, formatter). Injected at session start, under 2k tokens.
+- **C2b Semantic cartography** — the V4 embed index over symbols/file summaries; CodebaseSearch answers "where is auth handled" by meaning. Refreshed lazily, never blocks a turn.
 **TEST:** map under 2k tokens for this repo; stale-hash rebuild; semantic hit on a paraphrase query.
 
 ## C3 — Plan pressure scaled by complexity (kills #3)
@@ -38,6 +40,30 @@ The ARES laws still bind: deterministic spine, LLM judgment, deterministic verif
 ## C6 — The coding gauntlet (the referee — kills vibing)
 **WHAT:** A benchmark harness (`ares eval coding`): a suite of real repo tasks (fix-the-failing-test, add-an-endpoint, refactor-without-breaking, cross-file bug) run headless against any provider/model, scored by probes (tests pass, build green, diff scope). The Garrison runs it on schedule; per-model batting averages land in the same evidence system as everything else. "Ares makes any model code better" becomes a NUMBER per model, tracked over time — and every C1–C5 change must move it.
 **TEST:** gauntlet runs against mock + one real lane; report persists; regression in score flags red.
+
+## C7 — Recovery as a first-class artifact (kills the silent thrash)
+
+Failure mode #7, named late: **the repair path evaporates.** A turn that failed
+twice and succeeded on attempt three looks — to the Witness, to memory, to the
+next session — identical to one that succeeded instantly. The sequence
+(what broke → what the diagnostic said → what fixed it) is where engineering
+knowledge actually lives, and today it is discarded.
+
+**WHAT:** Two halves, runtime discipline first:
+- **C7a Bounded repair loop** — when C1 feedback reports red, the harness
+  enters an explicit repair cycle: diagnose (read the error, name the cause)
+  before re-editing; cap attempts (3) per failure; the SAME error twice in a
+  row forces a strategy change reminder; cap exhausted → stop and surface,
+  never thrash. (The engine's convergence guard is the precedent.)
+- **C7b Attempt trace** — the repair cycle is recorded as a structured trace
+  {attempt, error, diagnosis, fix} and handed to the Witness alongside the
+  final snapshot, so learned procedures capture the PATH ("the type error was
+  actually a stale dist — rebuild first"), not just the destination. Traces of
+  failures that never resolved are candidate post-mortems on their own.
+**TEST:** induced double-failure produces a trace with two attempts and distinct
+diagnoses; same-error-twice triggers the strategy-change reminder; the Witness
+ask() payload contains the trace; attempt cap halts the loop with a clean
+surface, not an infinite retry.
 
 ---
 
