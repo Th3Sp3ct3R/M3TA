@@ -53,6 +53,8 @@ export interface SessionOptions {
   initialSeq?: number;
   /** Pending system-reminders to inject at next turn_start. */
   drainSystemReminders?: () => Array<{ text: string; source: ReminderSource }>;
+  /** C1 end-of-turn gate — see QueryEngineConfig.confirmTurnEnd. */
+  confirmTurnEnd?: () => Promise<Array<{ text: string; source: "verifier" | "hook" }>>;
   hookManager?: HookManager;
   requestPermission?: (request: ToolPermissionRequest) => Promise<PermissionPromptDecision>;
   /**
@@ -99,6 +101,7 @@ export class Session {
         workspace: opts.workspace,
         signal: opts.signal,
         drainSystemReminders: opts.drainSystemReminders,
+        confirmTurnEnd: opts.confirmTurnEnd,
         hookManager: opts.hookManager,
         requestPermission: opts.requestPermission,
         selfTerritoryRoots: opts.selfTerritoryRoots,

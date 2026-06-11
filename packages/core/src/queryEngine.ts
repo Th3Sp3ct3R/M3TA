@@ -125,6 +125,15 @@ export interface QueryEngineConfig {
       | "self-revise";
   }>;
   hookManager?: HookManager;
+  /**
+   * C1 — the end-of-turn gate. Called when the model wants to finish the turn
+   * (no tool calls in its last message). Return reminders (e.g. settled
+   * verifier failures on files this turn touched) and the engine injects them
+   * and CONTINUES the loop instead of ending — the model cannot claim "done"
+   * while its own edits are red. Fires at most twice per turn, then the turn
+   * ends regardless (never an infinite repair loop at the engine level).
+   */
+  confirmTurnEnd?(): Promise<Array<{ text: string; source: "verifier" | "hook" }>>;
   requestPermission?(request: ToolPermissionRequest): Promise<PermissionPromptDecision>;
   beforeToolUseCheckpoint?(request: {
     toolUseId: string;
@@ -278,6 +287,7 @@ export class QueryEngine {
     const totalUsage: Usage = { inputTokens: 0, outputTokens: 0 };
     let stopReason: StopReason = "end_turn";
     const maxIters = this.cfg.maxTurns ?? 50;
+    let endGateFired = 0;
 
     for (let iter = 0; iter < maxIters; iter++) {
       // ─── Stream one assistant turn from the provider ─────────────────
@@ -405,6 +415,29 @@ export class QueryEngine {
 
       // ─── Tool execution phase ────────────────────────────────────────
       if (pendingToolUses.length === 0) {
+        // C1 end-of-turn gate: before accepting "done", give verification a
+        // chance to object. Reminders → inject + loop; quiet → finish.
+        if (this.cfg.confirmTurnEnd && endGateFired < 2 && !this.cfg.signal?.aborted) {
+          let gateReminders: Array<{ text: string; source: "verifier" | "hook" }> = [];
+          try {
+            gateReminders = await this.cfg.confirmTurnEnd();
+          } catch {
+            gateReminders = [];
+          }
+          if (gateReminders.length > 0) {
+            endGateFired++;
+            this.messages.push({
+              id: cryptoId(),
+              role: "user",
+              content: gateReminders.map((r) => ({ type: "system_reminder" as const, text: r.text })),
+              createdAt: new Date().toISOString(),
+            });
+            for (const r of gateReminders) {
+              yield { type: "system_reminder_injected", text: r.text, source: r.source };
+            }
+            continue;
+          }
+        }
         yield {
           type: "turn_end",
           status: this.cfg.signal?.aborted ? "interrupted" : "completed",
@@ -461,6 +494,17 @@ export class QueryEngine {
         content: orderedToolResults(pendingToolUses, resultByToolUseId),
         createdAt: new Date().toISOString(),
       });
+
+      // C1 mid-turn drain: verification that finished while tools ran reaches
+      // the model NOW, in the same turn — not after it has already claimed done.
+      const midTurn = this.cfg.drainSystemReminders?.() ?? [];
+      if (midTurn.length > 0) {
+        const last = this.messages[this.messages.length - 1];
+        for (const r of midTurn) {
+          last.content.push({ type: "system_reminder", text: r.text });
+          yield { type: "system_reminder_injected", text: r.text, source: r.source };
+        }
+      }
 
       // Convergence guard: after a soft cap of tool rounds, force the model to
       // stop gathering and answer with what it has. Weak models otherwise loop

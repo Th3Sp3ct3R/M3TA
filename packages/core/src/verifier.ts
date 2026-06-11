@@ -94,6 +94,41 @@ export class ContinuousVerifier {
     return drained;
   }
 
+  /**
+   * C1 — settle: flush the debounce immediately and wait for every scheduled
+   * verify run to finish (bounded). Lets the engine's end-of-turn gate ask
+   * "is anything still red?" instead of letting a turn finish before the
+   * verdict lands. Never throws; on timeout it simply returns (the reminder,
+   * if any, surfaces next drain).
+   */
+  async settle(timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    // Flush a pending debounce window right now.
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+      void this.fireRun();
+    }
+    // Runs can chain (a fireRun may have been queued while one was active),
+    // so loop until quiet or out of time.
+    while (Date.now() < deadline) {
+      const inFlight = this.inFlight;
+      if (!inFlight && this.pendingFiles.size === 0) return;
+      if (inFlight) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return;
+        await Promise.race([inFlight.done, new Promise((r) => setTimeout(r, remaining))]);
+      } else if (this.pendingFiles.size > 0) {
+        void this.fireRun();
+      }
+    }
+  }
+
+  /** True when reminders are waiting to be drained. */
+  hasPendingReminders(): boolean {
+    return this.pendingReminders.length > 0;
+  }
+
   /** Cancel any in-flight run; used on session shutdown. */
   async cancel(): Promise<void> {
     if (this.debounceTimer) {

@@ -1375,6 +1375,22 @@ function compactLine(text: string, limit: number): string {
   return one.length <= limit ? one : `${one.slice(0, Math.max(0, limit - 1))}…`;
 }
 
+/**
+ * C1 — the end-of-turn gate, composed: flush+await the continuous verifier,
+ * then hand any red verdicts to the engine, which injects them and keeps the
+ * turn alive. The model cannot say "done" while its own edits are broken.
+ */
+async function confirmTurnEndWith(
+  verifier: ContinuousVerifier,
+): Promise<Array<{ text: string; source: "verifier" | "hook" }>> {
+  await verifier.settle(10_000);
+  return verifier
+    .drainReminders()
+    .map((r) => ({ text: `${r.text}
+
+Fix this before finishing — your edits this turn caused it.`, source: "verifier" as const }));
+}
+
 async function createSession(
   args: ParsedArgs,
   resumeSessionId?: string,
@@ -1478,6 +1494,7 @@ async function createSessionWithSelection(
       tools,
       requestPermission,
       drainSystemReminders,
+      confirmTurnEnd: () => confirmTurnEndWith(verifier),
       hookManager: hooks,
       sessionMeta: snapshot.meta,
       initialMessages: snapshot.messages,
@@ -1522,6 +1539,7 @@ async function createSessionWithSelection(
     tools,
     requestPermission,
     drainSystemReminders,
+    confirmTurnEnd: () => confirmTurnEndWith(verifier),
     hookManager: hooks,
     selfTerritoryRoots: context.selfTerritoryRoots,
     reasoningLevel: resolveReasoningLevel(settings),
