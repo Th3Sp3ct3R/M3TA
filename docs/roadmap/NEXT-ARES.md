@@ -142,6 +142,12 @@ clients (all thin — render events, send intents, hold zero entity state)
 **TEST:** Component tests for event→render mapping; smoke screenshot per panel (the existing tauri smoke rig).
 **GOTCHAS:** Don't chase their pixels; steal restraint — one warm monochrome, progressive disclosure, telemetry passive in the footer, zero accent sprawl.
 
+### V9.5 — The Theater (live eval preview)
+**WHY:** Trust through sight. Claude/Codex desktop show the agent driving what it built — cursor moving, buttons clicked, UI reacting. Ares has the substrate (the browser connector + filmstrip proof in @ares/connectors) but no live surface.
+**WHAT:** A gateway frame type `{"type":"theater.frame","sessionId","image","cursor":[x,y],"action"}` streamed whenever a session drives the browser connector; the desktop renders a Theater pane: live screenshot stream with a bronze cursor ghost and an action ticker ("clicked Submit", "filled email"). Filmstrips remain the durable proof; the Theater is the live window onto them. Throttle to ~4fps, drop-frames-first backpressure (the event stream must never lag the engine).
+**TEST:** mock connector emits frames → attached client receives ordered theater frames; backpressure drops frames, never blocks; no browser activity → zero overhead.
+**GOTCHAS:** never screenshot outside the agent-driven browser context (privacy); the pane is read-only — interaction stays with the agent.
+
 ### V10 — First channel (proof of the gateway)
 **WHY:** Validates that channels are "just clients" and gives the entity reach.
 **WHAT:** Telegram bridge as a gateway client: DM ↔ session, approvals render as inline keyboards (Gate over Telegram), long outputs summarized via sideQuery.

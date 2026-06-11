@@ -214,7 +214,7 @@ import {
 } from "@ares/operator";
 import { bridgeLegacyEnv, buildForegroundReminder, classifyUserIntent, diagnoseMemory, MemoryStore, mindPaths, type MemoryKind } from "@ares/mind";
 import { SessionManager, GarrisonServer, Scheduler, tokenPath, DEFAULT_GARRISON_PORT, type GatewayServerFrame } from "@ares/garrison";
-import { buildHolotableHtml } from "./holotable.js";
+import { buildHolotableHtml, MECH_SPEC, ROBOT_ARM_SPEC, type HoloSpec } from "./holotable.js";
 import {
   Filmstrip,
   clickEffect,
@@ -3480,6 +3480,10 @@ function buildSystemPrompt(permissionMode: PermissionMode = "workspace-write", c
 
 You pair with the user as a durable local agent, not a code-only bot. Be useful, concise, and honest. Take action with tools when action is useful, and answer normally when the user is just talking.
 
+## The Holotable (3D build engine)
+
+You can forge interactive 3D hologram build-guides. When the user wants to design or build something physical — a robot, a robot arm, a prop, a mask, a figure, a kit — offer the Holotable without being asked. Author a HoloSpec JSON file: { "title", "parts": [{ "id", "name", "kind": "box|cylinder|sphere|icosa|capsule|cone|torus", "size": [..], "position": [x,y,z], "axis"?: [x,y,z], "travel"?, "printable"?, "vendor"?, "qty"?, "note"? }], "wires": [{ "name", "from": partId, "to": partId, "via"?: [[x,y,z]..], "color"? }], "steps": [{ "title", "instruction", "parts": [ids] }] } — then run: ares holo <spec>.json --out <name>.html and tell the user to open it. The viewer gives them exploded view, step-by-step assembly mode, a wiring overlay, and a print-vs-buy BOM with STL export. Design real builds: honest part dimensions, real vendor search terms, wiring that makes electrical sense, assembly steps in dependency order. "ares holo arm" is a complete reference example.
+
 ## Tone and verbosity
 
 Match output length to task complexity. Most replies should be ≤4 lines (excluding tool calls and code). Skip preamble like "Here's what I'll do" and postamble like "I've completed the task". Lead with the answer or the action.
@@ -4226,15 +4230,41 @@ function csvFlag(value: string | undefined): string[] | undefined {
  * exploded-view slider, orbit controls). No model -> the procedural mech.
  */
 async function holoCommand(args: ParsedArgs): Promise<number> {
-  const model = args.positionals[0];
+  const target = args.positionals[0];
   const out = path.resolve(args.flags.get("out") ?? "holo.html");
-  const html = buildHolotableHtml({
-    title: args.flags.get("title") ?? (model ? `ARES // HOLOTABLE — ${path.basename(model)}` : undefined),
-    modelUrl: model,
-  });
+  let html: string;
+  let what: string;
+  try {
+    if (target && /\.(glb|gltf)$/i.test(target)) {
+      html = buildHolotableHtml({ title: args.flags.get("title") ?? `ARES // HOLOTABLE — ${path.basename(target)}`, modelUrl: target });
+      what = `model ${path.basename(target)} (radial explode)`;
+    } else if (target && /\.json$/i.test(target)) {
+      const spec = JSON.parse(await readFile(path.resolve(target), "utf8")) as HoloSpec;
+      html = buildHolotableHtml({ spec, title: args.flags.get("title") });
+      what = `spec "${spec.title}" — ${spec.parts.length} parts, ${spec.wires?.length ?? 0} wires, ${spec.steps?.length ?? 0} steps`;
+    } else if (target === "arm") {
+      html = buildHolotableHtml({ spec: ROBOT_ARM_SPEC, title: args.flags.get("title") });
+      what = "the DIY robot arm build (print list, vendor list, wiring, 8 steps)";
+    } else {
+      html = buildHolotableHtml({ spec: MECH_SPEC, title: args.flags.get("title") });
+      what = "the MK I mech showpiece";
+    }
+  } catch (err) {
+    process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}
+`);
+    return 2;
+  }
   await writeFile(out, html, "utf8");
   process.stdout.write(
-    notice("Holotable", [`forged ${out}`, "open it in a browser — drag to rotate, slider to disassemble"], "success"),
+    notice(
+      "Holotable",
+      [
+        `forged ${out} — ${what}`,
+        "drag · rotate   slider · disassemble   ASSEMBLY MODE · step-by-step build",
+        "WIRING · routed runs   PARTS/BOM · print-vs-buy + STL export",
+      ],
+      "success",
+    ),
   );
   return 0;
 }

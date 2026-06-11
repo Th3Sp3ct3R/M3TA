@@ -61,3 +61,4 @@ tauri/dist/
 # Misc
 *.tgz
 holo-demo.html
+holo-arm.html
