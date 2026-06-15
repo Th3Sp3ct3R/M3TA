@@ -155,7 +155,20 @@ export class ShellRegistry {
     s.status = "killed";
     s.finishedAt = new Date().toISOString();
     try {
-      s.child.kill(process.platform === "win32" ? undefined : "SIGTERM");
+      if (process.platform === "win32" && s.child.pid) {
+        // child.kill() only signals the direct child (bash.exe/pwsh.exe); its
+        // grandchildren (e.g. a `pnpm dev` node server) survive and keep the
+        // port. taskkill /T kills the whole tree, /F forces it.
+        spawn("taskkill", ["/PID", String(s.child.pid), "/T", "/F"], { stdio: "ignore" }).on("error", () => {
+          try {
+            s.child.kill();
+          } catch {
+            /* ignore */
+          }
+        });
+      } else {
+        s.child.kill("SIGTERM");
+      }
     } catch {
       /* ignore */
     }

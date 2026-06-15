@@ -45,9 +45,26 @@ export function makeExitPlanModeTool(state: PlanModeState) {
     concurrency: "exclusive",
     inputZod: exitSchema,
     activityDescription: () => "Exiting plan mode",
-    async call(i): Promise<{ output: { mode: PermissionMode; plan: string }; display: string }> {
+    async call(i, ctx): Promise<{ output: { mode: PermissionMode; plan: string; approved: boolean }; display: string }> {
+      // Plan mode's contract is "the user accepts or refines" — the model must
+      // not unilaterally restore write access. Require an explicit host approval
+      // when one is available; only then leave plan mode.
+      if (ctx.requestPermission) {
+        const decision = await ctx.requestPermission({
+          toolName: "ExitPlanMode",
+          input: i,
+          reason: "Approve this plan to leave plan mode and allow edits.",
+          suggestion: "allow_once",
+        });
+        if (decision === "deny") {
+          return {
+            output: { mode: state.permissionMode, plan: i.plan, approved: false },
+            display: "[PLAN] plan declined — staying in plan mode",
+          };
+        }
+      }
       state.permissionMode = "workspace-write";
-      return { output: { mode: state.permissionMode, plan: i.plan }, display: "[PLAN] disabled" };
+      return { output: { mode: state.permissionMode, plan: i.plan, approved: true }, display: "[PLAN] disabled" };
     },
   });
 }

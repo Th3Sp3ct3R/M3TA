@@ -22,6 +22,7 @@ import type {
 } from "@ares/protocol";
 import { thinkingBudgetTokens } from "@ares/protocol";
 import type { Provider, ProviderRequest } from "../queryEngine.js";
+import { createStallGuard, stallErrorEvent } from "./stallGuard.js";
 
 export type SlotName = "reasoner" | "apply" | "summarize";
 
@@ -58,6 +59,8 @@ interface SlotState {
 export class OllamaCloudPool {
   readonly host: string;
   readonly useAnthropicCompat: boolean;
+  /** Set when /v1/messages 404s — this Ollama predates the compat endpoint. */
+  private compatUnsupported = false;
   private readonly slots: Map<SlotName, SlotState>;
   private readonly fetchImpl: typeof fetch;
   private readonly apiKey?: string;
@@ -75,11 +78,14 @@ export class OllamaCloudPool {
     this.host = normalizeOllamaHost(opts.host ?? anthropicBase ?? process.env.OLLAMA_HOST);
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.apiKey = opts.apiKey ?? anthropicToken ?? process.env.OLLAMA_API_KEY;
-    // Auto-enable compat when the user has the standard Anthropic env
-    // vars set, OR explicitly asked for it. /v1/messages exists; trust it.
+    // Compat is the DEFAULT: /v1/messages streams tool-input deltas (live
+    // tool authorship in the UI) and needs zero translation from Ares's
+    // Anthropic-shaped wire protocol. Opt out with
+    // ARES_OLLAMA_ANTHROPIC_COMPAT=0; old Ollama builds without the endpoint
+    // fall back to /api/chat automatically on the first 404/405.
     this.useAnthropicCompat =
       opts.useAnthropicCompat ??
-      (process.env.ARES_OLLAMA_ANTHROPIC_COMPAT === "1" || Boolean(anthropicBase || anthropicToken));
+      (process.env.ARES_OLLAMA_ANTHROPIC_COMPAT !== "0");
     this.slots = new Map(
       (Object.entries(opts.slots) as Array<[SlotName, SlotConfig]>).map(([name, cfg]) => [
         name,
@@ -205,7 +211,7 @@ export class OllamaCloudPool {
     const self = this;
     const generator = (async function* (): AsyncGenerator<StreamEvent> {
       try {
-        if (self.useAnthropicCompat) {
+        if (self.useAnthropicCompat && !self.compatUnsupported) {
           yield* self.callAnthropicMessages(model, req);
         } else {
           yield* self.callOllamaChat(model, req);
@@ -255,12 +261,26 @@ export class OllamaCloudPool {
         : {}),
     };
 
-    const res = await this.fetchImpl(`${this.host}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: req.signal,
-    });
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
+    const guard = createStallGuard(req.signal);
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.host}/api/chat`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: guard.signal,
+      });
+    } catch (err) {
+      guard.dispose();
+      if (guard.stalled()) {
+        yield stallErrorEvent();
+        return;
+      }
+      throw err;
+    }
+    guard.reset();
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
@@ -295,7 +315,19 @@ export class OllamaCloudPool {
     let stopReason: StopReason = "end_turn";
 
     while (true) {
-      const { done, value } = await reader.read();
+      let step: ReadableStreamReadResult<Uint8Array>;
+      try {
+        step = await reader.read();
+      } catch (err) {
+        guard.dispose();
+        if (guard.stalled()) {
+          yield stallErrorEvent();
+          return;
+        }
+        throw err;
+      }
+      guard.reset();
+      const { done, value } = step;
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let nlIdx: number;
@@ -355,6 +387,8 @@ export class OllamaCloudPool {
       }
     }
 
+    guard.dispose();
+
     for (const part of flushThinkingState(thinkingState)) {
       if (part.type === "thinking") {
         thinkingParts.push(part.text);
@@ -410,23 +444,54 @@ export class OllamaCloudPool {
     };
     if (this.apiKey) headers["x-api-key"] = this.apiKey;
 
-    let res = await this.fetchImpl(`${this.host}/v1/messages`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: req.signal,
-    });
+    const guard = createStallGuard(req.signal);
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.host}/v1/messages`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: guard.signal,
+      });
+    } catch (err) {
+      guard.dispose();
+      if (guard.stalled()) {
+        yield stallErrorEvent();
+        return;
+      }
+      throw err;
+    }
+    guard.reset();
+
+    if (!res.ok && (res.status === 404 || res.status === 405)) {
+      // This Ollama predates /v1/messages — remember and fall back to
+      // /api/chat for this and every future call.
+      guard.dispose();
+      this.compatUnsupported = true;
+      yield* this.callOllamaChat(model, req);
+      return;
+    }
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       if (hasCacheControl(body) && cacheControlMayBeUnsupported(res.status, text)) {
         body = buildAnthropicMessagesBody(model, req, false);
-        res = await this.fetchImpl(`${this.host}/v1/messages`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-          signal: req.signal,
-        });
+        try {
+          res = await this.fetchImpl(`${this.host}/v1/messages`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+            signal: guard.signal,
+          });
+        } catch (err) {
+          guard.dispose();
+          if (guard.stalled()) {
+            yield stallErrorEvent();
+            return;
+          }
+          throw err;
+        }
+        guard.reset();
         if (res.ok) {
           // Continue into the normal streaming parser below with the retried response.
         } else {
@@ -493,7 +558,19 @@ export class OllamaCloudPool {
     let messageId = "";
 
     while (true) {
-      const { done, value } = await reader.read();
+      let step: ReadableStreamReadResult<Uint8Array>;
+      try {
+        step = await reader.read();
+      } catch (err) {
+        guard.dispose();
+        if (guard.stalled()) {
+          yield stallErrorEvent();
+          return;
+        }
+        throw err;
+      }
+      guard.reset();
+      const { done, value } = step;
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let sep: number;
@@ -507,11 +584,16 @@ export class OllamaCloudPool {
           case "message_start": {
             messageId = evt.message?.id ?? "";
             if (evt.message?.usage) {
+              const cacheReadTokens = evt.message.usage.cache_read_input_tokens;
+              const cacheWriteTokens = evt.message.usage.cache_creation_input_tokens;
               usage = {
-                inputTokens: evt.message.usage.input_tokens ?? 0,
+                inputTokens:
+                  (evt.message.usage.input_tokens ?? 0) +
+                  (cacheReadTokens ?? 0) +
+                  (cacheWriteTokens ?? 0),
                 outputTokens: evt.message.usage.output_tokens ?? 0,
-                cacheReadTokens: evt.message.usage.cache_read_input_tokens,
-                cacheWriteTokens: evt.message.usage.cache_creation_input_tokens,
+                cacheReadTokens,
+                cacheWriteTokens,
               };
             }
             continue;
@@ -598,6 +680,8 @@ export class OllamaCloudPool {
         }
       }
     }
+
+    guard.dispose();
 
     // Build final assistant message
     const content: ContentBlock[] = [];

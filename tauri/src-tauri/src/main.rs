@@ -30,13 +30,16 @@ use windows_sys::Win32::Graphics::Dwm::{
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 struct DaemonState {
-    child: Mutex<Option<Child>>,
-    stdin: Mutex<Option<ChildStdin>>,
+    child: Arc<Mutex<Option<Child>>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     root: Mutex<Option<PathBuf>>,
     provider: Mutex<Option<String>>,
     model: Mutex<Option<String>>,
     events: Arc<Mutex<Vec<BufferedEvent>>>,
     next_event_seq: Arc<AtomicU64>,
+    /// Bumped on every (re)start so stale exit-watchers from a previous child
+    /// can tell they are watching a dead generation and stand down.
+    generation: Arc<AtomicU64>,
 }
 
 /// The local Kokoro voice sidecar (voice_service/server.py) — auto-started with
@@ -203,6 +206,9 @@ fn start_daemon(
             .map_err(|error| format!("failed to create Ares home: {error}"))?;
     }
 
+    // New generation: any watcher from a previous child stands down.
+    state.generation.fetch_add(1, Ordering::SeqCst);
+
     let provider = clean_optional(provider);
     let model = clean_optional(model);
     let mut command = Command::new(&runtime.node);
@@ -284,6 +290,14 @@ fn start_daemon(
         state.events.clone(),
         state.next_event_seq.clone(),
     );
+    spawn_exit_watcher(
+        app.clone(),
+        state.child.clone(),
+        state.stdin.clone(),
+        state.events.clone(),
+        state.next_event_seq.clone(),
+        state.generation.clone(),
+    );
     push_event(
         &app,
         state,
@@ -304,13 +318,26 @@ fn start_daemon(
 }
 
 #[tauri::command]
-fn ares_send(goal: String, state: State<DaemonState>) -> Result<(), String> {
+fn ares_send(goal: String, session_id: Option<String>, state: State<DaemonState>) -> Result<(), String> {
     let trimmed = goal.trim();
     if trimmed.is_empty() {
         return Err("message is empty".to_string());
     }
 
-    write_daemon_command(state.inner(), json!({ "type": "send", "goal": trimmed }))
+    write_daemon_command(
+        state.inner(),
+        json!({ "type": "send", "goal": trimmed, "sessionId": session_id }),
+    )
+}
+
+#[tauri::command]
+fn ares_interrupt(session_id: Option<String>, state: State<DaemonState>) -> Result<(), String> {
+    // Stop the in-flight turn for this chat. The daemon aborts the provider
+    // stream and any running tools; the session stays alive for the next message.
+    write_daemon_command(
+        state.inner(),
+        json!({ "type": "interrupt", "sessionId": session_id }),
+    )
 }
 
 #[tauri::command]
@@ -333,6 +360,79 @@ fn ares_set_routing(routing: Value, state: State<DaemonState>) -> Result<(), Str
     write_daemon_command(
         state.inner(),
         json!({ "type": "routing", "routing": routing }),
+    )
+}
+
+/// Forward an arbitrary control command to the daemon (NDJSON over stdin).
+/// Used by the desktop for the read-model commands: sessions_list,
+/// session_history, engine_config, skills_list, skill_toggle, usage_stats,
+/// operator_status. The daemon replies asynchronously on the event stream.
+/// Open a URL in the user's default browser (used for the Anthropic OAuth
+/// sign-in flow). Validated to http(s) so a daemon event can't open arbitrary
+/// programs.
+#[tauri::command]
+fn ares_open_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("only http(s) URLs may be opened".to_string());
+    }
+    #[cfg(windows)]
+    {
+        // ShellExecuteW — the ONLY correct way to open a URL on Windows. Using
+        // `cmd /c start` mangles URLs containing `&` (cmd treats it as a command
+        // separator), which silently dropped every OAuth query param after the
+        // first one. ShellExecuteW takes the whole URL verbatim.
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL as i32,
+            )
+        };
+        // ShellExecuteW returns a value > 32 on success.
+        if (result as isize) <= 32 {
+            return Err("failed to open browser".to_string());
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(&url).spawn().map_err(|e| format!("failed to open browser: {e}"))?;
+        Ok(())
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(&url).spawn().map_err(|e| format!("failed to open browser: {e}"))?;
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn ares_daemon_command(command: Value, state: State<DaemonState>) -> Result<(), String> {
+    if !command.is_object() {
+        return Err("daemon command must be an object".to_string());
+    }
+    write_daemon_command(state.inner(), command)
+}
+
+#[tauri::command]
+fn ares_set_provider_key(
+    provider: String,
+    key: String,
+    model: Option<String>,
+    state: State<DaemonState>,
+) -> Result<(), String> {
+    // The owner's API key for any keyed provider (anthropic, openrouter, …).
+    // Persisted to ui.json by the daemon; applied on the next daemon start.
+    write_daemon_command(
+        state.inner(),
+        json!({ "type": "provider_key", "provider": provider, "key": key, "model": model }),
     )
 }
 
@@ -378,6 +478,44 @@ fn write_daemon_command(state: &DaemonState, command: Value) -> Result<(), Strin
         .and_then(|_| stdin.write_all(b"\n"))
         .and_then(|_| stdin.flush())
         .map_err(|error| format!("failed to send message to daemon: {error}"))
+}
+
+/// Write sandbox/preview HTML into the Ares home so the Forge panel can load
+/// it over the asset protocol — a real document origin, so its scripts run
+/// (srcdoc iframes inherit the app CSP and cannot execute inline code).
+#[tauri::command]
+fn ares_forge_write(name: String, html: String) -> Result<String, String> {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = safe.trim_matches('.').to_string();
+    if safe.is_empty() {
+        return Err("forge file name is empty".to_string());
+    }
+    let dir = desktop_ares_home()
+        .ok_or_else(|| "Ares home unavailable".to_string())?
+        .join("forge");
+    fs::create_dir_all(&dir).map_err(|error| format!("failed to create forge dir: {error}"))?;
+    let path = dir.join(format!("{safe}.html"));
+    fs::write(&path, html).map_err(|error| format!("failed to write forge file: {error}"))?;
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
+fn ares_read_text_file(path: String) -> Result<String, String> {
+    let path = PathBuf::from(path);
+    let meta = fs::metadata(&path).map_err(|error| format!("cannot stat file: {error}"))?;
+    if meta.len() > 4_000_000 {
+        return Err("file too large to preview".to_string());
+    }
+    fs::read_to_string(&path).map_err(|error| format!("cannot read file: {error}"))
 }
 
 #[tauri::command]
@@ -431,7 +569,64 @@ fn ares_window_close(app: tauri::AppHandle, state: State<DaemonState>) -> Result
         .map_err(|error| format!("failed to close window: {error}"))
 }
 
+/// Watch the live child for unexpected exit. When it dies on its own (crash,
+/// provider auth failure, OOM), clear the dead handles and tell the frontend —
+/// the UI shows the failure and offers/performs a restart instead of silently
+/// erroring with "pipe is being closed" on the next send.
+fn spawn_exit_watcher(
+    app: tauri::AppHandle,
+    child: Arc<Mutex<Option<Child>>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    events: Arc<Mutex<Vec<BufferedEvent>>>,
+    next_event_seq: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
+) {
+    let my_generation = generation.load(Ordering::SeqCst);
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(500));
+        if generation.load(Ordering::SeqCst) != my_generation {
+            return; // superseded by a restart/stop — not ours to report
+        }
+        let mut exit_code: Option<i32> = None;
+        let mut exited = false;
+        if let Ok(mut guard) = child.lock() {
+            match guard.as_mut() {
+                None => return, // stopped deliberately elsewhere
+                Some(proc) => match proc.try_wait() {
+                    Ok(Some(status)) => {
+                        exit_code = status.code();
+                        exited = true;
+                        *guard = None;
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        exited = true;
+                        *guard = None;
+                    }
+                },
+            }
+        }
+        if exited {
+            if generation.load(Ordering::SeqCst) != my_generation {
+                return;
+            }
+            if let Ok(mut stdin_guard) = stdin.lock() {
+                *stdin_guard = None;
+            }
+            push_event_parts(
+                &app,
+                &events,
+                &next_event_seq,
+                json!({ "type": "desktop_daemon_exited", "code": exit_code }),
+            );
+            return;
+        }
+    });
+}
+
 fn stop_existing_daemon(state: &DaemonState) -> Result<(), String> {
+    // Bump the generation first so the exit watcher treats this as deliberate.
+    state.generation.fetch_add(1, Ordering::SeqCst);
     {
         let mut stdin_state = state.stdin.lock().map_err(|_| "daemon stdin lock failed")?;
         *stdin_state = None;
@@ -529,13 +724,14 @@ fn stop_voice_sidecar(state: &VoiceState) {
 fn main() {
     tauri::Builder::default()
         .manage(DaemonState {
-            child: Mutex::new(None),
-            stdin: Mutex::new(None),
+            child: Arc::new(Mutex::new(None)),
+            stdin: Arc::new(Mutex::new(None)),
             root: Mutex::new(None),
             provider: Mutex::new(None),
             model: Mutex::new(None),
             events: Arc::new(Mutex::new(Vec::new())),
             next_event_seq: Arc::new(AtomicU64::new(1)),
+            generation: Arc::new(AtomicU64::new(0)),
         })
         .manage(VoiceState {
             child: Mutex::new(None),
@@ -580,10 +776,16 @@ fn main() {
             ares_start_daemon,
             ares_restart_daemon,
             ares_send,
+            ares_interrupt,
             ares_set_reasoning,
             ares_set_routing,
             ares_set_openrouter_key,
+            ares_set_provider_key,
+            ares_daemon_command,
+            ares_open_url,
             ares_permission_response,
+            ares_forge_write,
+            ares_read_text_file,
             ares_stop_daemon,
             ares_window_minimize,
             ares_window_toggle_maximize,
@@ -615,10 +817,21 @@ fn hide_windows_accent_border(window: &tauri::WebviewWindow) {
 }
 
 fn daemon_status(state: &DaemonState) -> DaemonStatus {
+    // Live-check the child rather than trusting the handle: a crashed daemon
+    // must read as not-running so the shell/UI can restart it.
     let running = state
         .child
         .lock()
-        .map(|child| child.is_some())
+        .map(|mut child| match child.as_mut() {
+            None => false,
+            Some(proc) => match proc.try_wait() {
+                Ok(Some(_)) | Err(_) => {
+                    *child = None;
+                    false
+                }
+                Ok(None) => true,
+            },
+        })
         .unwrap_or(false);
     let root = state
         .root
@@ -1230,11 +1443,43 @@ fn http_json(
     stream
         .read_to_string(&mut response)
         .map_err(|error| format!("failed to read Ollama response: {error}"))?;
-    let body = response
+    let (head, body) = response
         .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
         .ok_or_else(|| "invalid Ollama HTTP response".to_string())?;
-    serde_json::from_str(body).map_err(|error| format!("invalid Ollama JSON: {error}"))
+    // Ollama answers HTTP/1.1 with Transfer-Encoding: chunked — the body is
+    // chunk-size lines interleaved with data. Decode before parsing JSON.
+    let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        decode_chunked_body(body)
+    } else {
+        body.to_string()
+    };
+    serde_json::from_str(&body).map_err(|error| format!("invalid Ollama JSON: {error}"))
+}
+
+fn decode_chunked_body(raw: &str) -> String {
+    // Chunk sizes are BYTE counts — work on bytes so a chunk boundary inside a
+    // multibyte character can never panic a string slice.
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    while pos + 1 < bytes.len() {
+        let Some(line_end) = bytes[pos..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|i| pos + i)
+        else {
+            break;
+        };
+        let size_line = String::from_utf8_lossy(&bytes[pos..line_end]);
+        let size = usize::from_str_radix(size_line.trim().split(';').next().unwrap_or(""), 16).unwrap_or(0);
+        let data_start = line_end + 2;
+        if size == 0 || data_start + size > bytes.len() {
+            break;
+        }
+        out.extend_from_slice(&bytes[data_start..data_start + size]);
+        pos = data_start + size + 2;
+    }
+    String::from_utf8_lossy(&out).to_string()
 }
 
 fn resolve_ares_runtime(app: Option<&tauri::AppHandle>) -> Option<AresRuntime> {
@@ -1298,7 +1543,23 @@ fn push_runtime_candidates(candidates: &mut Vec<PathBuf>, root: PathBuf) {
     candidates.push(root);
 }
 
+/// Strip Windows verbatim prefixes (`\\?\` / `\\?\UNC\`). Tauri's
+/// resource_dir() returns canonicalized verbatim paths, and Node CANNOT load
+/// its main module through one — realpathSync walks the components, lstats a
+/// bare `C:`, and dies with EISDIR before the daemon even starts.
+fn simplify_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 fn runtime_at(root: &Path) -> Option<AresRuntime> {
+    let root = simplify_path(root);
     let cli = root.join("cli").join("ares-cli.mjs");
     let node = root
         .join("bin")

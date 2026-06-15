@@ -31,7 +31,7 @@ function runAres(args) {
 test("M0: ares help exits 0 with usage on stdout", () => {
   const r = runAres(["help"]);
   assert.equal(r.status, 0);
-  assert.match(r.stdout, /ares v0\.3\.0-alpha\.1/);
+  assert.match(r.stdout, /ares v0\.9\.1/);
   assert.match(r.stdout, /streaming coding-agent harness/);
 });
 

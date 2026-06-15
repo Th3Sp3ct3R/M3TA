@@ -41,11 +41,20 @@ const inputSchema = z
       .max(120_000)
       .default(20_000)
       .describe("Cap on returned text. Default 20k chars."),
+    offset: z
+      .number()
+      .int()
+      .nonnegative()
+      .default(0)
+      .describe("Character offset to start from — page through a long document by advancing offset."),
   })
   .strict();
 
 const FETCH_TIMEOUT_MS = 30_000;
-const MAX_REDIRECTS = 5;
+// A real browser UA: many CDNs auto-403 unknown agents, which wrongly teaches
+// the model the page is unreachable.
+const FETCH_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
 export function makeWebFetchTool(summarizer?: Summarizer) {
   return buildTool({
@@ -70,20 +79,38 @@ export function makeWebFetchTool(summarizer?: Summarizer) {
         const res = await fetch(upgraded, {
           redirect: "follow",
           signal: controller.signal,
-          headers: { "user-agent": "Ares/0.3 (+https://ares.dev)" },
+          headers: { "user-agent": FETCH_USER_AGENT },
         });
         clearTimeout(timeout);
         ctx.signal.removeEventListener("abort", onAbort);
 
         const contentType = res.headers.get("content-type") ?? "";
+        // Don't dump binary (PDF/image/octet-stream) into context as garbage.
+        if (/application\/pdf|^image\/|application\/octet-stream|^audio\/|^video\//i.test(contentType)) {
+          return {
+            output: {
+              url: upgraded,
+              finalUrl: res.url,
+              status: res.status,
+              contentType,
+              text: `[${contentType || "binary content"} — not text. WebFetch returns text only; download it with a shell tool if you need the bytes.]`,
+              truncated: false,
+            },
+            display: `Fetched ${shortUrl(res.url)} (${res.status}, ${contentType || "binary"})`,
+          };
+        }
         const raw = await res.text();
         const isHtml = /text\/html|application\/xhtml/i.test(contentType) ||
           (!contentType && /^\s*<!DOCTYPE html|<html/i.test(raw));
         const rendered = isHtml ? htmlToText(raw) : raw;
-        const truncated = rendered.length > i.max_chars;
-        const text = truncated ? rendered.slice(0, i.max_chars) + "\n\n…[truncated]…" : rendered;
+        // Page through long docs with offset (content past the window was
+        // previously permanently unreachable).
+        const windowed = i.offset > 0 ? rendered.slice(i.offset) : rendered;
+        const truncated = windowed.length > i.max_chars;
+        const text = truncated ? windowed.slice(0, i.max_chars) + "\n\n…[truncated — advance `offset` to read more]…" : windowed;
 
         let summary: string | undefined;
+        let summarized = false;
         if (i.prompt && summarizer) {
           try {
             summary = await summarizer.summarize({
@@ -91,10 +118,16 @@ export function makeWebFetchTool(summarizer?: Summarizer) {
               instructions: `You are summarizing a web page for a coding agent. The agent asked: "${i.prompt}". Return ONLY the information that answers that question. Preserve URLs, code snippets, and exact identifiers. Be concise.`,
               signal: ctx.signal,
             });
+            summarized = true;
           } catch (err) {
             summary = `(summarization failed: ${err instanceof Error ? err.message : String(err)})`;
           }
         }
+
+        // When a summary actually succeeded, DROP the full text — otherwise the
+        // reasoner re-reads the whole page and the "keeps context lean" promise
+        // is a lie. Keep a short lead-in for grounding.
+        const returnedText = summarized ? text.slice(0, 500) : text;
 
         return {
           output: {
@@ -102,8 +135,8 @@ export function makeWebFetchTool(summarizer?: Summarizer) {
             finalUrl: res.url,
             status: res.status,
             contentType,
-            text,
-            truncated,
+            text: returnedText,
+            truncated: summarized ? false : truncated,
             summary,
           },
           display: summary

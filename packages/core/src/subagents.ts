@@ -37,6 +37,8 @@ export interface SubagentRunRequest {
   parentSessionId?: string;
   workspace: string;
   signal?: AbortSignal;
+  /** Forward child activity to the parent so a running subagent isn't invisible. */
+  onProgress?: (data: unknown) => void;
 }
 
 export interface SubagentRunResult {
@@ -188,6 +190,8 @@ export interface SubagentRunnerOptions {
   parentTools: readonly EngineTool[];
   /** Base system prompt the subagent sees AFTER its type-specific prompt. */
   baseSystemPrompt: string;
+  /** Optional global ceiling layered over each subagent type's own limit. */
+  maxTurns?: number | (() => number | undefined);
 }
 
 export class AresSubagentRunner implements SubagentRunner {
@@ -221,6 +225,12 @@ export class AresSubagentRunner implements SubagentRunner {
 
     const systemPrompt = `${def.systemPrompt}\n\n---\n\n${this.opts.baseSystemPrompt}`;
 
+    const configuredMaxTurns =
+      typeof this.opts.maxTurns === "function" ? this.opts.maxTurns() : this.opts.maxTurns;
+    const typeMaxTurns = def.maxTurns ?? 30;
+    const maxTurns =
+      configuredMaxTurns === undefined ? typeMaxTurns : Math.min(typeMaxTurns, configuredMaxTurns);
+
     const engine = new QueryEngine(
       {
         provider: this.opts.provider,
@@ -229,7 +239,11 @@ export class AresSubagentRunner implements SubagentRunner {
         tools: allowedTools,
         workspace: req.workspace,
         signal: req.signal,
-        maxTurns: def.maxTurns ?? 30,
+        maxTurns,
+        // Fresh read-stamp map per subagent run: a child's Reads must never
+        // poison the parent's re-read guard or grant it read-before-write on
+        // files the parent never inspected.
+        fileReadStamps: new Map(),
       },
       id,
     );
@@ -244,7 +258,18 @@ export class AresSubagentRunner implements SubagentRunner {
     try {
       for await (const ev of engine.streamTurn()) {
         events.push(ev);
-        if (ev.type === "tool_start") toolCallCount++;
+        if (ev.type === "tool_start") {
+          toolCallCount++;
+          // Surface what the child is doing so the parent UI shows real activity
+          // instead of a frozen "Delegating…".
+          req.onProgress?.({
+            kind: "subagent_activity",
+            agentId: id,
+            type: req.subagent_type,
+            tool: (ev as { name?: string }).name,
+            activity: (ev as { activityDescription?: string }).activityDescription,
+          });
+        }
         if (ev.type === "turn_end") {
           usage = ev.usage;
           status = ev.status === "completed" ? "completed" : "failed";

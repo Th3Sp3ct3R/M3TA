@@ -5,7 +5,7 @@
 import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { buildTool, resolveWorkspacePath, zPath } from "./_shared.js";
+import { buildTool, contentHash, resolveWorkspacePath, zPath } from "./_shared.js";
 
 const inputSchema = z
   .object({
@@ -59,21 +59,28 @@ export const ReadTool = buildTool({
     const prior = ctx.fileReadStamps.get(filePath);
     const wholeFile = i.offset === undefined && i.limit === undefined;
     if (prior && wholeFile && prior.mtimeMs === stat.mtimeMs && prior.size === stat.size) {
+      // The model-visible content MUST NOT look like an empty file, or a model
+      // that re-reads because it lost track will edit/rewrite blind. Put the
+      // explanation in `content` itself and report the real line count.
+      const priorTotal = prior.lines ?? 0;
+      const note = `<system>File "${path.basename(filePath)}" (${priorTotal} lines) is unchanged on disk and already in your context this session — its full contents are above. Work from what you already have, or pass offset/limit to re-fetch a specific range.</system>`;
       return {
         output: {
           path: filePath,
-          totalLines: 0,
+          totalLines: priorTotal,
           startLine: 0,
           endLine: 0,
-          content: "",
+          content: note,
           truncated: false,
         },
-        display: `Skipped re-read of ${path.basename(filePath)} — already in context this session, unchanged. Work from what you already have, or pass offset/limit to fetch a specific range.`,
+        display: `Skipped re-read of ${path.basename(filePath)} — already in context this session, unchanged.`,
       };
     }
 
     const raw = await fs.readFile(filePath, "utf8");
-    const lines = raw.split("\n");
+    // Strip \r so CRLF files present clean lines — the model can't see (or
+    // reproduce) a trailing \r, and Edit matches in EOL-normalized space.
+    const lines = raw.split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
     const total = lines.length;
     const start = i.offset ?? 0;
     const end = i.limit !== undefined ? Math.min(total, start + i.limit) : total;
@@ -86,7 +93,7 @@ export const ReadTool = buildTool({
       })
       .join("\n");
 
-    ctx.fileReadStamps.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size });
+    ctx.fileReadStamps.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, hash: contentHash(raw), lines: total });
 
     return {
       output: {

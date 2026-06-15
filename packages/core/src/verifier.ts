@@ -33,6 +33,9 @@ export interface VerifyResult {
   stdoutTail: string;
   stderrTail: string;
   durationMs: number;
+  /** The tool wasn't found on PATH (ENOENT) — verifier unavailable, not a real
+   *  failure. Callers must NOT turn this into a "fix this" reminder. */
+  skipped?: boolean;
 }
 
 export type VerifyEvent =
@@ -71,7 +74,12 @@ export class ContinuousVerifier {
 
   constructor(opts: VerifierOptions) {
     this.workspace = opts.workspace;
-    this.debounceMs = opts.debounceMs ?? 800;
+    // Hot-path coalescing (C1): during a burst of edits we cancel + reschedule,
+    // so a longer window means fewer wasted project typechecks mid-edit. The
+    // end-of-turn gate flushes immediately via settle(), so this only affects
+    // mid-turn thrash. Tunable with ARES_VERIFY_DEBOUNCE_MS.
+    const envDebounce = Number(process.env.ARES_VERIFY_DEBOUNCE_MS);
+    this.debounceMs = opts.debounceMs ?? (Number.isFinite(envDebounce) && envDebounce >= 0 ? Math.floor(envDebounce) : 1500);
     this.outputTailChars = opts.outputTailChars ?? 4000;
     this.onEvent = opts.onEvent;
   }
@@ -162,7 +170,10 @@ export class ContinuousVerifier {
     this.pendingFiles.clear();
 
     const setup = await this.detectSetup();
-    const commands = deriveNarrowVerify(files, this.workspace, setup);
+    // Editing a source file should exercise its tests, not just its types —
+    // pull in existing sibling/related test files for everything touched.
+    const related = await findRelatedTestFiles(files, this.workspace);
+    const commands = deriveNarrowVerify([...files, ...related], this.workspace, setup);
     if (commands.length === 0) return;
 
     this.onEvent?.({ type: "scheduled", files, commands });
@@ -239,13 +250,19 @@ If a failure is unrelated to your change, say so explicitly. If you can't fix it
       };
       child.stdout?.on("data", (b: Buffer) => onChunk(b, "out"));
       child.stderr?.on("data", (b: Buffer) => onChunk(b, "err"));
-      child.on("error", () => {
+      child.on("error", (err: NodeJS.ErrnoException) => {
+        // ENOENT = the tool isn't installed (e.g. ruff/pytest/tsc missing).
+        // That's "verifier unavailable", NOT a code failure — never nag for it.
+        const missing = err?.code === "ENOENT";
         resolve({
-          ok: false,
+          ok: missing ? true : false,
+          skipped: missing,
           command: cmd,
           exitCode: null,
           stdoutTail: stdout.slice(-this.outputTailChars),
-          stderrTail: (stderr + "\n(child errored)").slice(-this.outputTailChars),
+          stderrTail: (stderr + (missing ? `\n(${cmd.program} not found — skipped)` : "\n(child errored)")).slice(
+            -this.outputTailChars,
+          ),
           durationMs: Date.now() - t0,
         });
       });
@@ -272,14 +289,36 @@ If a failure is unrelated to your change, say so explicitly. If you can't fix it
 
 export interface WorkspaceSetup {
   hasTsconfig: boolean;
+  /** tsconfig declares composite/references — `tsc -b` is valid. Otherwise
+   *  `tsc -b` errors, so we must use `tsc --noEmit -p .`. */
+  tsconfigComposite: boolean;
   hasPackageJson: boolean;
   hasPnpm: boolean;
   hasNpm: boolean;
+  /** Project's actual JS/TS test runner, read from package.json. */
+  testRunner: "vitest" | "jest" | "node" | null;
   hasPyproject: boolean;
   hasRuff: boolean;
   hasPytest: boolean;
   hasCargo: boolean;
   hasGoMod: boolean;
+}
+
+/** Is a binary resolvable on PATH? Used so we never emit a verify command for a
+ *  tool that isn't installed (which would surface as a phantom failure). */
+async function onPath(bin: string): Promise<boolean> {
+  const dirs = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+  const exts = process.platform === "win32" ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";") : [""];
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      const ok = await fs
+        .stat(path.join(dir, bin + ext))
+        .then((s) => s.isFile())
+        .catch(() => false);
+      if (ok) return true;
+    }
+  }
+  return false;
 }
 
 async function detectWorkspaceSetup(workspace: string): Promise<WorkspaceSetup> {
@@ -288,6 +327,12 @@ async function detectWorkspaceSetup(workspace: string): Promise<WorkspaceSetup> 
       .stat(path.join(workspace, rel))
       .then(() => true)
       .catch(() => false);
+  const readJson = async (rel: string): Promise<Record<string, unknown> | null> =>
+    fs
+      .readFile(path.join(workspace, rel), "utf8")
+      .then((raw) => JSON.parse(raw) as Record<string, unknown>)
+      .catch(() => null);
+
   const [tsc, pkg, pnpmLock, pyproject, cargo, goMod] = await Promise.all([
     exists("tsconfig.json"),
     exists("package.json"),
@@ -296,17 +341,92 @@ async function detectWorkspaceSetup(workspace: string): Promise<WorkspaceSetup> 
     exists("Cargo.toml"),
     exists("go.mod"),
   ]);
+
+  // Composite/references → `tsc -b` is the right invocation; otherwise it errors.
+  let tsconfigComposite = false;
+  if (tsc) {
+    const cfg = await readJson("tsconfig.json");
+    const opts = (cfg?.compilerOptions ?? {}) as Record<string, unknown>;
+    tsconfigComposite = opts.composite === true || Array.isArray(cfg?.references);
+  }
+
+  // Real test runner from package.json (devDeps + the `test` script), not a guess.
+  let testRunner: WorkspaceSetup["testRunner"] = null;
+  if (pkg) {
+    const p = await readJson("package.json");
+    const deps = { ...((p?.devDependencies as object) ?? {}), ...((p?.dependencies as object) ?? {}) } as Record<string, unknown>;
+    const testScript = ((p?.scripts as Record<string, unknown>)?.test as string) ?? "";
+    if ("vitest" in deps || /\bvitest\b/.test(testScript)) testRunner = "vitest";
+    else if ("jest" in deps || /\bjest\b/.test(testScript)) testRunner = "jest";
+    else if (/node\s+--test/.test(testScript)) testRunner = "node";
+  }
+
+  // Verify Python tooling is actually installed before emitting commands for it.
+  const [hasRuff, hasPytest] = pyproject
+    ? await Promise.all([onPath("ruff"), onPath("pytest")])
+    : [false, false];
+
   return {
     hasTsconfig: tsc,
+    tsconfigComposite,
     hasPackageJson: pkg,
     hasPnpm: pnpmLock,
     hasNpm: pkg && !pnpmLock,
+    testRunner,
     hasPyproject: pyproject,
-    hasRuff: pyproject, // optimistic; ruff failure is graceful
-    hasPytest: pyproject,
+    hasRuff,
+    hasPytest,
     hasCargo: cargo,
     hasGoMod: goMod,
   };
+}
+
+/**
+ * Map touched SOURCE files to their existing test files so editing code runs
+ * its tests, not just its types. Deterministic lookups only — sibling
+ * `x.test.*` / `x.spec.*`, `__tests__/x.test.*`, and `tests/x*.test.*` beside
+ * or near the source. Only returns files that actually exist; never guesses.
+ */
+export async function findRelatedTestFiles(files: readonly string[], workspace: string): Promise<string[]> {
+  const found = new Set<string>();
+  const exists = async (p: string) =>
+    fs
+      .stat(p)
+      .then((s) => s.isFile())
+      .catch(() => false);
+
+  for (const file of files) {
+    const base = path.basename(file);
+    const m = base.match(/^(.+?)\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py)$/);
+    if (!m) continue;
+    if (/\.(test|spec)\.[^.]+$/.test(base) || /^test_|_test\.py$/.test(base)) continue; // already a test
+    const stem = m[1];
+    const ext = m[2];
+    const dir = path.dirname(file);
+
+    const candidates =
+      ext === "py"
+        ? [
+            path.join(dir, `test_${stem}.py`),
+            path.join(dir, `${stem}_test.py`),
+            path.join(dir, "tests", `test_${stem}.py`),
+            path.join(workspace, "tests", `test_${stem}.py`),
+          ]
+        : [
+            path.join(dir, `${stem}.test.${ext}`),
+            path.join(dir, `${stem}.spec.${ext}`),
+            path.join(dir, "__tests__", `${stem}.test.${ext}`),
+            path.join(dir, "..", "tests", `${stem}.test.${ext}`),
+            path.join(workspace, "tests", `${stem}.test.${ext}`),
+            path.join(workspace, "tests", `${stem}.test.mjs`),
+            path.join(workspace, "test", `${stem}.test.${ext}`),
+          ];
+    for (const candidate of candidates) {
+      if (found.size >= 12) return [...found]; // narrow means narrow
+      if (await exists(candidate)) found.add(path.resolve(candidate));
+    }
+  }
+  return [...found];
 }
 
 export function deriveNarrowVerify(
@@ -325,12 +445,23 @@ export function deriveNarrowVerify(
   const rsFiles = files.filter((f) => f.endsWith(".rs"));
   const goFiles = files.filter((f) => f.endsWith(".go"));
 
-  // TypeScript: prefer project-wide tsc -b if tsconfig exists; otherwise
-  // per-file --noEmit. The project-wide path catches cross-file regressions.
-  if (tsFiles.length > 0 && setup.hasTsconfig && setup.hasPackageJson) {
+  // TypeScript: `tsc -b` ONLY when the project is composite/has references —
+  // otherwise tsc -b errors. For non-composite projects use a project-wide
+  // `tsc --noEmit -p .` (catches cross-file regressions without emitting), and
+  // fall back to per-file --noEmit when there's no tsconfig at all.
+  if (tsFiles.length > 0 && setup.hasTsconfig && setup.hasPackageJson && setup.tsconfigComposite) {
     cmds.push({
       program: setup.hasPnpm ? "pnpm" : "npx",
       args: setup.hasPnpm ? ["exec", "tsc", "-b", "--pretty", "false"] : ["tsc", "-b", "--pretty", "false"],
+      cwd: workspace,
+      label: "typescript",
+    });
+  } else if (tsFiles.length > 0 && setup.hasTsconfig) {
+    cmds.push({
+      program: setup.hasPnpm ? "pnpm" : "npx",
+      args: setup.hasPnpm
+        ? ["exec", "tsc", "--noEmit", "-p", ".", "--pretty", "false"]
+        : ["-y", "tsc", "--noEmit", "-p", ".", "--pretty", "false"],
       cwd: workspace,
       label: "typescript",
     });
@@ -343,14 +474,30 @@ export function deriveNarrowVerify(
     });
   }
 
-  // Node tests: run JUST the touched test files (narrow is the whole point).
-  const nodeTestFiles = [...tsTestFiles, ...jsTestFiles];
-  if (nodeTestFiles.length > 0) {
+  // Tests: use the project's REAL runner. node --test only natively runs plain
+  // JS — pointing it at .ts/.tsx is a guaranteed phantom failure on a Node
+  // without type stripping. So: vitest/jest run any touched test file; bare
+  // node --test runs only JS test files.
+  const allTestFiles = [...tsTestFiles, ...jsTestFiles];
+  const rel = (f: string) => path.relative(workspace, f);
+  if (allTestFiles.length > 0 && (setup.testRunner === "vitest" || setup.testRunner === "jest")) {
+    const runner = setup.testRunner;
+    cmds.push({
+      program: setup.hasPnpm ? "pnpm" : "npx",
+      args: [
+        ...(setup.hasPnpm ? ["exec", runner] : ["-y", runner]),
+        ...(runner === "vitest" ? ["run"] : []),
+        ...allTestFiles.map(rel),
+      ],
+      cwd: workspace,
+      label: `${runner}(${allTestFiles.length})`,
+    });
+  } else if (jsTestFiles.length > 0) {
     cmds.push({
       program: "node",
-      args: ["--test", ...nodeTestFiles.map((f) => path.relative(workspace, f))],
+      args: ["--test", ...jsTestFiles.map(rel)],
       cwd: workspace,
-      label: `tests(${nodeTestFiles.length})`,
+      label: `tests(${jsTestFiles.length})`,
     });
   }
 

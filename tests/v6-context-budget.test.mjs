@@ -107,6 +107,45 @@ test("chat tuning: setReasoningLevel updates the dial live", async () => {
   assert.deepEqual(levels, ["low", "max"]);
 });
 
+test("chat tuning: setProvider updates the live context budget", async () => {
+  const captured = [];
+  const provider = (name) => ({
+    name,
+    async *stream(req) {
+      captured.push({ name, count: req.messages.length, model: req.model });
+      yield {
+        type: "message_done",
+        message: { id: `a_${name}`, role: "assistant", content: [{ type: "text", text: "ok" }], createdAt: new Date().toISOString() },
+        usage: { inputTokens: 1, outputTokens: 1 },
+        stopReason: "end_turn",
+      };
+    },
+  });
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "ares-model-context-"));
+  const session = new Session({
+    workspace,
+    provider: provider("small"),
+    model: "small-model",
+    systemPrompt: "s",
+    tools: [],
+    initialMessages: Array.from({ length: 8 }, (_, i) => textMsg(i % 2 ? "assistant" : "user", 4_000, `switch_${i}`)),
+    contextBudgetTokens: 1_500,
+    compactionThresholdTokens: 1_000_000,
+  });
+
+  for await (const _event of session.send("one")) void _event;
+  await session.setProvider(provider("large"), "large-model", {
+    contextBudgetTokens: 100_000,
+    compactionThresholdTokens: 1_000_000,
+  });
+  for await (const _event of session.send("two")) void _event;
+
+  assert.equal(captured[0].name, "small");
+  assert.equal(captured[1].name, "large");
+  assert.equal(captured[1].model, "large-model");
+  assert.ok(captured[1].count > captured[0].count, "larger model budget should restore more history");
+});
+
 test("chat tuning: context-limit errors retry with a smaller recent-history window", async () => {
   const callMessageCounts = [];
   const provider = {

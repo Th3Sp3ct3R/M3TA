@@ -103,7 +103,7 @@ test("AnthropicProvider: text-only stream → deltas, usage, cache token capture
   assert.deepEqual(done.message.content, [{ type: "text", text: "Hello" }]);
   assert.equal(done.message.id, "msg_1");
   assert.equal(done.stopReason, "end_turn");
-  assert.equal(done.usage.inputTokens, 100);
+  assert.equal(done.usage.inputTokens, 200);
   assert.equal(done.usage.outputTokens, 12);
   assert.equal(done.usage.cacheReadTokens, 80);
   assert.equal(done.usage.cacheWriteTokens, 20);
@@ -215,8 +215,10 @@ test("AnthropicProvider: request shape — cache breakpoints, thinking budget, h
   assert.deepEqual(req.thinking, { type: "enabled", budget_tokens: 8192 });
   assert.equal(req.max_tokens, 8192 + 2048);
 
+  // The last block of the most recent message carries the rolling conversation
+  // cache breakpoint (S3) so a long session reuses its history prefix.
   assert.deepEqual(req.messages, [
-    { role: "user", content: [{ type: "text", text: "go" }] },
+    { role: "user", content: [{ type: "text", text: "go", cache_control: { type: "ephemeral" } }] },
   ]);
 
   // Without reasoningLevel: no thinking param, default 8192 max_tokens.
@@ -236,6 +238,41 @@ test("AnthropicProvider: request shape — cache breakpoints, thinking budget, h
   }
   assert.equal(Object.hasOwn(captured2.body, "thinking"), false);
   assert.equal(captured2.body.max_tokens, 8192);
+});
+
+test("AnthropicProvider: OAuth uses the Claude Code request contract", async () => {
+  const previous = process.env.ARES_ANTHROPIC_OAUTH_TOKEN;
+  process.env.ARES_ANTHROPIC_OAUTH_TOKEN = "oauth-token";
+  const captured = {};
+  const body = [
+    sse("message_start", { message: { id: "msg_oauth", usage: { input_tokens: 1, output_tokens: 0 } } }),
+    sse("message_stop", {}),
+  ].join("");
+  try {
+    const provider = new AnthropicProvider({
+      fetchImpl: captureFetch(body, captured),
+      endpointUrl: "http://x",
+    });
+    for await (const _ of provider.stream({
+      model: "claude-sonnet-4-6",
+      system: "Ares system",
+      messages: [userMessage("go")],
+      tools: [],
+    })) {
+      // drain
+    }
+
+    assert.equal(captured.headers.Authorization, "Bearer oauth-token");
+    assert.equal(captured.headers["x-app"], "cli");
+    assert.match(captured.headers["User-Agent"], /^claude-cli\//);
+    assert.match(captured.headers["anthropic-beta"], /claude-code-20250219/);
+    assert.match(captured.headers["anthropic-beta"], /oauth-2025-04-20/);
+    assert.equal(captured.body.system[0].text, "You are Claude Code, Anthropic's official CLI for Claude.");
+    assert.equal(captured.body.system[1].text, "Ares system");
+  } finally {
+    if (previous === undefined) delete process.env.ARES_ANTHROPIC_OAUTH_TOKEN;
+    else process.env.ARES_ANTHROPIC_OAUTH_TOKEN = previous;
+  }
 });
 
 test("AnthropicProvider: 429 → single error event, retriable", async () => {
@@ -341,8 +378,10 @@ test("AnthropicProvider: abort mid-stream stops cleanly (no message_done, no err
 test("AnthropicProvider: missing API key → no_auth error", async () => {
   const prevAres = process.env.ARES_ANTHROPIC_API_KEY;
   const prevPlain = process.env.ANTHROPIC_API_KEY;
+  const prevDisableOauth = process.env.ARES_DISABLE_ANTHROPIC_OAUTH;
   delete process.env.ARES_ANTHROPIC_API_KEY;
   delete process.env.ANTHROPIC_API_KEY;
+  process.env.ARES_DISABLE_ANTHROPIC_OAUTH = "1";
   try {
     const provider = new AnthropicProvider({ fetchImpl: async () => new Response("never") });
     const events = [];
@@ -361,6 +400,8 @@ test("AnthropicProvider: missing API key → no_auth error", async () => {
   } finally {
     if (prevAres !== undefined) process.env.ARES_ANTHROPIC_API_KEY = prevAres;
     if (prevPlain !== undefined) process.env.ANTHROPIC_API_KEY = prevPlain;
+    if (prevDisableOauth === undefined) delete process.env.ARES_DISABLE_ANTHROPIC_OAUTH;
+    else process.env.ARES_DISABLE_ANTHROPIC_OAUTH = prevDisableOauth;
   }
 });
 

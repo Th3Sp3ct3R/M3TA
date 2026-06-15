@@ -85,6 +85,8 @@ export interface Usage {
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
   reasoningTokens?: number;
+  /** Number of provider requests represented by this usage aggregate. */
+  modelCalls?: number;
 }
 
 export interface StreamError {
@@ -139,6 +141,22 @@ export type TurnEvent =
         | "recall"
         | "self-revise";
     }
+  | {
+      type: "compaction";
+      summarizedMessages: number;
+      tokensBefore: number;
+      tokensAfter: number;
+      method: "summary" | "ledger";
+      /** Exact post-compaction history so restart/resume preserves the same memory. */
+      messages?: Message[];
+    }
+  | {
+      type: "auxiliary_usage";
+      kind: "compaction" | "witness" | "memory" | "other";
+      provider: string;
+      model: string;
+      usage: Usage;
+    }
   | { type: "self_revise"; attempt: number; reason: string }
   | { type: "heartbeat_tick"; reason: string; surfaced?: string }
   | { type: "dream_phase_started"; phase: "light" | "deep" | "rem" }
@@ -151,7 +169,15 @@ export type TurnEvent =
   | { type: "workspace_diff"; checkpointId: string; toolUseId?: string; files: string[]; diff: string; truncated: boolean }
   | { type: "subagent_start"; id: string; name: string; description: string }
   | { type: "subagent_end"; id: string; status: "completed" | "failed" | "cancelled"; summary: string }
-  | { type: "turn_end"; status: TurnEndStatus; usage: Usage; durationMs: number };
+  | {
+      type: "turn_end";
+      status: TurnEndStatus;
+      usage: Usage;
+      durationMs: number;
+      /** Added by Session persistence for accurate historical attribution. */
+      provider?: string;
+      model?: string;
+    };
 
 export type TurnEndStatus = "completed" | "interrupted" | "failed";
 

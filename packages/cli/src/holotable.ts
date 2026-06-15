@@ -177,31 +177,80 @@ const MODEL_URL = ${modelUrl};
 
 // ── stage ─────────────────────────────────────────────────────────────────
 const canvas = document.getElementById("scene");
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.25;
 const scene = new THREE.Scene();
-scene.background = new THREE.Color("#0c0a0b");
-scene.fog = new THREE.FogExp2("#0c0a0b", 0.03);
+scene.background = new THREE.Color("#080708");
+scene.fog = new THREE.FogExp2("#080708", 0.028);
 const camera = new THREE.PerspectiveCamera(46, 1, 0.1, 300);
 camera.position.set(6.5, 4.2, 8.5);
 const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
 controls.target.set(0, 2.0, 0);
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.45;
 
-const grid = new THREE.GridHelper(40, 40, ACCENT.clone().multiplyScalar(0.5), ACCENT.clone().multiplyScalar(0.16));
+// ── the projection dais: glowing disc + concentric scan rings ──────────────
+const dais = new THREE.Group();
+scene.add(dais);
+const discMat = new THREE.MeshBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.05, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+const disc = new THREE.Mesh(new THREE.CircleGeometry(7.5, 64), discMat);
+disc.rotation.x = -Math.PI / 2;
+disc.position.y = -0.02;
+dais.add(disc);
+const ringMats = [];
+for (let r = 0; r < 4; r++) {
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(1.6 + r * 1.7, 1.66 + r * 1.7, 96),
+    new THREE.MeshBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.22 - r * 0.035, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }),
+  );
+  ring.rotation.x = -Math.PI / 2;
+  dais.add(ring);
+  ringMats.push(ring);
+}
+// faint radial-fade floor grid
+const grid = new THREE.GridHelper(50, 50, ACCENT.clone().multiplyScalar(0.6), ACCENT.clone().multiplyScalar(0.14));
 grid.material.transparent = true;
-grid.material.opacity = 0.22;
+grid.material.opacity = 0.16;
 scene.add(grid);
-scene.add(new THREE.AmbientLight(ACCENT, 0.35));
-const key = new THREE.PointLight(ACCENT, 60, 80);
+
+scene.add(new THREE.AmbientLight(ACCENT, 0.4));
+const key = new THREE.PointLight(ACCENT, 70, 90);
 key.position.set(6, 9, 6);
 scene.add(key);
+const underGlow = new THREE.PointLight(new THREE.Color("#e3b86a"), 24, 30);
+underGlow.position.set(0, 0.4, 0);
+scene.add(underGlow);
 
-// ── hologram materials ────────────────────────────────────────────────────
+// ── ambient mote field ─────────────────────────────────────────────────────
+const moteGeo = new THREE.BufferGeometry();
+const MOTES = 260;
+const motePos = new Float32Array(MOTES * 3);
+for (let i = 0; i < MOTES; i++) {
+  motePos[i * 3] = (Math.random() - 0.5) * 22;
+  motePos[i * 3 + 1] = Math.random() * 11;
+  motePos[i * 3 + 2] = (Math.random() - 0.5) * 22;
+}
+moteGeo.setAttribute("position", new THREE.BufferAttribute(motePos, 3));
+const motes = new THREE.Points(moteGeo, new THREE.PointsMaterial({ color: ACCENT, size: 0.045, transparent: true, opacity: 0.55, blending: THREE.AdditiveBlending, depthWrite: false }));
+scene.add(motes);
+
+// ── the build scan-plane: a bronze sheet that sweeps up through the model ──
+const scanPlane = new THREE.Mesh(
+  new THREE.PlaneGeometry(9, 9),
+  new THREE.MeshBasicMaterial({ color: new THREE.Color("#e3b86a"), transparent: true, opacity: 0.14, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }),
+);
+scanPlane.rotation.x = -Math.PI / 2;
+scene.add(scanPlane);
+
+// ── hologram materials — wire shell + translucent surface + additive glow ──
 function holoMaterials() {
-  const wire = new THREE.MeshBasicMaterial({ color: ACCENT, wireframe: true, transparent: true, opacity: 0.85 });
-  const glow = new THREE.MeshBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.07, blending: THREE.AdditiveBlending, depthWrite: false });
-  return { wire, glow };
+  const wire = new THREE.MeshBasicMaterial({ color: ACCENT, wireframe: true, transparent: true, opacity: 0.9 });
+  const surface = new THREE.MeshPhongMaterial({ color: ACCENT, emissive: ACCENT.clone().multiplyScalar(0.25), transparent: true, opacity: 0.12, shininess: 80, depthWrite: false, blending: THREE.AdditiveBlending });
+  const glow = new THREE.MeshBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.06, blending: THREE.AdditiveBlending, depthWrite: false });
+  return { wire, surface, glow };
 }
 
 function buildGeometry(part) {
@@ -226,13 +275,15 @@ const byId = new Map();
 
 function addSpecPart(p) {
   const geometry = buildGeometry(p);
-  const { wire, glow } = holoMaterials();
+  const { wire, surface, glow } = holoMaterials();
   const group = new THREE.Group();
   group.name = p.name;
   const glowMesh = new THREE.Mesh(geometry, glow);
   glowMesh.scale.setScalar(0.985);
+  const surfaceMesh = new THREE.Mesh(geometry, surface);
+  surfaceMesh.scale.setScalar(0.992);
   const shell = new THREE.Mesh(geometry, wire);
-  group.add(glowMesh, shell);
+  group.add(glowMesh, surfaceMesh, shell);
   const base = new THREE.Vector3(p.position[0], p.position[1], p.position[2]);
   group.position.copy(base);
   if (p.rotation) group.rotation.set(p.rotation[0], p.rotation[1], p.rotation[2]);
@@ -442,6 +493,20 @@ renderer.setAnimationLoop(() => {
   if (wiring.visible) for (const m of wiring.children) m.material.opacity = 0.85 * Math.max(0, 1 - t * 2.2);
   rig.rotation.y += dt * 0.1 * (mode === "assembly" ? 0 : 1 - t * 0.6);
   wiring.rotation.y = rig.rotation.y;
+
+  // dais scan rings breathe; the build scan-plane sweeps up through the model
+  dais.rotation.y -= dt * 0.08;
+  for (let r = 0; r < ringMats.length; r++) {
+    ringMats[r].material.opacity = (0.22 - r * 0.035) * (0.6 + 0.4 * Math.sin(time * 1.4 - r * 0.8));
+  }
+  scanPlane.position.y = ((time * 0.7) % 5);
+  scanPlane.material.opacity = 0.16 * (0.4 + 0.6 * Math.abs(Math.sin(time * 0.7 * Math.PI)));
+  underGlow.intensity = 20 + 8 * Math.sin(time * 1.6);
+  // motes drift slowly upward, wrapping
+  const mp = moteGeo.attributes.position.array;
+  for (let i = 1; i < mp.length; i += 3) { mp[i] += dt * 0.18; if (mp[i] > 11) mp[i] = 0; }
+  moteGeo.attributes.position.needsUpdate = true;
+  motes.rotation.y += dt * 0.01;
 
   raycaster.setFromCamera(pointer, camera);
   const hits = raycaster.intersectObjects([rig, wiring], true);

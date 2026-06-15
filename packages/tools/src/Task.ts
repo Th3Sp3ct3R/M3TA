@@ -21,6 +21,9 @@ export interface SubagentRunner {
     parentSessionId?: string;
     workspace: string;
     signal?: AbortSignal;
+    /** Forward child activity (tool_start/tool_end) so the UI isn't a silent
+     *  "Delegating…" for up to 40 inner turns. */
+    onProgress?: (data: unknown) => void;
   }): Promise<{
     id: string;
     type: string;
@@ -74,7 +77,11 @@ export function makeTaskTool(runner: SubagentRunner) {
     // Child tool calls still enforce their own permissions through the
     // scoped QueryEngine, including plan-mode write blocking.
     safety: "read-only",
-    concurrency: "exclusive",
+    // Parallel-safe so adjacent Task calls batch and fan out concurrently
+    // (subagents are isolated engines; researcher/code-reviewer are read-only).
+    // The engine now solos any tool that declares "exclusive", so this is the
+    // explicit opt-in to concurrent fan-out.
+    concurrency: "parallel-safe",
     inputZod: inputSchema,
     activityDescription: (i) => `Task[${i.subagent_type}] ${i.description}`,
     async checkPermissions(i, ctx) {
@@ -102,6 +109,7 @@ export function makeTaskTool(runner: SubagentRunner) {
         prompt: i.prompt,
         workspace: ctx.workspace,
         signal: ctx.signal,
+        onProgress: ctx.emitProgress,
       });
       return {
         output: {

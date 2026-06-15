@@ -6,7 +6,7 @@
 import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { buildTool, resolveWorkspacePath, zPath } from "./_shared.js";
+import { buildTool, contentHash, resolveWorkspacePath, zPath } from "./_shared.js";
 import { safeOverwrite } from "./safeWrite.js";
 
 const inputSchema = z
@@ -65,7 +65,7 @@ export const WriteTool = buildTool({
       allowFullReplace: i.allow_full_replace,
     });
     const stat = await fs.stat(filePath);
-    ctx.fileReadStamps.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size });
+    ctx.fileReadStamps.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, hash: contentHash(i.content) });
     return {
       output: { path: filePath, created: written.created, bytesWritten: written.bytesWritten, backupPath: written.backupPath },
       touchedFiles: [filePath],

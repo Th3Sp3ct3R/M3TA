@@ -165,10 +165,16 @@ Pair CodebaseSearch with Task(researcher) when the investigation needs many foll
         if (!CODE_EXTENSIONS.has(ext)) return;
         const stat = await fs.stat(file).catch(() => null);
         if (!stat || stat.size > MAX_FILE_BYTES) return;
+        filesScanned++;
+        const cached = chunkCache.get(file);
+        // Skip the read entirely when mtime+size are unchanged.
+        if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+          for (const c of cached.chunks) allChunks.push(c);
+          return;
+        }
         const content = await fs.readFile(file, "utf8").catch(() => "");
         if (!content) return;
-        filesScanned++;
-        chunkify(file, content, allChunks);
+        for (const c of chunksForFile(file, content, stat.mtimeMs, stat.size)) allChunks.push(c);
       });
     }
 
@@ -212,6 +218,20 @@ interface Chunk {
   endLine: number;
   text: string;
   tokens: Map<string, number>;
+}
+
+// Per-process chunk cache keyed by path → (mtime,size). A query previously
+// re-read+re-chunked the WHOLE workspace every time; now only files that
+// changed since last seen are re-chunked.
+const chunkCache = new Map<string, { mtimeMs: number; size: number; chunks: Chunk[] }>();
+
+function chunksForFile(filePath: string, content: string, mtimeMs: number, size: number): Chunk[] {
+  const cached = chunkCache.get(filePath);
+  if (cached && cached.mtimeMs === mtimeMs && cached.size === size) return cached.chunks;
+  const chunks: Chunk[] = [];
+  chunkify(filePath, content, chunks);
+  chunkCache.set(filePath, { mtimeMs, size, chunks });
+  return chunks;
 }
 
 function chunkify(filePath: string, content: string, out: Chunk[]): void {

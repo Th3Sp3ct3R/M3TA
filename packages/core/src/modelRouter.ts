@@ -306,9 +306,11 @@ export function laneForTask(kind: ModelTaskKind): RouteLane {
  */
 export function classifyLane(goal: string): RouteLane {
   const g = ` ${goal.toLowerCase()} `;
-  const coding = /\b(code|coding|bug|debug|fix|refactor|function|class|method|implement|compile|build|stack ?trace|exception|typescript|javascript|python|rust|golang|api|endpoint|test|unit test|repo|git|commit|merge|lint|regex|sql|css|html|component|module|import|syntax)\b/;
+  const coding = /\b(code|coding|bug|debug|fix|refactor|function|class|method|implement|compile|build|stack ?trace|exception|typescript|javascript|python|rust|golang|api|endpoint|test|unit test|repo|git|commit|merge|lint|regex|sql|css|html|component|module|import|syntax|installer|workspace|sandbox|website|webapp|dashboard|frontend|backend|three\.?js|3d world)\b/;
+  const artifactRequest = /\b(make|create|build|develop|implement|generate|write|update|change|rebuild|upgrade|improve)\b[\s\S]{0,120}\b(app|application|site|website|page|game|sandbox|project|file|script|component|ui|interface|dashboard|installer|plugin|extension|3d|world)\b/;
+  const filesystemTarget = /(?:^|\s)[a-z]:\\[^\s]+|(?:^|\s)(?:\.{0,2}\/)?[\w.-]+\/[\w./-]+/i;
   const research = /\b(research|plan|planning|analyz|investigat|compare|comparison|evaluate|assess|design|architect|strateg|explain|why|how does|trade-?off|pros and cons|summar|review|deep dive|explore|options)\b/;
-  if (coding.test(g)) return "coding";
+  if (coding.test(g) || artifactRequest.test(g) || filesystemTarget.test(g)) return "coding";
   if (research.test(g)) return "research";
   return "chat";
 }

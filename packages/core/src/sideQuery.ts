@@ -8,7 +8,7 @@
 // per-call volatile parts (user text, schema hint) ride the user turn,
 // so the prefix stays byte-stable.
 
-import type { Message, ReasoningLevel } from "@ares/protocol";
+import type { Message, ReasoningLevel, Usage } from "@ares/protocol";
 import type { Provider } from "./queryEngine.js";
 
 export interface SideQueryOptions {
@@ -20,6 +20,8 @@ export interface SideQueryOptions {
   /** Output ceiling for the reply. Default 1024 — judgments are short. */
   maxOutputTokens?: number;
   reasoningLevel?: ReasoningLevel;
+  /** Receives provider-reported usage for this auxiliary call. */
+  onUsage?: (usage: Usage) => void | Promise<void>;
 }
 
 export interface SideQueryJsonOptions extends SideQueryOptions {
@@ -54,6 +56,8 @@ export async function sideQuery(opts: SideQueryOptions): Promise<string> {
       parts.push(ev.text);
     } else if (ev.type === "error") {
       throw new Error(`sideQuery(${opts.provider.name}): ${ev.error.message}`);
+    } else if (ev.type === "message_done") {
+      await opts.onUsage?.({ ...ev.usage, modelCalls: ev.usage.modelCalls ?? 1 });
     }
   }
   return parts.join("");

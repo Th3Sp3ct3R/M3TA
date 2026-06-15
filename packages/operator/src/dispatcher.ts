@@ -13,7 +13,7 @@
 
 import { randomUUID } from "node:crypto";
 import { QueryEngine, type EngineTool, type Provider } from "@ares/core";
-import type { DispatchContext, Dispatcher, Goal, StepVerdict } from "./types.js";
+import type { DispatchContext, Dispatcher, Goal, StepVerdict, VerificationSpec } from "./types.js";
 
 export interface QueryEngineDispatcherOptions {
   provider: Provider;
@@ -59,11 +59,43 @@ Do the single most useful next concrete step toward the goal — no more. Then s
 
 function buildStepPrompt(goal: Goal): string {
   const moved = goal.stepLog.filter((s) => s.moved).length;
-  return [
-    `Goal: ${goal.statement}`,
-    `Steps that have moved the gap so far: ${moved}.`,
-    `Take the single next concrete step toward this goal, then report what you did and whether the goal is now fully met.`,
-  ].join("\n");
+  const lines = [`Goal: ${goal.statement}`, `Steps so far: ${goal.stepLog.length} (${moved} moved the gap).`];
+
+  // Hand the worker the actual step history — without this, day 3's worker has
+  // no idea what days 1-2 did beyond a number, and repeats or contradicts them.
+  const recent = goal.stepLog.slice(-6);
+  if (recent.length) {
+    lines.push("", "What prior steps did (most recent last):");
+    for (const s of recent) {
+      const tag = s.goalMet ? "✓done" : s.moved ? "→moved" : "·no-op";
+      lines.push(`- [${tag}] ${s.evidence?.replace(/\s+/g, " ").slice(0, 200) ?? "(no evidence recorded)"}`);
+    }
+  }
+
+  // Give the worker the acceptance criteria so "done" means reality, not say-so.
+  if (goal.verification) lines.push("", `Success is measured by: ${describeVerification(goal.verification)}`);
+  if (goal.noProgressStreak > 0) {
+    lines.push("", `Note: ${goal.noProgressStreak} recent step(s) made NO progress — try a different approach than before.`);
+  }
+
+  lines.push(
+    "",
+    "Take the single next concrete step toward this goal, then report what you did and whether the goal is now fully met.",
+  );
+  return lines.join("\n");
+}
+
+function describeVerification(v: VerificationSpec): string {
+  switch (v.kind) {
+    case "always":
+      return v.summary ?? (v.met ? "marked met" : "manual judgement");
+    case "file":
+      return `file ${v.path}${v.contains ? ` contains "${v.contains}"` : " exists"}`;
+    case "command":
+      return `command \`${[v.cmd, ...(v.args ?? [])].join(" ")}\`${v.contains ? ` outputs "${v.contains}"` : ` exits ${v.expectExit ?? 0}`}`;
+    case "http":
+      return `GET ${v.url} returns ${v.expectStatus ?? 200}${v.contains ? ` containing "${v.contains}"` : ""}`;
+  }
 }
 
 /**

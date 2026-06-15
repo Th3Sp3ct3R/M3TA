@@ -416,3 +416,43 @@ test("PowerShell: runs Write-Output", async () => {
   assert.equal(r.output.exitCode, 0);
   assert.match(r.output.stdout, /ok/);
 });
+
+test("shell permissions: destructive commands require explicit approval", async () => {
+  const tmp = await makeTmp();
+  const c = ctx(tmp);
+  const bashDecision = await BashTool.checkPermissions(
+    { command: "rm -rf build", description: "remove build", timeout: 30000, run_in_background: false },
+    c,
+  );
+  const powershellDecision = await PowerShellTool.checkPermissions(
+    { command: "Remove-Item -Recurse -Force build", description: "remove build", timeout: 30000, run_in_background: false },
+    c,
+  );
+  const safeDecision = await PowerShellTool.checkPermissions(
+    { command: "Get-ChildItem", description: "list files", timeout: 30000, run_in_background: false },
+    c,
+  );
+
+  assert.equal(bashDecision.kind, "ask");
+  assert.equal(powershellDecision.kind, "ask");
+  assert.equal(safeDecision.kind, "allow");
+});
+
+test("lenient tool input: an extra model-invented key is stripped, not a hard failure", async () => {
+  const tmp = await makeTmp();
+  await fs.writeFile(path.join(tmp, "a.txt"), "hello\nworld\n", "utf8");
+  const adapted = adaptToolForEngine(ReadTool, () => ctx(tmp));
+  // A model adds `max_results` (not in Read's strict schema). Pre-fix this threw
+  // a Zod unrecognized_keys error and the whole call failed.
+  const r = await adapted.call({ file_path: path.join(tmp, "a.txt"), max_results: 5 }, ctx(tmp));
+  assert.match(r.output.content, /hello/);
+});
+
+test("lenient tool input: a genuine validation error still throws a readable message", async () => {
+  const tmp = await makeTmp();
+  const adapted = adaptToolForEngine(ReadTool, () => ctx(tmp));
+  await assert.rejects(
+    () => adapted.call({ offset: 3 }, ctx(tmp)), // missing required file_path
+    /Read: invalid arguments/,
+  );
+});

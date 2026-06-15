@@ -8,7 +8,7 @@
 import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { buildTool, resolveWorkspacePath, zPath } from "./_shared.js";
+import { buildTool, contentHash, resolveWorkspacePath, zPath } from "./_shared.js";
 import { safeOverwrite } from "./safeWrite.js";
 
 const inputSchema = z
@@ -64,12 +64,20 @@ export const ApplyIntentTool = buildTool({
     const stamp = ctx.fileReadStamps.get(filePath);
     if (!stamp) throw new Error(`${filePath}: missing read stamp`);
 
-    const stat = await fs.stat(filePath);
-    if (stat.mtimeMs > stamp.mtimeMs + 5) {
-      throw new Error(`${filePath} was modified on disk since the last Read. Re-Read and retry.`);
-    }
-
     const original = await fs.readFile(filePath, "utf8");
+    // Staleness check mirrors Edit.ts: the content hash is exact and immune to
+    // Windows mtime-granularity races. Fall back to mtime only for stamps
+    // written before the hash existed (resumed sessions / older rollouts).
+    if (stamp.hash !== undefined) {
+      if (contentHash(original) !== stamp.hash) {
+        throw new Error(`${filePath} was modified on disk since the last Read. Re-Read and retry.`);
+      }
+    } else {
+      const stat = await fs.stat(filePath);
+      if (stat.mtimeMs > stamp.mtimeMs + 5) {
+        throw new Error(`${filePath} was modified on disk since the last Read. Re-Read and retry.`);
+      }
+    }
     const sketch = stripCodeFence(i.sketch);
     let finalContent: string;
     let engine: ApplyIntentOutput["engine"];
@@ -104,7 +112,11 @@ export const ApplyIntentTool = buildTool({
       allowFullReplace: i.allow_full_replace,
     });
     const newStat = await fs.stat(filePath);
-    ctx.fileReadStamps.set(filePath, { mtimeMs: newStat.mtimeMs, size: newStat.size });
+    ctx.fileReadStamps.set(filePath, {
+      mtimeMs: newStat.mtimeMs,
+      size: newStat.size,
+      hash: contentHash(finalContent),
+    });
 
     return {
       output: { path: filePath, bytesWritten: written.bytesWritten, engine, backupPath: written.backupPath },

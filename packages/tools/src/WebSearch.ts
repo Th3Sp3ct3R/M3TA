@@ -31,7 +31,86 @@ const inputSchema = z
   })
   .strict();
 
-export function makeWebSearchTool(backend: SearchBackend = duckDuckGoLite()) {
+/**
+ * The default search chain, strongest first: Brave and Tavily are real search
+ * APIs (deep, fresh, contractual) and are tried when their keys are present;
+ * the DuckDuckGo HTML scrape is the keyless LAST resort. Whichever backend
+ * fails or returns nothing falls through to the next, so a broken scrape or a
+ * rate-limited API never fails the tool call outright.
+ */
+export function defaultSearchChain(): SearchBackend {
+  const backends: SearchBackend[] = [];
+  if (process.env.ARES_BRAVE_API_KEY || process.env.BRAVE_API_KEY) backends.push(braveSearch());
+  if (process.env.ARES_TAVILY_API_KEY || process.env.TAVILY_API_KEY) backends.push(tavilySearch());
+  backends.push(duckDuckGoLite());
+  return backends.length === 1 ? backends[0] : withFallback(backends);
+}
+
+export function withFallback(backends: SearchBackend[]): SearchBackend {
+  return {
+    name: backends.map((b) => b.name).join("→"),
+    async search(query, signal) {
+      let lastError: unknown = null;
+      for (const backend of backends) {
+        try {
+          const results = await backend.search(query, signal);
+          if (results.length > 0) return results;
+        } catch (err) {
+          lastError = err;
+          if (signal.aborted) throw err;
+        }
+      }
+      if (lastError) throw lastError instanceof Error ? lastError : new Error(String(lastError));
+      return [];
+    },
+  };
+}
+
+/** Brave Search API — needs ARES_BRAVE_API_KEY (or BRAVE_API_KEY). */
+export function braveSearch(): SearchBackend {
+  return {
+    name: "Brave",
+    async search(query: string, signal: AbortSignal): Promise<WebSearchResult[]> {
+      const key = process.env.ARES_BRAVE_API_KEY || process.env.BRAVE_API_KEY || "";
+      if (!key) throw new Error("Brave search: no API key");
+      const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=20`;
+      const res = await fetch(url, {
+        signal,
+        headers: { accept: "application/json", "x-subscription-token": key },
+      });
+      if (!res.ok) throw new Error(`Brave search returned ${res.status}`);
+      const body = (await res.json()) as { web?: { results?: Array<{ title?: string; url?: string; description?: string }> } };
+      return (body.web?.results ?? [])
+        .filter((r): r is { title: string; url: string; description?: string } => Boolean(r.title && r.url))
+        .map((r) => ({ title: htmlToText(r.title).trim(), url: r.url, snippet: htmlToText(r.description ?? "").trim() }));
+    },
+  };
+}
+
+/** Tavily Search API — needs ARES_TAVILY_API_KEY (or TAVILY_API_KEY). A search
+ *  API built for agents: clean JSON, freshness, and answer-grade snippets. */
+export function tavilySearch(): SearchBackend {
+  return {
+    name: "Tavily",
+    async search(query: string, signal: AbortSignal): Promise<WebSearchResult[]> {
+      const key = process.env.ARES_TAVILY_API_KEY || process.env.TAVILY_API_KEY || "";
+      if (!key) throw new Error("Tavily search: no API key");
+      const res = await fetch("https://api.tavily.com/search", {
+        method: "POST",
+        signal,
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ api_key: key, query, max_results: 10, search_depth: "basic" }),
+      });
+      if (!res.ok) throw new Error(`Tavily search returned ${res.status}`);
+      const body = (await res.json()) as { results?: Array<{ title?: string; url?: string; content?: string }> };
+      return (body.results ?? [])
+        .filter((r): r is { title: string; url: string; content?: string } => Boolean(r.title && r.url))
+        .map((r) => ({ title: htmlToText(r.title).trim(), url: r.url, snippet: htmlToText(r.content ?? "").trim() }));
+    },
+  };
+}
+
+export function makeWebSearchTool(backend: SearchBackend = defaultSearchChain()) {
   return buildTool({
     name: "WebSearch",
     description: `Search the web for current information beyond your knowledge cutoff. Returns titles + URLs + snippets. Pair with WebFetch to read the full page for promising results. Use for: docs that may have changed, library versions, framework APIs, real-world examples. Default backend: ${backend.name}.`,

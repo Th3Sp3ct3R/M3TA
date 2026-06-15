@@ -4,6 +4,7 @@
 import { z } from "zod";
 import { promises as fs } from "node:fs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildTool, resolveWorkspacePath, zPath } from "./_shared.js";
@@ -183,7 +184,10 @@ class TsLanguageServerClient {
   private nextId = 1;
   private buffer = "";
   private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (err: Error) => void }>();
-  private readonly openFiles = new Set<string>();
+  // Per-file LSP document version + last-sent content hash. Without didChange
+  // the server keeps the version-1 buffer forever, so every navigation after an
+  // edit runs on stale text (wrong lines, missing symbols).
+  private readonly openDocs = new Map<string, { version: number; hash: string }>();
 
   private constructor(private readonly child: ChildProcessWithoutNullStreams, private readonly root: string) {
     child.stdout.setEncoding("utf8");
@@ -221,16 +225,25 @@ class TsLanguageServerClient {
     }
   }
 
+  /** Open the document, or push a full-sync didChange if its content changed
+   *  since we last sent it (so navigation never runs on a stale buffer). */
   async didOpen(filePath: string, text: string): Promise<void> {
-    if (this.openFiles.has(filePath)) return;
-    this.openFiles.add(filePath);
-    this.notify("textDocument/didOpen", {
-      textDocument: {
-        uri: pathToFileURL(filePath).href,
-        languageId: languageId(filePath),
-        version: 1,
-        text,
-      },
+    const hash = createHash("sha256").update(text, "utf8").digest("hex");
+    const existing = this.openDocs.get(filePath);
+    const uri = pathToFileURL(filePath).href;
+    if (!existing) {
+      this.openDocs.set(filePath, { version: 1, hash });
+      this.notify("textDocument/didOpen", {
+        textDocument: { uri, languageId: languageId(filePath), version: 1, text },
+      });
+      return;
+    }
+    if (existing.hash === hash) return; // unchanged — nothing to sync
+    const version = existing.version + 1;
+    this.openDocs.set(filePath, { version, hash });
+    this.notify("textDocument/didChange", {
+      textDocument: { uri, version },
+      contentChanges: [{ text }], // full-document sync
     });
   }
 

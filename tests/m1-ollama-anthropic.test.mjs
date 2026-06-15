@@ -58,17 +58,55 @@ test("auto-enables Anthropic compat when ANTHROPIC_BASE_URL is set", () => {
   }
 });
 
-test("does NOT auto-enable when no Anthropic env vars are set", () => {
-  const prev = { base: process.env.ANTHROPIC_BASE_URL, tok: process.env.ANTHROPIC_AUTH_TOKEN };
+test("compat is the DEFAULT (live tool-input deltas); ARES_OLLAMA_ANTHROPIC_COMPAT=0 opts out", () => {
+  const prev = {
+    base: process.env.ANTHROPIC_BASE_URL,
+    tok: process.env.ANTHROPIC_AUTH_TOKEN,
+    compat: process.env.ARES_OLLAMA_ANTHROPIC_COMPAT,
+  };
   delete process.env.ANTHROPIC_BASE_URL;
   delete process.env.ANTHROPIC_AUTH_TOKEN;
+  delete process.env.ARES_OLLAMA_ANTHROPIC_COMPAT;
   try {
-    const pool = new OllamaCloudPool({ slots });
-    assert.equal(pool.useAnthropicCompat, false);
+    // Default ON — /v1/messages streams tool-input deltas; old Ollama builds
+    // fall back to /api/chat automatically on the first 404/405.
+    assert.equal(new OllamaCloudPool({ slots }).useAnthropicCompat, true);
+    // Explicit opt-out still honored.
+    process.env.ARES_OLLAMA_ANTHROPIC_COMPAT = "0";
+    assert.equal(new OllamaCloudPool({ slots }).useAnthropicCompat, false);
   } finally {
     if (prev.base) process.env.ANTHROPIC_BASE_URL = prev.base;
     if (prev.tok) process.env.ANTHROPIC_AUTH_TOKEN = prev.tok;
+    if (prev.compat !== undefined) process.env.ARES_OLLAMA_ANTHROPIC_COMPAT = prev.compat;
+    else delete process.env.ARES_OLLAMA_ANTHROPIC_COMPAT;
   }
+});
+
+test("compat falls back to /api/chat on 404 and remembers", async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    if (String(url).includes("/v1/messages")) {
+      return new Response("not found", { status: 404 });
+    }
+    // Minimal /api/chat NDJSON reply.
+    const body = [
+      JSON.stringify({ message: { content: "ok" }, done: false }),
+      JSON.stringify({ done: true, done_reason: "stop", prompt_eval_count: 1, eval_count: 1 }),
+    ].join("\n") + "\n";
+    return new Response(body, { status: 200 });
+  };
+  const pool = new OllamaCloudPool({ slots, fetchImpl, useAnthropicCompat: true });
+  const events = [];
+  for await (const ev of pool.stream("reasoner", baseReq)) events.push(ev);
+  assert.ok(calls.some((u) => u.includes("/v1/messages")), "tried compat first");
+  assert.ok(calls.some((u) => u.includes("/api/chat")), "fell back to /api/chat");
+  assert.ok(events.some((e) => e.type === "message_done"), "fallback stream completed");
+
+  // Second call goes straight to /api/chat — the 404 was remembered.
+  calls.length = 0;
+  for await (const _ of pool.stream("reasoner", baseReq)) void _;
+  assert.ok(!calls.some((u) => u.includes("/v1/messages")), "no second compat attempt");
 });
 
 // ─── /v1/messages streaming ────────────────────────────────────────────

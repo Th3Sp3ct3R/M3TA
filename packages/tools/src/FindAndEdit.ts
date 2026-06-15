@@ -7,7 +7,7 @@
 import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { buildTool, assertInsideWorkspace, workspaceRoot } from "./_shared.js";
+import { buildTool, assertInsideWorkspace, contentHash, workspaceRoot } from "./_shared.js";
 
 const inputSchema = z
   .object({
@@ -114,6 +114,12 @@ export const FindAndEditTool = buildTool({
       if (!i.dry_run) {
         await fs.writeFile(file, updated, "utf8");
         touched.push(file);
+        // Refresh the read stamp so a follow-up Edit on this file doesn't fail
+        // the staleness check (mixed FindAndEdit+Edit refactors otherwise thrash).
+        const stat = await fs.stat(file).catch(() => null);
+        if (stat) {
+          ctx.fileReadStamps.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, hash: contentHash(updated) });
+        }
       }
     }
 

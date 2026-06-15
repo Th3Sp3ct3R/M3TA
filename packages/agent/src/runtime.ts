@@ -4,6 +4,7 @@ import { ensureAgentScaffold, bootstrapReminder } from "./bootstrap/bootstrap.js
 import { loadAgentConfig, type AresAgentConfig } from "./config.js";
 import { composeAgentSystemPrompt, loadAgentSystemContext, type AgentSystemContext } from "./identity/context.js";
 import { runLightDream } from "./dreaming.js";
+import { MemoryStore as LivingMemoryStore, mindPaths } from "@ares/mind";
 import { startHeartbeatLoop } from "./heartbeat.js";
 import { emitLifecycle } from "./lifecycle/bus.js";
 import { captureUserMessage } from "./capture.js";
@@ -117,5 +118,11 @@ export class AresAgentRuntime {
       transcriptPath: transcriptPath ?? path.join(this.opts.workspace, ".ares", "sessions", this.opts.sessionId, "events.jsonl"),
       config: this.prepared.config,
     }).catch(() => undefined);
+    // Consolidate the v6 living store on session end — prune faded episodics,
+    // dedupe, promote themes. Without a scheduled invoker the store grows
+    // append-only and the dedupe/theme passes never fire (3-month rot).
+    await LivingMemoryStore.open(mindPaths(this.prepared.home).memoryFile)
+      .then((store) => store.consolidate())
+      .catch(() => undefined);
   }
 }

@@ -63,14 +63,23 @@ export const GlobTool = buildTool({
 async function glob(root: string, pattern: string, limit: number): Promise<string[]> {
   const regex = globToRegExp(pattern);
   const out: string[] = [];
+  // Walk dot-dirs (e.g. .github/workflows) but skip heavy/state ones, matching
+  // the ripgrep --hidden behavior so Glob and Grep agree on visibility.
   const ignoreDirs = new Set([
     "node_modules",
     ".git",
+    ".ares",
+    ".crix",
     "dist",
     "build",
     "target",
     ".next",
     ".pnpm-store",
+    ".turbo",
+    ".cache",
+    ".venv",
+    "venv",
+    "coverage",
   ]);
 
   async function walk(dir: string, rel: string): Promise<void> {
@@ -86,7 +95,7 @@ async function glob(root: string, pattern: string, limit: number): Promise<strin
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
       const childAbs = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (ignoreDirs.has(entry.name) || entry.name.startsWith(".")) continue;
+        if (ignoreDirs.has(entry.name)) continue;
         await walk(childAbs, childRel);
       } else if (entry.isFile()) {
         if (regex.test(childRel)) out.push(childRel);

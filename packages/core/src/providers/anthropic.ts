@@ -33,6 +33,14 @@ import type {
 } from "@ares/protocol";
 import { thinkingBudgetTokens } from "@ares/protocol";
 import type { Provider, ProviderRequest } from "../queryEngine.js";
+import { createStallGuard, stallErrorEvent, type StallGuard } from "./stallGuard.js";
+import {
+  resolveAnthropicAccessToken,
+  ANTHROPIC_OAUTH_BETA,
+  ANTHROPIC_OAUTH_IDENTITY,
+  ANTHROPIC_OAUTH_USER_AGENT,
+  ANTHROPIC_OAUTH_X_APP,
+} from "./anthropicAuth.js";
 
 export const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
 
@@ -75,12 +83,16 @@ export class AnthropicProvider implements Provider {
       process.env.ARES_ANTHROPIC_API_KEY ||
       process.env.ANTHROPIC_API_KEY ||
       "";
-    if (!apiKey) {
+    // Prefer an explicit API key; otherwise fall back to a Claude subscription
+    // OAuth token (Pro/Max). The two use different auth headers.
+    const oauthToken = apiKey ? null : await resolveAnthropicAccessToken(this.fetchImpl);
+    if (!apiKey && !oauthToken) {
       yield {
         type: "error",
         error: {
           code: "no_auth",
-          message: "No Anthropic API key. Set ARES_ANTHROPIC_API_KEY (or ANTHROPIC_API_KEY).",
+          // The desktop watches for "no_auth" + anthropic to prompt a browser sign-in.
+          message: "Not signed in to Anthropic. Sign in with your Claude account, or set an API key.",
           retriable: false,
         },
       };
@@ -93,19 +105,40 @@ export class AnthropicProvider implements Provider {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Accept: "text/event-stream",
-      "x-api-key": apiKey,
       "anthropic-version": ANTHROPIC_VERSION,
     };
+    if (apiKey) {
+      headers["x-api-key"] = apiKey;
+    } else if (oauthToken) {
+      headers["Authorization"] = `Bearer ${oauthToken}`;
+      headers["anthropic-beta"] = ANTHROPIC_OAUTH_BETA;
+      headers["User-Agent"] = ANTHROPIC_OAUTH_USER_AGENT;
+      headers["x-app"] = ANTHROPIC_OAUTH_X_APP;
+      headers["anthropic-dangerous-direct-browser-access"] = "true";
+      const existingSystem = Array.isArray(body.system) ? body.system : [];
+      body.system = [
+        { type: "text", text: ANTHROPIC_OAUTH_IDENTITY },
+        ...existingSystem,
+      ];
+    }
 
+    // Stall watchdog: abort the fetch when no bytes arrive for the stall
+    // window so a hung connection becomes a retriable error, not a freeze.
+    const guard = createStallGuard(req.signal);
     let response: Response;
     try {
       response = await this.fetchImpl(url, {
         method: "POST",
         headers,
         body: JSON.stringify(body),
-        signal: req.signal,
+        signal: guard.signal,
       });
     } catch (err) {
+      guard.dispose();
+      if (guard.stalled()) {
+        yield stallErrorEvent();
+        return;
+      }
       if (req.signal?.aborted || isAbortError(err)) return;
       yield {
         type: "error",
@@ -117,6 +150,7 @@ export class AnthropicProvider implements Provider {
       };
       return;
     }
+    guard.reset();
 
     if (!response.ok) {
       // Surface the body verbatim: the engine's context-limit matcher
@@ -144,12 +178,13 @@ export class AnthropicProvider implements Provider {
       return;
     }
 
-    yield* this.parseSSE(response.body, req.signal);
+    yield* this.parseSSE(response.body, req.signal, guard);
   }
 
   private async *parseSSE(
     body: ReadableStream<Uint8Array>,
     signal: AbortSignal | undefined,
+    guard?: StallGuard,
   ): AsyncGenerator<StreamEvent> {
     const decoder = new TextDecoder("utf8");
     const reader = body.getReader();
@@ -174,6 +209,11 @@ export class AnthropicProvider implements Provider {
       try {
         ({ done, value } = await reader.read());
       } catch (err) {
+        guard?.dispose();
+        if (guard?.stalled()) {
+          yield stallErrorEvent();
+          return;
+        }
         if (signal?.aborted || isAbortError(err)) return;
         yield {
           type: "error",
@@ -185,6 +225,7 @@ export class AnthropicProvider implements Provider {
         };
         return;
       }
+      guard?.reset();
       if (done) break;
       if (value) buffer += decoder.decode(value, { stream: true });
 
@@ -289,6 +330,7 @@ export class AnthropicProvider implements Provider {
       }
     }
 
+    guard?.dispose();
     if (signal?.aborted) return;
 
     // Assemble the final assistant message in wire (index) order. Reached
@@ -374,6 +416,23 @@ function buildMessagesBody(req: ProviderRequest): Record<string, unknown> {
     }));
   }
 
+  // S3 — rolling conversation cache breakpoint. The system + last-tool
+  // breakpoints only cache the STATIC prefix; without a breakpoint inside the
+  // message history, every turn of a long session re-bills the entire growing
+  // transcript. Mark the last block of the most recent message: Anthropic caches
+  // that prefix, and the next turn's longest-prefix match reuses all the shared
+  // history (cache reads are ~10% the price of fresh input). Moves forward every
+  // turn, so the cached span grows with the conversation. 3 breakpoints total
+  // (system + tools + history), under the 4-breakpoint ceiling.
+  const msgs = body.messages as Array<{ content: Array<Record<string, unknown>> }>;
+  const lastMsg = msgs[msgs.length - 1];
+  if (lastMsg && Array.isArray(lastMsg.content) && lastMsg.content.length > 0) {
+    const lastBlock = lastMsg.content[lastMsg.content.length - 1];
+    if (lastBlock && typeof lastBlock === "object") {
+      lastBlock.cache_control = { type: "ephemeral" };
+    }
+  }
+
   return body;
 }
 
@@ -444,11 +503,17 @@ function parseToolInput(partialJson: string): unknown {
 }
 
 function mergeUsage(prev: Usage, wire: AnthropicWireUsage): Usage {
+  const cacheReadTokens = wire.cache_read_input_tokens ?? prev.cacheReadTokens;
+  const cacheWriteTokens = wire.cache_creation_input_tokens ?? prev.cacheWriteTokens;
+  const freshInput = wire.input_tokens;
   return {
-    inputTokens: wire.input_tokens ?? prev.inputTokens,
+    inputTokens:
+      freshInput === undefined
+        ? prev.inputTokens
+        : freshInput + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0),
     outputTokens: wire.output_tokens ?? prev.outputTokens,
-    cacheReadTokens: wire.cache_read_input_tokens ?? prev.cacheReadTokens,
-    cacheWriteTokens: wire.cache_creation_input_tokens ?? prev.cacheWriteTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
   };
 }
 

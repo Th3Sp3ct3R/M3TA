@@ -16,7 +16,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 
-app = FastAPI(title="Crix Voice Service", version="0.1.0")
+app = FastAPI(title="Ares Voice Service", version="0.1.0")
 
 # Allow the standalone audition page (file:// / localhost) and the Tauri webview
 # (tauri://localhost) to call /voices and open the /tts socket.
@@ -286,22 +286,22 @@ def build_stt(settings: STTSettings) -> MockSTT | WhisperSTT | None:
 
 
 def parse_args() -> tuple[VoiceSettings, STTSettings]:
-    parser = argparse.ArgumentParser(description="Crix local voice sidecar (Kokoro TTS + Whisper STT)")
-    parser.add_argument("--host", default=os.environ.get("CRIX_TTS_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("CRIX_TTS_PORT", "8765")))
-    parser.add_argument("--engine", choices=["kokoro", "mock"], default=os.environ.get("CRIX_TTS_ENGINE", "kokoro"))
-    parser.add_argument("--voice", default=os.environ.get("CRIX_TTS_VOICE", "af_heart"))
-    parser.add_argument("--lang", default=os.environ.get("CRIX_TTS_LANG", "a"))
-    parser.add_argument("--speed", type=float, default=float(os.environ.get("CRIX_TTS_SPEED", "1.15")))
-    parser.add_argument("--device", default=os.environ.get("CRIX_TTS_DEVICE", "cuda:0"))
-    parser.add_argument("--language", default=os.environ.get("CRIX_TTS_LANGUAGE", "English"))
+    parser = argparse.ArgumentParser(description="Ares local voice sidecar (Kokoro TTS + Whisper STT)")
+    parser.add_argument("--host", default=os.environ.get("ARES_TTS_HOST", os.environ.get("CRIX_TTS_HOST", "127.0.0.1")))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("ARES_TTS_PORT", os.environ.get("CRIX_TTS_PORT", "8765"))))
+    parser.add_argument("--engine", choices=["kokoro", "mock"], default=os.environ.get("ARES_TTS_ENGINE", os.environ.get("CRIX_TTS_ENGINE", "kokoro")))
+    parser.add_argument("--voice", default=os.environ.get("ARES_TTS_VOICE", os.environ.get("CRIX_TTS_VOICE", "af_heart")))
+    parser.add_argument("--lang", default=os.environ.get("ARES_TTS_LANG", os.environ.get("CRIX_TTS_LANG", "a")))
+    parser.add_argument("--speed", type=float, default=float(os.environ.get("ARES_TTS_SPEED", os.environ.get("CRIX_TTS_SPEED", "1.15"))))
+    parser.add_argument("--device", default=os.environ.get("ARES_TTS_DEVICE", os.environ.get("CRIX_TTS_DEVICE", "cuda:0")))
+    parser.add_argument("--language", default=os.environ.get("ARES_TTS_LANGUAGE", os.environ.get("CRIX_TTS_LANGUAGE", "English")))
     parser.add_argument("--mock", action="store_true")
     # Speech-to-text (push-to-talk). --mock forces the mock engine for both.
-    parser.add_argument("--stt-engine", choices=["whisper", "mock"], default=os.environ.get("CRIX_STT_ENGINE", "whisper"))
-    parser.add_argument("--stt-model", default=os.environ.get("CRIX_STT_MODEL", "small.en"))
-    parser.add_argument("--stt-device", default=os.environ.get("CRIX_STT_DEVICE", "cuda:0"))
-    parser.add_argument("--stt-input-device", default=os.environ.get("CRIX_STT_INPUT_DEVICE"))
-    parser.add_argument("--stt-lang", default=os.environ.get("CRIX_STT_LANG", "en"))
+    parser.add_argument("--stt-engine", choices=["whisper", "mock"], default=os.environ.get("ARES_STT_ENGINE", os.environ.get("CRIX_STT_ENGINE", "whisper")))
+    parser.add_argument("--stt-model", default=os.environ.get("ARES_STT_MODEL", os.environ.get("CRIX_STT_MODEL", "small.en")))
+    parser.add_argument("--stt-device", default=os.environ.get("ARES_STT_DEVICE", os.environ.get("CRIX_STT_DEVICE", "cuda:0")))
+    parser.add_argument("--stt-input-device", default=os.environ.get("ARES_STT_INPUT_DEVICE", os.environ.get("CRIX_STT_INPUT_DEVICE")))
+    parser.add_argument("--stt-lang", default=os.environ.get("ARES_STT_LANG", os.environ.get("CRIX_STT_LANG", "en")))
     args = parser.parse_args()
     voice = VoiceSettings(
         host=args.host,

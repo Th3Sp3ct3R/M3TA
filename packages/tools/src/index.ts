@@ -25,10 +25,21 @@ export {
   makeWebSearchTool,
   duckDuckGoLite,
   parseDuckDuckGoLite,
+  defaultSearchChain,
+  braveSearch,
+  tavilySearch,
+  withFallback,
   type WebSearchResult,
   type WebSearchOutput,
   type SearchBackend,
 } from "./WebSearch.js";
+export {
+  makeImageSearchTool,
+  duckDuckGoImages,
+  braveImages,
+  type ImageResult,
+  type ImageSearchOutput,
+} from "./ImageSearch.js";
 export {
   CodebaseSearchTool,
   type CodebaseSearchHit,
@@ -46,6 +57,11 @@ export { makeKillShellTool, type KillShellOutput } from "./KillShell.js";
 export { McpListToolsTool, McpCallTool, type McpListOutput, type McpCallOutput } from "./Mcp.js";
 export { SkillsListTool, SkillReadTool, type SkillsListOutput, type SkillReadOutput, type SkillSummary } from "./Skills.js";
 export { MemoryTool, type MemoryOutput, type MemoryItem } from "./Memory.js";
+export { ComputerUseTool, type ComputerUseOutput } from "./ComputerUse.js";
+export { DeployTool, type DeployOutput } from "./Deploy.js";
+export { StripeTool, type StripeOutput } from "./Stripe.js";
+export { EmailTool, type EmailOutput } from "./Email.js";
+export { RequestUserActionTool, type RequestUserActionOutput } from "./RequestUserAction.js";
 export { makeEnterPlanModeTool, makeExitPlanModeTool, type PlanModeState } from "./PlanMode.js";
 
 import { ReadTool } from "./Read.js";
@@ -63,6 +79,11 @@ import { CodeModeTool } from "./CodeMode.js";
 import { McpListToolsTool, McpCallTool } from "./Mcp.js";
 import { SkillsListTool, SkillReadTool } from "./Skills.js";
 import { MemoryTool } from "./Memory.js";
+import { ComputerUseTool } from "./ComputerUse.js";
+import { DeployTool } from "./Deploy.js";
+import { StripeTool } from "./Stripe.js";
+import { EmailTool } from "./Email.js";
+import { RequestUserActionTool } from "./RequestUserAction.js";
 
 /** The default tool set wired into a fresh Session. */
 export const DEFAULT_TOOLS = process.platform === "win32"
@@ -84,6 +105,11 @@ export const DEFAULT_TOOLS = process.platform === "win32"
       SkillsListTool,
       SkillReadTool,
       MemoryTool,
+      ComputerUseTool,
+      DeployTool,
+      StripeTool,
+      EmailTool,
+      RequestUserActionTool,
     ] as const
   : [
       ReadTool,
@@ -103,4 +129,8 @@ export const DEFAULT_TOOLS = process.platform === "win32"
       SkillsListTool,
       SkillReadTool,
       MemoryTool,
+      DeployTool,
+      StripeTool,
+      EmailTool,
+      RequestUserActionTool,
     ] as const;

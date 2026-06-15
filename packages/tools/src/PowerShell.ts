@@ -6,7 +6,12 @@
 import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { buildTool, describeShellActivity, resolveWorkspacePath } from "./_shared.js";
+import {
+  buildTool,
+  describeShellActivity,
+  destructiveShellDecision,
+  resolveWorkspacePath,
+} from "./_shared.js";
 import { runShell } from "./Bash.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -36,7 +41,9 @@ export const PowerShellTool = buildTool({
   inputZod: inputSchema,
   activityDescription: (i) => describeShellActivity(i.command, i.run_in_background === true),
   async checkPermissions(i, ctx) {
-    return ctx.commandPermissions?.decide("PowerShell", i.command) ?? { kind: "allow" };
+    const configured = ctx.commandPermissions?.decide("PowerShell", i.command);
+    if (configured && configured.kind !== "allow") return configured;
+    return destructiveShellDecision(i.command) ?? configured ?? { kind: "allow" };
   },
 
   async call(i, ctx) {

@@ -11,7 +11,7 @@ import path from "node:path";
 
 import { __internal } from "../packages/core/dist/queryEngine.js";
 
-const { buildDepAwareBatches, analyzeToolDeps } = __internal;
+const { buildDepAwareBatches, analyzeToolDeps, normalizeToolInput, resolveEngineTool } = __internal;
 const WORKSPACE = path.resolve("/tmp/dep-batches");
 
 function mkTool(name, { safety, concurrency }) {
@@ -116,4 +116,23 @@ test("T1-OP: Write tool participates same as Edit", () => {
   const batches = buildDepAwareBatches(uses, WORKSPACE);
   assert.equal(batches.length, 1);
   assert.equal(batches[0].length, 2);
+});
+
+test("tool compatibility: resolves common provider naming variants", () => {
+  const tools = [
+    mkTool("Read", readTool),
+    mkTool("WebSearch", readTool),
+  ];
+  assert.equal(resolveEngineTool(tools, "read_file")?.schema.name, "Read");
+  assert.equal(resolveEngineTool(tools, "functions.Read:0")?.schema.name, "Read");
+  assert.equal(resolveEngineTool(tools, "web_search_tool")?.schema.name, "WebSearch");
+});
+
+test("tool compatibility: normalizes high-confidence argument aliases", () => {
+  assert.deepEqual(normalizeToolInput("Read", { path: "src/a.ts" }), { path: "src/a.ts", file_path: "src/a.ts" });
+  assert.deepEqual(
+    normalizeToolInput("Edit", { path: "src/a.ts", old_text: "a", new_text: "b" }),
+    { path: "src/a.ts", old_text: "a", new_text: "b", file_path: "src/a.ts", old_string: "a", new_string: "b" },
+  );
+  assert.deepEqual(normalizeToolInput("PowerShell", { cmd: "pnpm test" }), { cmd: "pnpm test", command: "pnpm test" });
 });

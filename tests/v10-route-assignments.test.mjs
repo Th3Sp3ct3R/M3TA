@@ -36,6 +36,8 @@ test("owner assignment wins over the heuristic", () => {
 test("classifyLane routes goals to coding/research/chat by keywords", () => {
   assert.equal(classifyLane("fix the bug in this function"), "coding");
   assert.equal(classifyLane("refactor the API endpoint"), "coding");
+  assert.equal(classifyLane("make me a nice 3d world sandbox medieval style in D:\\cryptWORKSPACE"), "coding");
+  assert.equal(classifyLane("make me a 3d sandbox\nmake it advanced"), "coding");
   assert.equal(classifyLane("research the best approach and compare options"), "research");
   assert.equal(classifyLane("explain why this design works"), "research");
   assert.equal(classifyLane("hey how are you"), "chat");

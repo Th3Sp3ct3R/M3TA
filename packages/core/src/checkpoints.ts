@@ -9,8 +9,45 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { BlobRef, CheckpointMeta } from "@ares/protocol";
 
-const IGNORED_DIRS = new Set([".git", ".ares", "node_modules", "dist", "build", "target", ".next", "coverage"]);
+const IGNORED_DIRS = new Set([
+  ".git",
+  ".ares",
+  // Legacy pre-rename home left ~43k files (a Python voice-venv + old sessions)
+  // that were being read+hashed before every single write/shell call.
+  ".crix",
+  "node_modules",
+  "dist",
+  "build",
+  "target",
+  ".next",
+  "coverage",
+  // Common heavy state/venv/cache dirs that have no business in a snapshot.
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".pnpm-store",
+  ".turbo",
+  ".cache",
+  "out",
+]);
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Per-process (path → mtime,size → hash) cache so a checkpoint re-hashes only
+ * files that actually changed since the last snapshot. On a large workspace the
+ * old behavior read+sha256'd every file before every write/shell tool call —
+ * seconds of tax on the hottest coding path. With the cache, an unchanged file
+ * costs one stat. Keyed by absolute path; the blob for a cached hash is assumed
+ * present (verified cheaply on reuse).
+ */
+const fileHashCache = new Map<string, { mtimeMs: number; size: number; hash: string }>();
+
+/** Keep at most this many checkpoint metas per session; older ones are GC'd
+ *  along with any blobs they solely referenced. Override with ARES_CHECKPOINT_RETENTION. */
+function checkpointRetention(): number {
+  const env = Number(process.env.ARES_CHECKPOINT_RETENTION);
+  return Number.isFinite(env) && env > 0 ? Math.floor(env) : 200;
+}
 
 export interface CreateCheckpointOptions {
   workspace: string;
@@ -21,13 +58,11 @@ export interface CreateCheckpointOptions {
 }
 
 export async function createWorkspaceCheckpoint(opts: CreateCheckpointOptions): Promise<CheckpointMeta> {
-  const files = await listWorkspaceFiles(opts.workspace);
+  const files = await listWorkspaceFilesWithStats(opts.workspace);
   const manifest: BlobRef[] = [];
   for (const file of files) {
-    const bytes = await fs.readFile(file);
-    const hash = sha256(bytes);
-    await writeBlob(opts.workspace, hash, bytes);
-    const rel = path.relative(opts.workspace, file).replace(/\\/g, "/");
+    const hash = await hashFileCached(opts.workspace, file.path, file.mtimeMs, file.size);
+    const rel = path.relative(opts.workspace, file.path).replace(/\\/g, "/");
     manifest.push({ path: rel, blobHash: hash, mode: 0o100644 });
   }
   manifest.sort((a, b) => a.path.localeCompare(b.path));
@@ -48,7 +83,62 @@ export async function createWorkspaceCheckpoint(opts: CreateCheckpointOptions): 
   };
   await fs.mkdir(metaDir(opts.workspace), { recursive: true });
   await fs.writeFile(path.join(metaDir(opts.workspace), `${id}.json`), JSON.stringify(meta, null, 2) + "\n", "utf8");
+  // Opportunistic GC so blobs/metas don't accumulate forever (the old behavior).
+  await gcCheckpoints(opts.workspace).catch(() => {});
   return meta;
+}
+
+/** Hash a file, reusing the cached hash when mtime+size are unchanged AND the
+ *  blob still exists on disk (cheap stat). Re-reads only genuinely-changed files. */
+async function hashFileCached(workspace: string, full: string, mtimeMs: number, size: number): Promise<string> {
+  const cached = fileHashCache.get(full);
+  if (cached && cached.mtimeMs === mtimeMs && cached.size === size) {
+    // Trust the cache only if its blob is still present (GC may have removed it).
+    const exists = await fs.stat(blobPath(workspace, cached.hash)).then(() => true).catch(() => false);
+    if (exists) return cached.hash;
+  }
+  const bytes = await fs.readFile(full);
+  const hash = sha256(bytes);
+  await writeBlob(workspace, hash, bytes);
+  fileHashCache.set(full, { mtimeMs, size, hash });
+  return hash;
+}
+
+/** Prune checkpoint metas beyond the retention window (per session, newest
+ *  kept), then delete blobs no surviving meta references. */
+async function gcCheckpoints(workspace: string): Promise<void> {
+  const retention = checkpointRetention();
+  const metas = await listWorkspaceCheckpoints(workspace);
+  // Group by session, keep newest `retention` per session.
+  const bySession = new Map<string, CheckpointMeta[]>();
+  for (const m of metas) {
+    const arr = bySession.get(m.sessionId) ?? [];
+    arr.push(m);
+    bySession.set(m.sessionId, arr);
+  }
+  const survivors: CheckpointMeta[] = [];
+  const doomed: CheckpointMeta[] = [];
+  for (const arr of bySession.values()) {
+    arr.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    survivors.push(...arr.slice(0, retention));
+    doomed.push(...arr.slice(retention));
+  }
+  if (doomed.length === 0) return;
+  for (const m of doomed) {
+    await fs.rm(path.join(metaDir(workspace), `${m.id}.json`), { force: true }).catch(() => {});
+  }
+  // Sweep orphaned blobs: keep only hashes referenced by a surviving meta.
+  const live = new Set<string>();
+  for (const m of survivors) for (const ref of m.fileManifest) live.add(ref.blobHash);
+  const blobsRoot = path.join(workspace, ".ares", "checkpoints", "blobs");
+  const shards = await fs.readdir(blobsRoot).catch(() => [] as string[]);
+  for (const shard of shards) {
+    const shardDir = path.join(blobsRoot, shard);
+    const blobs = await fs.readdir(shardDir).catch(() => [] as string[]);
+    for (const hash of blobs) {
+      if (!live.has(hash)) await fs.rm(path.join(shardDir, hash), { force: true }).catch(() => {});
+    }
+  }
 }
 
 export async function listWorkspaceCheckpoints(workspace: string): Promise<CheckpointMeta[]> {
@@ -150,7 +240,13 @@ export async function diffWorkspaceCheckpointUnified(
 }
 
 async function listWorkspaceFiles(workspace: string): Promise<string[]> {
-  const out: string[] = [];
+  return (await listWorkspaceFilesWithStats(workspace)).map((f) => f.path);
+}
+
+async function listWorkspaceFilesWithStats(
+  workspace: string,
+): Promise<Array<{ path: string; mtimeMs: number; size: number }>> {
+  const out: Array<{ path: string; mtimeMs: number; size: number }> = [];
   async function walk(dir: string): Promise<void> {
     const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
@@ -160,7 +256,7 @@ async function listWorkspaceFiles(workspace: string): Promise<string[]> {
         await walk(full);
       } else if (entry.isFile()) {
         const stat = await fs.stat(full).catch(() => null);
-        if (stat && stat.size <= MAX_FILE_BYTES) out.push(full);
+        if (stat && stat.size <= MAX_FILE_BYTES) out.push({ path: full, mtimeMs: stat.mtimeMs, size: stat.size });
       }
     }
   }

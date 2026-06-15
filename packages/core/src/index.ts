@@ -9,6 +9,9 @@
 export {
   QueryEngine,
   budgetMessages,
+  buildContextLedger,
+  collectTrimmedFilePaths,
+  chooseCompactionSplit,
   stringifyModelToolOutput,
   type QueryEngineConfig,
   type Provider,
@@ -34,6 +37,17 @@ export {
 } from "./providers/anthropic.js";
 
 export {
+  startAnthropicLogin,
+  finishAnthropicLogin,
+  runAnthropicLoginFlow,
+  loadAnthropicTokens,
+  clearAnthropicTokens,
+  resolveAnthropicAccessToken,
+  type AnthropicOAuthTokens,
+  type AnthropicAuthChallenge,
+} from "./providers/anthropicAuth.js";
+
+export {
   sideQuery,
   sideQueryJson,
   type SideQueryOptions,
@@ -54,6 +68,7 @@ export {
 export {
   ContinuousVerifier,
   deriveNarrowVerify,
+  findRelatedTestFiles,
   type VerifierOptions,
   type VerifyCommand,
   type VerifyResult,
@@ -120,9 +135,14 @@ export {
 } from "./providers/ollamaCloud.js";
 
 export {
+  DeepSeekProvider,
   OpenRouterProvider,
+  fetchDeepSeekModels,
   fetchOpenRouterModels,
+  DEEPSEEK_BASE_URL,
   OPENROUTER_BASE_URL,
+  type DeepSeekProviderOptions,
+  type DeepSeekModel,
   type OpenRouterProviderOptions,
   type OpenRouterModel,
 } from "./providers/openrouter.js";

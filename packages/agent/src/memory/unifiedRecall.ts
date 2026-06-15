@@ -16,9 +16,43 @@
 // behavior) and v4 only bumps recall hit-counts — exactly as each did before.
 // Neither store is migrated or rewritten here.
 
-import { MemoryStore as LivingMemoryStore, type RecalledMemory } from "@ares/mind";
+import { MemoryStore as LivingMemoryStore, EmbedIndex, ollamaEmbedder, type RecalledMemory } from "@ares/mind";
 import type { AresAgentConfig } from "../config.js";
 import { recallForTurn } from "../recall.js";
+
+// Files whose sidecar vector index has already been reindexed this process, so
+// the one-time reindex on first wire doesn't repeat every recall.
+const embedReindexed = new Set<string>();
+
+/**
+ * Open the living-memory store with SEMANTIC seeding wired in. Without this the
+ * whole vector apparatus (cosine blend, .vec.jsonl sidecar, spreading-activation
+ * over embeddings) is dead code and recall is pure lexical — a paraphrase with
+ * no shared tokens can't surface a memory. Gated behind ARES_MIND_EMBED so it's
+ * opt-in (it adds a local Ollama dependency); fully graceful — if the embedder
+ * is unreachable, embedCue times out (~300ms) and recall falls back to lexical,
+ * never blocking or breaking a turn.
+ */
+async function openLivingStore(file?: string): Promise<LivingMemoryStore> {
+  const store = await LivingMemoryStore.open(file);
+  if (file && process.env.ARES_MIND_EMBED === "1") {
+    try {
+      const index = await EmbedIndex.open(`${file}.vec.jsonl`);
+      const embedder = ollamaEmbedder(
+        process.env.ARES_MIND_EMBED_MODEL ? { model: process.env.ARES_MIND_EMBED_MODEL } : {},
+      );
+      store.attachEmbedder(embedder, index);
+      if (!embedReindexed.has(file)) {
+        embedReindexed.add(file);
+        // Populate the sidecar once, in the background — never await on a turn.
+        void store.reindex().catch(() => {});
+      }
+    } catch {
+      // Semantic seeding is an enhancement; lexical recall stands on its own.
+    }
+  }
+  return store;
+}
 
 export type UnifiedRecallOrigin = "living" | "vector";
 
@@ -121,7 +155,7 @@ export async function unifiedRecallForTurn(opts: UnifiedRecallOptions): Promise<
   // 1. v6 living memory — primary, source of truth.
   if (opts.livingMemoryFile || opts.openLiving) {
     try {
-      const open = opts.openLiving ?? ((file?: string) => LivingMemoryStore.open(file));
+      const open = opts.openLiving ?? openLivingStore;
       const store = await open(opts.livingMemoryFile);
       // Read-only when reinforce === false and the store supports peek(); else
       // remember() (which reinforces — the normal live-turn behavior).

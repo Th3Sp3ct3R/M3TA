@@ -4,7 +4,12 @@ import { z } from "zod";
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { buildTool, describeShellActivity, resolveWorkspacePath } from "./_shared.js";
+import {
+  buildTool,
+  describeShellActivity,
+  destructiveShellDecision,
+  resolveWorkspacePath,
+} from "./_shared.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 600_000;
@@ -58,7 +63,9 @@ export const BashTool = buildTool({
   inputZod: inputSchema,
   activityDescription: (i) => describeShellActivity(i.command, i.run_in_background === true),
   async checkPermissions(i, ctx) {
-    return ctx.commandPermissions?.decide("Bash", i.command) ?? { kind: "allow" };
+    const configured = ctx.commandPermissions?.decide("Bash", i.command);
+    if (configured && configured.kind !== "allow") return configured;
+    return destructiveShellDecision(i.command) ?? configured ?? { kind: "allow" };
   },
 
   async call(i, ctx): Promise<{ output: unknown; display: string }> {
@@ -122,7 +129,19 @@ export async function runShell(
 
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill();
+      // On win32 kill the whole tree — child.kill() leaves grandchildren (dev
+      // servers, watchers) alive holding ports. taskkill /T /F reaps them.
+      if (process.platform === "win32" && child.pid) {
+        spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" }).on("error", () => {
+          try {
+            child.kill();
+          } catch {
+            /* ignore */
+          }
+        });
+      } else {
+        child.kill();
+      }
     }, timeoutMs);
 
     child.stdout.on("data", (chunk: Buffer) => {

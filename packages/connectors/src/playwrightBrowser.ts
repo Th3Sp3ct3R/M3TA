@@ -10,10 +10,69 @@
 // Internals are loosely typed on purpose (the dependency may be absent at build
 // time); the returned object is checked against the BrowserConnector contract.
 
+import { existsSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { AccessibilityNode, BrowserConnector } from "./types.js";
 
 export interface PlaywrightOptions {
   headless?: boolean;
+}
+
+export function findInstalledChromium(): string | undefined {
+  const candidates =
+    process.platform === "win32"
+      ? [
+          process.env.PROGRAMFILES
+            ? path.join(process.env.PROGRAMFILES, "Microsoft", "Edge", "Application", "msedge.exe")
+            : "",
+          process.env["PROGRAMFILES(X86)"]
+            ? path.join(process.env["PROGRAMFILES(X86)"], "Microsoft", "Edge", "Application", "msedge.exe")
+            : "",
+          process.env.LOCALAPPDATA
+            ? path.join(process.env.LOCALAPPDATA, "Microsoft", "Edge", "Application", "msedge.exe")
+            : "",
+          process.env.PROGRAMFILES
+            ? path.join(process.env.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe")
+            : "",
+          process.env["PROGRAMFILES(X86)"]
+            ? path.join(process.env["PROGRAMFILES(X86)"], "Google", "Chrome", "Application", "chrome.exe")
+            : "",
+          process.env.LOCALAPPDATA
+            ? path.join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe")
+            : "",
+        ]
+      : process.platform === "darwin"
+        ? [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+          ]
+        : [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/microsoft-edge-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+          ];
+
+  return candidates.find((candidate) => candidate && existsSync(candidate));
+}
+
+/** Parse Playwright's aria snapshot YAML (lines like `- button "Submit"`) into
+ *  the {role, name, selector} nodes the connector contract uses. */
+function parseAriaSnapshot(yaml: string): AccessibilityNode[] {
+  const out: AccessibilityNode[] = [];
+  for (const rawLine of yaml.split("\n")) {
+    const line = rawLine.trim();
+    const m = line.match(/^-\s+([a-z]+)(?:\s+"([^"]*)")?/i);
+    if (!m) continue;
+    const role = m[1];
+    const name = m[2];
+    out.push({ role, name, selector: name ? `${role}:${name}` : role });
+  }
+  return out;
 }
 
 export async function createPlaywrightBrowser(opts: PlaywrightOptions = {}): Promise<BrowserConnector> {
@@ -22,11 +81,35 @@ export async function createPlaywrightBrowser(opts: PlaywrightOptions = {}): Pro
   try {
     pw = await import(moduleName);
   } catch {
-    throw new Error("Playwright is not installed. Run: pnpm add -w playwright && npx playwright install chromium");
+    // Terminal, non-actionable message ON PURPOSE: the model must NOT try to
+    // "install" anything (that loops for minutes outside a dev checkout). It
+    // should switch tools. Surfaced verbatim to the agent.
+    throw new Error(
+      "BROWSER_UNAVAILABLE: the headless browser is not available in this build. Do not attempt to install it. Use WebFetch to read page text, or ImageSearch to get image URLs, instead.",
+    );
   }
 
-  const browser = await pw.chromium.launch({ headless: opts.headless ?? true });
-  const page = await browser.newPage();
+  const executablePath = findInstalledChromium();
+  // A PERSISTENT profile under ~/.ares — durable cookies/logins survive across
+  // sessions and daemon restarts (so "log into my accounts / manage dashboards"
+  // is possible), and pointing at the user's real Chrome/Edge build gives a
+  // genuine fingerprint that passes most anti-bot checks a stock headless fails.
+  const userDataDir = process.env.ARES_HOME
+    ? path.join(process.env.ARES_HOME, "browser-profile")
+    : path.join(os.tmpdir(), "ares-browser-profile");
+  let context: any;
+  try {
+    context = await pw.chromium.launchPersistentContext(userDataDir, {
+      headless: opts.headless ?? true,
+      viewport: { width: 1280, height: 800 },
+      ...(executablePath ? { executablePath } : {}),
+    });
+  } catch (error) {
+    throw new Error(
+      `BROWSER_UNAVAILABLE: Playwright loaded, but no compatible Edge/Chrome runtime could launch. ${String(error)}`,
+    );
+  }
+  const page = context.pages()[0] ?? (await context.newPage());
 
   const flatten = (node: any, out: AccessibilityNode[] = []): AccessibilityNode[] => {
     if (node && typeof node.role === "string") {
@@ -39,18 +122,38 @@ export async function createPlaywrightBrowser(opts: PlaywrightOptions = {}): Pro
   return {
     name: "playwright",
     async navigate(url) {
-      await page.goto(url);
+      // Bounded waits — a stock 30s default means every miss is a half-minute hang.
+      await page.goto(url, { timeout: 15_000, waitUntil: "domcontentloaded" });
       return { url: page.url(), title: await page.title() };
     },
     async accessibilityTree() {
-      const snapshot = await page.accessibility.snapshot();
-      return snapshot ? flatten(snapshot) : [];
+      // page.accessibility was removed in newer Playwright — calling .snapshot()
+      // on it threw "Cannot read properties of undefined (reading 'snapshot')".
+      // Use it when present, else the modern aria snapshot (built for agents).
+      if (page.accessibility?.snapshot) {
+        const snapshot = await page.accessibility.snapshot().catch(() => null);
+        if (snapshot) return flatten(snapshot);
+      }
+      const yaml: string = await page
+        .locator("body")
+        .ariaSnapshot()
+        .catch(() => "");
+      return parseAriaSnapshot(yaml);
     },
     async fillByLabel(label, value) {
-      await page.getByLabel(label).fill(value);
+      await page.getByLabel(label).first().fill(value, { timeout: 5_000 });
     },
     async clickByRole(role, name) {
-      await page.getByRole(role, { name }).click();
+      const locator = page.getByRole(role, { name });
+      try {
+        await locator.click({ timeout: 5_000 });
+      } catch (err) {
+        // Strict-mode multi-match throws immediately — fall back to the first
+        // candidate instead of hanging/failing the whole action.
+        const count = await locator.count().catch(() => 0);
+        if (count > 1) await locator.first().click({ timeout: 5_000 });
+        else throw err;
+      }
     },
     async screenshot() {
       const buffer: Buffer = await page.screenshot();
@@ -60,7 +163,7 @@ export async function createPlaywrightBrowser(opts: PlaywrightOptions = {}): Pro
       return { url: page.url(), title: await page.title() };
     },
     async close() {
-      await browser.close();
+      await context.close();
     },
   };
 }

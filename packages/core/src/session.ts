@@ -22,7 +22,7 @@ import {
 } from "@ares/protocol";
 import { QueryEngine, stringifyModelToolOutput, type EngineTool, type Provider } from "./queryEngine.js";
 import type { ToolPermissionRequest } from "./queryEngine.js";
-import type { PermissionPromptDecision, ReasoningLevel } from "@ares/protocol";
+import type { PermissionPromptDecision, ReasoningLevel, Usage } from "@ares/protocol";
 import type { HookManager } from "./hooks.js";
 import { createWorkspaceCheckpoint, diffWorkspaceCheckpointUnified } from "./checkpoints.js";
 
@@ -69,12 +69,22 @@ export interface SessionOptions {
   maxOutputTokens?: number;
   /** Trim oldest history to keep estimated input under this many tokens. */
   contextBudgetTokens?: number;
+  /** Hard ceiling on tool-calling turns before the engine stops (default 80). */
+  maxTurns?: number;
+  /** See QueryEngineConfig.onHistoryTrimmed — read-stamp invalidation on trim. */
+  onHistoryTrimmed?: (dropped: readonly Message[]) => void;
+  /** See QueryEngineConfig.summarizeSpan — smart compaction summarizer. */
+  summarizeSpan?: (messages: readonly Message[]) => Promise<string>;
+  /** See QueryEngineConfig.compactionThresholdTokens. */
+  compactionThresholdTokens?: number;
 }
 
 export class Session {
   readonly meta: SessionMeta;
   readonly engine: QueryEngine;
   private seq = 0;
+  /** Serializes rollout appends off the hot path; ordered, never interleaved. */
+  private ioChain: Promise<void> = Promise.resolve();
   private readonly eventsPath: string;
   private readonly metaPath: string;
   private metaWritten = false;
@@ -108,6 +118,10 @@ export class Session {
         reasoningLevel: opts.reasoningLevel,
         maxOutputTokens: opts.maxOutputTokens,
         contextBudgetTokens: opts.contextBudgetTokens,
+        maxTurns: opts.maxTurns,
+        onHistoryTrimmed: opts.onHistoryTrimmed,
+        summarizeSpan: opts.summarizeSpan,
+        compactionThresholdTokens: opts.compactionThresholdTokens,
         beforeToolUseCheckpoint: async ({ toolUseId, toolName }) => {
           const checkpoint = await createWorkspaceCheckpoint({
             workspace: this.opts.workspace,
@@ -132,6 +146,45 @@ export class Session {
     this.engine.setReasoningLevel(level);
   }
 
+  setMaxTurns(maxTurns: number | undefined): void {
+    this.engine.setMaxTurns(maxTurns);
+  }
+
+  /** Swap provider/model in place and persist the new session metadata. */
+  async setProvider(
+    provider: Provider,
+    model: string,
+    context?: Pick<SessionOptions, "contextBudgetTokens" | "compactionThresholdTokens" | "summarizeSpan">,
+  ): Promise<void> {
+    this.engine.setProvider(provider, model, context);
+    this.meta.provider = { name: provider.name, model };
+    await this.ensureSessionDir();
+    await writeFile(this.metaPath, JSON.stringify(this.meta, null, 2) + "\n", "utf8");
+  }
+
+  /** Persist provider work performed outside the main QueryEngine loop. */
+  async recordAuxiliaryUsage(
+    kind: "compaction" | "witness" | "memory" | "other",
+    provider: string,
+    model: string,
+    usage: Usage,
+  ): Promise<void> {
+    await this.ensureSessionDir();
+    this.persistEvent({
+      type: "auxiliary_usage",
+      kind,
+      provider,
+      model,
+      usage: { ...usage, modelCalls: usage.modelCalls ?? 1 },
+    });
+    await this.flush();
+  }
+
+  /** Stop the in-flight turn; the session stays alive for the next message. */
+  interrupt(): void {
+    this.engine.interrupt();
+  }
+
   /** Append a user message and stream the turn. Events persist to rollout. */
   async *send(text: string): AsyncGenerator<TurnEvent> {
     yield* this.sendContent([{ type: "text", text }]);
@@ -141,28 +194,51 @@ export class Session {
   async *sendContent(content: ContentBlock[]): AsyncGenerator<TurnEvent> {
     await this.ensureSessionDir();
     this.engine.appendUserMessageContent(content);
+    yield* this.streamAndPersist();
+  }
+
+  /**
+   * Re-stream the CURRENT pending turn without appending a new user message.
+   * Used to retry a turn that died on a provider-level failure after switching
+   * to a healthy provider — the engine re-runs the same pending user message.
+   */
+  async *resumeTurn(): AsyncGenerator<TurnEvent> {
+    await this.ensureSessionDir();
+    yield* this.streamAndPersist();
+  }
+
+  private async *streamAndPersist(): AsyncGenerator<TurnEvent> {
     const preToolCheckpoints = new Map<string, string>();
-    for await (const event of this.engine.streamTurn()) {
-      await this.persistEvent(event);
-      yield event;
+    {
+      for await (const event of this.engine.streamTurn()) {
+        // Persistence is enqueued (not awaited) so a fast token stream never
+        // waits on an NTFS append + Defender scan before reaching the consumer.
+        this.persistEvent(event);
+        // Durability barrier at the turn boundary: drain pending appends BEFORE
+        // surfacing turn_end, so the rollout is complete on disk without holding
+        // the turn "active" past the generator's return (which would reject the
+        // user's immediate next message).
+        if (event.type === "turn_end") await this.flush();
+        yield event;
       if (event.type === "checkpoint_created" && event.toolUseId && event.reason === "pre_tool") {
         preToolCheckpoints.set(event.toolUseId, event.checkpointId);
       }
-      if (event.type === "tool_end" && event.touchedFiles && event.touchedFiles.length > 0) {
-        const checkpointId = preToolCheckpoints.get(event.id);
-        if (!checkpointId) continue;
-        const diff = await diffWorkspaceCheckpointUnified(this.opts.workspace, checkpointId, event.touchedFiles).catch(() => null);
-        if (!diff || !diff.diff) continue;
-        const diffEvent: TurnEvent = {
-          type: "workspace_diff",
-          checkpointId,
-          toolUseId: event.id,
-          files: diff.files,
-          diff: diff.diff,
-          truncated: diff.truncated,
-        };
-        await this.persistEvent(diffEvent);
-        yield diffEvent;
+        if (event.type === "tool_end" && event.touchedFiles && event.touchedFiles.length > 0) {
+          const checkpointId = preToolCheckpoints.get(event.id);
+          if (!checkpointId) continue;
+          const diff = await diffWorkspaceCheckpointUnified(this.opts.workspace, checkpointId, event.touchedFiles).catch(() => null);
+          if (!diff || !diff.diff) continue;
+          const diffEvent: TurnEvent = {
+            type: "workspace_diff",
+            checkpointId,
+            toolUseId: event.id,
+            files: diff.files,
+            diff: diff.diff,
+            truncated: diff.truncated,
+          };
+          this.persistEvent(diffEvent);
+          yield diffEvent;
+        }
       }
     }
   }
@@ -179,13 +255,28 @@ export class Session {
     this.metaWritten = true;
   }
 
-  private async persistEvent(event: TurnEvent): Promise<void> {
+  /**
+   * Enqueue a rollout append WITHOUT blocking the caller. seq is assigned
+   * synchronously (preserving order); the actual fs append is serialized on
+   * ioChain so writes never interleave and the hot path never waits on disk.
+   */
+  private persistEvent(event: TurnEvent): void {
+    const persistedEvent: TurnEvent =
+      event.type === "turn_end"
+        ? { ...event, provider: this.meta.provider.name, model: this.meta.provider.model }
+        : event;
     const entry: RolloutEntry = {
       ts: new Date().toISOString(),
       seq: this.seq++,
-      event,
+      event: persistedEvent,
     };
-    await appendFile(this.eventsPath, JSON.stringify(entry) + "\n", "utf8");
+    const line = JSON.stringify(entry) + "\n";
+    this.ioChain = this.ioChain.then(() => appendFile(this.eventsPath, line, "utf8")).catch(() => {});
+  }
+
+  /** Await all pending rollout appends. */
+  private flush(): Promise<void> {
+    return this.ioChain;
   }
 }
 
@@ -336,6 +427,12 @@ function messagesFromRollout(entries: readonly RolloutEntry[]): Message[] {
         content: event.error,
         is_error: true,
       });
+      continue;
+    }
+    if (event.type === "compaction" && Array.isArray(event.messages)) {
+      pendingToolResults = [];
+      messages.length = 0;
+      messages.push(...event.messages);
     }
   }
   flushToolResults();

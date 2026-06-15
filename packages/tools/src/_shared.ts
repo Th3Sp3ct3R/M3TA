@@ -4,6 +4,7 @@
 
 import path from "node:path";
 import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import type {
@@ -19,6 +20,18 @@ import type { ToolCallContext, EngineToolResult } from "@ares/core";
 export interface FileReadStamp {
   mtimeMs: number;
   size: number;
+  /** sha256 of the file content at Read time. The mtime/size guard races on
+   *  coarse-granularity filesystems (Windows mtime can be ~16ms); the hash is
+   *  the exact "did this change since I last saw it" check Edit/Write use. */
+  hash?: string;
+  /** Total line count at Read time, so the re-read guard can report the real
+   *  size instead of returning something indistinguishable from an empty file. */
+  lines?: number;
+}
+
+/** Cheap, stable content hash for read-stamp staleness checks. */
+export function contentHash(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
 export interface RichToolContext extends ToolCallContext {
@@ -54,6 +67,8 @@ export interface ToolResult<O> extends EngineToolResult {
   output: O;
   touchedFiles?: string[];
   display?: string;
+  /** Images for the model to see (screenshots). See EngineToolResult.images. */
+  images?: Array<{ mediaType: string; data: string }>;
 }
 
 export interface Tool<I extends z.ZodTypeAny = z.ZodTypeAny, O = unknown> {
@@ -111,6 +126,52 @@ export function buildTool<I extends z.ZodTypeAny, O>(def: ToolDef<I, O>): Tool<I
   };
 }
 
+/**
+ * Parse tool input, tolerating extra keys the model invented. Tool schemas are
+ * `.strict()`, so a single plausible-but-unknown param (e.g. `max_results` on a
+ * tool that doesn't take it) made Zod reject the WHOLE call — a dominant cause
+ * of "most tool calls failing" with models that habitually add params. We strip
+ * unrecognized keys and retry; only GENUINE validation errors (missing/typed-
+ * wrong fields) still throw, with a readable message the model can correct from.
+ */
+export function parseToolInputLenient<S extends z.ZodTypeAny>(schema: S, input: unknown, toolName: string): z.infer<S> {
+  const first = schema.safeParse(input);
+  if (first.success) return first.data;
+
+  const unknownKeyIssues = first.error.issues.filter(
+    (i): i is z.ZodIssue & { keys: string[] } => i.code === "unrecognized_keys",
+  );
+  if (unknownKeyIssues.length > 0) {
+    const stripped = stripUnknownKeys(input, unknownKeyIssues);
+    const retry = schema.safeParse(stripped);
+    if (retry.success) return retry.data;
+    return throwToolInputError(retry.error, toolName);
+  }
+  return throwToolInputError(first.error, toolName);
+}
+
+function stripUnknownKeys(input: unknown, issues: Array<{ path: (string | number)[]; keys: string[] }>): unknown {
+  if (input === null || typeof input !== "object") return input;
+  const clone: unknown = structuredClone(input);
+  for (const issue of issues) {
+    let node: unknown = clone;
+    for (const seg of issue.path) {
+      if (node && typeof node === "object") node = (node as Record<string | number, unknown>)[seg];
+    }
+    if (node && typeof node === "object") {
+      for (const key of issue.keys) delete (node as Record<string, unknown>)[key];
+    }
+  }
+  return clone;
+}
+
+function throwToolInputError(error: z.ZodError, toolName: string): never {
+  const detail = error.issues
+    .map((i) => `${i.path.length ? i.path.join(".") + ": " : ""}${i.message}`)
+    .join("; ");
+  throw new Error(`${toolName}: invalid arguments — ${detail}`);
+}
+
 export function adaptToolForEngine(
   tool: Tool<z.ZodTypeAny, unknown>,
   enrich: (base: ToolCallContext) => RichToolContext,
@@ -118,7 +179,7 @@ export function adaptToolForEngine(
   return {
     schema: tool.schema,
     async call(input, ctx) {
-      const parsed = tool.inputZod.parse(input);
+      const parsed = parseToolInputLenient(tool.inputZod, input, tool.schema.name);
       const rich = enrich(ctx);
       const decision = await tool.checkPermissions(parsed, rich);
       if (decision.kind === "deny") {
@@ -145,6 +206,7 @@ export function adaptToolForEngine(
         output: result.output,
         touchedFiles: result.touchedFiles,
         display: result.display,
+        images: result.images,
       };
     },
   };
@@ -173,6 +235,27 @@ export function describeShellActivity(rawCommand: string, background: boolean): 
   if (/(pnpm|npm|yarn)\s+(install|i|add)|cargo add/i.test(cmd)) return lead("Installing dependencies");
   const program = cmd.split(" ")[0]?.split(/[\\/]/).pop() || "command";
   return lead(`Running ${program}`);
+}
+
+/** Commands that can erase data or discard uncommitted work. */
+export function destructiveShellDecision(command: string): PermissionDecision | null {
+  const normalized = command.replace(/\s+/g, " ").trim();
+  const destructive =
+    /(?:^|[;&|]\s*)rm\s+(?:-[a-zA-Z]*[rf][a-zA-Z]*\s+)+/i.test(normalized) ||
+    /(?:^|[;&|]\s*)(?:rmdir|unlink|shred)\b/i.test(normalized) ||
+    /\bgit\s+(?:reset\s+--hard|clean\s+-[a-zA-Z]*f|checkout\s+--)\b/i.test(normalized) ||
+    /\b(?:mkfs(?:\.\w+)?|wipefs|format)\b/i.test(normalized) ||
+    /\bRemove-Item\b/i.test(normalized) ||
+    /(?:^|[;|]\s*)(?:del|erase|rd|rmdir)\s+(?:\/[a-z]+\s+)*/i.test(normalized) ||
+    /\b(?:Clear-Disk|Format-Volume|Remove-Partition)\b/i.test(normalized);
+
+  return destructive
+    ? {
+        kind: "ask",
+        prompt: "This shell command can delete data or discard uncommitted work.",
+        suggestion: "deny",
+      }
+    : null;
 }
 
 function defaultPermissionDecision<I extends z.ZodTypeAny, O>(

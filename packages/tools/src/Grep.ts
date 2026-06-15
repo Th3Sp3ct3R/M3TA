@@ -45,6 +45,8 @@ export interface GrepMatch {
   path: string;
   line: number;
   text: string;
+  /** True for -B/-A context lines (not a match itself). */
+  context?: boolean;
 }
 
 export interface GrepOutput {
@@ -139,6 +141,19 @@ async function tryRipgrep(
           if (i.output_mode === "content" && matches.length < i.max_results) {
             matches.push({ path: p, line: lineNum, text: text.replace(/\n$/, "") });
           }
+        } else if (
+          event.type === "context" &&
+          i.output_mode === "content" &&
+          (i.context_before > 0 || i.context_after > 0) &&
+          matches.length < i.max_results
+        ) {
+          // rg emits "context" events for -B/-A lines, in stream order around
+          // their match. Interleave them so the model gets the surrounding code
+          // it asked for, without counting them as matches.
+          const p = event.data?.path?.text;
+          const text = event.data?.lines?.text ?? "";
+          const lineNum = event.data?.line_number ?? 0;
+          if (p) matches.push({ path: p, line: lineNum, text: text.replace(/\n$/, ""), context: true });
         }
       }
     });
@@ -180,14 +195,24 @@ async function nativeGrep(
   const files = new Set<string>();
   const counts: Record<string, number> = {};
   let total = 0;
+  // Mirror the rg path (which uses --hidden minus DEFAULT_IGNORE_GLOBS): walk
+  // dot-dirs like .github/workflows, but skip the heavy/state ones explicitly
+  // so the JS fallback and ripgrep return the SAME result set.
   const ignoreDirs = new Set([
     "node_modules",
     ".git",
+    ".ares",
+    ".crix",
     "dist",
     "build",
     "target",
     ".next",
     ".pnpm-store",
+    ".turbo",
+    ".cache",
+    ".venv",
+    "venv",
+    "coverage",
   ]);
 
   async function walk(dir: string): Promise<void> {
@@ -200,7 +225,7 @@ async function nativeGrep(
     for (const e of entries) {
       const abs = path.join(dir, e.name);
       if (e.isDirectory()) {
-        if (ignoreDirs.has(e.name) || e.name.startsWith(".")) continue;
+        if (ignoreDirs.has(e.name)) continue;
         await walk(abs);
       } else if (e.isFile()) {
         if (!matchesAnyGlob(abs, roots, i.glob)) continue;

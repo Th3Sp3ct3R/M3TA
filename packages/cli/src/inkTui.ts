@@ -1134,7 +1134,7 @@ function pulseColor(p: Pulse, theme: DeckTheme): string {
 
 function cachePercent(usage: Usage): string {
   const cached = usage.cacheReadTokens ?? 0;
-  const denom = usage.inputTokens + cached;
+  const denom = usage.inputTokens;
   if (denom <= 0) return "0%";
   return `${Math.round((cached / denom) * 100)}%`;
 }

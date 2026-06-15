@@ -1,6 +1,6 @@
-# Crix Voice Service
+# Ares Voice Service
 
-Local WebSocket sidecar for low-latency spoken replies in the Crix desktop app.
+Local WebSocket sidecar for low-latency spoken replies in the Ares desktop app.
 
 The engine is **Kokoro-82M** — a small, fast, high-quality local TTS that runs
 comfortably faster than real time (RTF ~0.03 on GPU, ~real-time on CPU), which is
@@ -11,9 +11,9 @@ what makes streamed spoken replies feel instant. First-audio latency is ~250ms.
 Use a clean Python 3.12 environment.
 
 ```powershell
-cd D:\Crix
-python -m venv .crix\voice-venv
-.\.crix\voice-venv\Scripts\Activate.ps1
+cd D:\Ares
+python -m venv .ares\voice-venv
+.\.ares\voice-venv\Scripts\Activate.ps1
 pip install -r voice_service\requirements.txt
 ```
 
@@ -48,11 +48,11 @@ pnpm voice:tts -- --engine mock
 
 ## Configuration
 
-All flags have `CRIX_TTS_*` environment-variable equivalents:
+All flags have `ARES_TTS_*` environment-variable equivalents (legacy `ARES_TTS_*` still honored):
 
-- `--engine` / `CRIX_TTS_ENGINE` (`kokoro` | `mock`, default `kokoro`)
-- `--voice` / `CRIX_TTS_VOICE` (default `af_heart`)
-- `--lang` / `CRIX_TTS_LANG` (default `a`)
-- `--speed` / `CRIX_TTS_SPEED` (speaking rate, default `1.15`; 1.0 = normal)
-- `--device` / `CRIX_TTS_DEVICE` (default `cuda:0`)
-- `--port` / `CRIX_TTS_PORT` (default `8765`)
+- `--engine` / `ARES_TTS_ENGINE` (`kokoro` | `mock`, default `kokoro`)
+- `--voice` / `ARES_TTS_VOICE` (default `af_heart`)
+- `--lang` / `ARES_TTS_LANG` (default `a`)
+- `--speed` / `ARES_TTS_SPEED` (speaking rate, default `1.15`; 1.0 = normal)
+- `--device` / `ARES_TTS_DEVICE` (default `cuda:0`)
+- `--port` / `ARES_TTS_PORT` (default `8765`)
