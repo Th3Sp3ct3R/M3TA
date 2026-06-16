@@ -49,6 +49,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # tauri-build embeds the frontend (frontendDist: ../dist) at compile time,
+      # so the web bundle must exist before cargo build. This is the vite build
+      # only — the NSIS installer and the heavy runtime bundle are NOT built here.
+      - name: Build web frontend
+        run: pnpm --filter ares-tauri build:web
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 

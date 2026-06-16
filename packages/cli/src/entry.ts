@@ -5731,7 +5731,7 @@ async function telegramCommand(args: ParsedArgs): Promise<number> {
     api,
     gateway: { url: gatewayUrl, token: gatewayToken },
     allowedChatIds,
-    log: (line) => process.stdout.write(`telegram: ${line}\n`),
+    log: (line: string) => process.stdout.write(`telegram: ${line}\n`),
   });
   bridge.start();
 

@@ -15,7 +15,8 @@
     { "path": "../effects" },
     { "path": "../connectors" },
     { "path": "../mind" },
-    { "path": "../garrison" }
+    { "path": "../garrison" },
+    { "path": "../channels" }
   ],
   "include": ["src/**/*.ts"]
 }
