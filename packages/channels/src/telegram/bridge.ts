@@ -232,7 +232,7 @@ export class TelegramBridge {
     if (this.commands) {
       const command = parseTelegramCommand(text);
       if (command) {
-        this.runCommand(chatId, command);
+        this.runCommand(chatId, command.kind, command.arg);
         return;
       }
     }
@@ -247,13 +247,13 @@ export class TelegramBridge {
     if (this.connected) this.requestSession(chatId);
   }
 
-  private runCommand(chatId: number, command: ReturnType<typeof parseTelegramCommand> & string): void {
+  private runCommand(chatId: number, kind: NonNullable<ReturnType<typeof parseTelegramCommand>>["kind"], arg?: string): void {
     this.enqueueSend(chatId, async () => {
       let result;
       try {
-        result = await handleTelegramCommand(command, this.commands);
+        result = await handleTelegramCommand(kind, this.commands, arg);
       } catch (err) {
-        this.log(`command ${command} failed: ${errText(err)}`);
+        this.log(`command ${kind} failed: ${errText(err)}`);
         await this.api.sendMessage(chatId, "Command failed.");
         return;
       }

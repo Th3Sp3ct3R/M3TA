@@ -26,13 +26,17 @@ import {
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 test("parser: recognizes slash and bare one-word commands", () => {
-  assert.equal(parseTelegramCommand("/status"), "status");
-  assert.equal(parseTelegramCommand("status"), "status");
-  assert.equal(parseTelegramCommand("/status@ares_bot"), "status");
-  assert.equal(parseTelegramCommand("/war_map"), "war_map");
-  assert.equal(parseTelegramCommand("/run_next"), "run_next");
-  assert.equal(parseTelegramCommand("PAUSE"), "pause");
-  assert.equal(parseTelegramCommand("/help"), "help");
+  const kind = (t) => parseTelegramCommand(t)?.kind ?? null;
+  assert.equal(kind("/status"), "status");
+  assert.equal(kind("status"), "status");
+  assert.equal(kind("/status@ares_bot"), "status");
+  assert.equal(kind("/war_map"), "war_map");
+  assert.equal(kind("/run_next"), "run_next");
+  assert.equal(kind("PAUSE"), "pause");
+  assert.equal(kind("/help"), "help");
+  // arg capture for the orchestration verbs
+  assert.deepEqual(parseTelegramCommand("/run_next approve"), { kind: "run_next", arg: "approve" });
+  assert.deepEqual(parseTelegramCommand("/cancel abc123"), { kind: "cancel", arg: "abc123" });
 });
 
 test("parser: unknown / multi-word / chat text falls through (null)", () => {
@@ -81,18 +85,17 @@ test("/next and /summary surface nextActions and recentWins", async () => {
 // ── /run_next is dry-run only ─────────────────────────────────────────────────
 
 test("/run_next is DRY-RUN: shows the move + why, never executes", async () => {
-  let executed = false;
+  let authorized = false;
   const r = await handleTelegramCommand("run_next", {
-    state: sampleState,
-    runNextDryRun: () => { /* still just returns a proposal */ return { action: "wire telegram commands", why: "top of the war map" }; },
-    control: () => { executed = true; }, // must NOT be called
+    proposeNext: () => ({ id: "tg-x", action: "wire telegram commands", why: "top of the war map", planningOnly: false }),
+    authorizeMission: () => { authorized = true; return { id: "tg-x", created: true }; }, // must NOT be called on a bare /run_next
   });
   assert.match(r.text, /dry-run/i);
   assert.match(r.text, /Action: wire telegram commands/);
   assert.match(r.text, /Why: top of the war map/);
-  assert.match(r.text, /[Nn]ot executed/);
+  assert.match(r.text, /approve to queue/);
   assert.equal(r.control, undefined, "run_next emits NO control action");
-  assert.equal(executed, false, "nothing was run");
+  assert.equal(authorized, false, "no mission created without explicit approve");
 });
 
 // ── Control commands emit the intended action ─────────────────────────────────

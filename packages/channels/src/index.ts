@@ -34,12 +34,20 @@ export type {
   WarMapBriefing,
 } from "./telegram/operatorReport.js";
 
-export { parseTelegramCommand, handleTelegramCommand } from "./telegram/commands.js";
+export {
+  parseTelegramCommand,
+  handleTelegramCommand,
+  classifyMissionAction,
+  stableHash,
+} from "./telegram/commands.js";
 export type {
+  TelegramCommand,
   TelegramCommandKind,
   TelegramCommandState,
   TelegramCommandDeps,
   TelegramCommandResult,
+  MissionProposal,
+  MissionSummary,
 } from "./telegram/commands.js";
 
 export type {

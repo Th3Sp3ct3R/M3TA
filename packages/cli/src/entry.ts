@@ -232,7 +232,7 @@ import {
 } from "@ares/operator";
 import { bridgeLegacyEnv, buildForegroundReminder, classifyUserIntent, diagnoseMemory, MemoryStore, mindPaths, reflectOnRun, detectWorkspaceProjectId, loadProjectState, loadMissionState, loadRecentAfterActions, type MemoryKind } from "@ares/mind";
 import { SessionManager, GarrisonServer, Scheduler, ApprovalQueue, tokenPath, DEFAULT_GARRISON_PORT, type GatewayServerFrame } from "@ares/garrison";
-import { TelegramApi, TelegramBridge, OperatorTelegramReporter, formatWarMapBriefing } from "@ares/channels";
+import { TelegramApi, TelegramBridge, OperatorTelegramReporter, formatWarMapBriefing, classifyMissionAction, stableHash } from "@ares/channels";
 import { buildHolotableHtml, MECH_SPEC, ROBOT_ARM_SPEC, type HoloSpec } from "./holotable.js";
 import {
   Filmstrip,
@@ -5889,10 +5889,40 @@ async function telegramCommand(args: ParsedArgs): Promise<number> {
         if (action === "resume") await setOperatorControl({ paused: false }, context.home);
         else await setOperatorControl({ paused: true }, context.home); // pause + stop both park the loop
       },
-      runNextDryRun: async () => {
+      // Level-3 orchestration: /run_next proposes (dry-run); /run_next approve
+      // QUEUES an operator goal (never runs tools directly); the operator loop
+      // executes it under its own safety gates. Risky actions are downgraded to
+      // planning-only here, and outward/irreversible steps still hit the approval
+      // gate at execution time. Telegram authorizes; the operator executes.
+      proposeNext: async () => {
         const projectId = await detectWorkspaceProjectId(context.workspace).catch(() => undefined);
         const project = projectId ? await loadProjectState(projectId, context.home).catch(() => null) : null;
-        return { action: project?.nextActions?.[0] ?? "(no next action queued)", why: "top of the project war map's nextActions" };
+        const action = project?.nextActions?.[0] ?? "(no next action queued)";
+        const { planningOnly } = classifyMissionAction(action);
+        return { id: `tg-${stableHash(`${projectId ?? ""}:${action}`)}`, action, why: "top of the project war map's nextActions", planningOnly };
+      },
+      authorizeMission: async (p) => {
+        const existing = await loadGoal(context.home, p.id).catch(() => null);
+        if (existing) return { id: p.id, created: false }; // idempotent — no duplicate
+        const statement = p.planningOnly
+          ? `Plan ONLY — do NOT execute. Investigate and propose changes for the owner's approval: ${p.action}`
+          : p.action;
+        await saveGoal(context.home, createGoal({ id: p.id, statement }));
+        return { id: p.id, created: true };
+      },
+      listMissions: async () => {
+        const goals = await listGoals(context.home).catch(() => []);
+        return goals.slice(0, 20).map((g) => ({ id: g.id, statement: g.statement, status: g.status, progress: g.progress }));
+      },
+      getMission: async (id) => {
+        const g = await loadGoal(context.home, id).catch(() => null);
+        return g ? { id: g.id, statement: g.statement, status: g.status, progress: g.progress } : null;
+      },
+      cancelMission: async (id) => {
+        const g = await loadGoal(context.home, id).catch(() => null);
+        if (!g || g.status === "done" || g.status === "abandoned") return false;
+        await saveGoal(context.home, { ...g, status: "abandoned", updatedAt: new Date().toISOString() });
+        return true;
       },
     },
   });
