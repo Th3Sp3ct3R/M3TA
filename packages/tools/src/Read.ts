@@ -61,9 +61,11 @@ export const ReadTool = buildTool({
     if (prior && wholeFile && prior.mtimeMs === stat.mtimeMs && prior.size === stat.size) {
       // The model-visible content MUST NOT look like an empty file, or a model
       // that re-reads because it lost track will edit/rewrite blind. Put the
-      // explanation in `content` itself and report the real line count.
+      // explanation in `content` itself, report the real line count, and cite the
+      // tracked hash so the model can tell this is the SAME bytes it already has.
       const priorTotal = prior.lines ?? 0;
-      const note = `<system>File "${path.basename(filePath)}" (${priorTotal} lines) is unchanged on disk and already in your context this session — its full contents are above. Work from what you already have, or pass offset/limit to re-fetch a specific range.</system>`;
+      const hashTag = prior.hash ? ` [sha256:${prior.hash.slice(0, 12)}]` : "";
+      const note = `<system>File "${path.basename(filePath)}" (${priorTotal} lines${hashTag}) is unchanged on disk and already in your context this session — its full contents are above. Work from what you already have, or pass offset/limit to re-fetch a specific range.</system>`;
       return {
         output: {
           path: filePath,
@@ -78,6 +80,25 @@ export const ReadTool = buildTool({
     }
 
     const raw = await fs.readFile(filePath, "utf8");
+
+    // A genuinely empty file: say so explicitly. Returning "" (or a lone blank
+    // cat -n line) is indistinguishable from "content omitted" and invites a
+    // blind rewrite. Still record the read stamp so Write's read-before-write is
+    // satisfied for filling the file in.
+    if (raw === "") {
+      ctx.fileReadStamps.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, hash: contentHash(raw), lines: 0 });
+      return {
+        output: {
+          path: filePath,
+          totalLines: 0,
+          startLine: 0,
+          endLine: 0,
+          content: `<system>File "${path.basename(filePath)}" is empty (0 bytes). Use Write to add contents.</system>`,
+          truncated: false,
+        },
+        display: `Read ${filePath} (empty file)`,
+      };
+    }
     // Strip \r so CRLF files present clean lines — the model can't see (or
     // reproduce) a trailing \r, and Edit matches in EOL-normalized space.
     const lines = raw.split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
