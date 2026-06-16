@@ -11,7 +11,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, UNIX_EPOCH},
@@ -276,20 +276,26 @@ fn start_daemon(
         *child_state = Some(child);
     }
 
-    spawn_output_reader(
+    // stdout (the content stream) flows through the coalescer so rapid token
+    // deltas become a few IPC pushes instead of hundreds. stderr is low-volume
+    // diagnostics — it goes straight to the buffer.
+    let coalescer = spawn_event_coalescer(
         app.clone(),
-        stdout,
-        false,
         state.events.clone(),
         state.next_event_seq.clone(),
     );
-    spawn_output_reader(
-        app.clone(),
-        stderr,
-        true,
-        state.events.clone(),
-        state.next_event_seq.clone(),
-    );
+    let stdout_sink: EventSink = Arc::new(move |value| {
+        let _ = coalescer.send(value);
+    });
+    spawn_output_reader(stdout, false, stdout_sink);
+
+    let stderr_app = app.clone();
+    let stderr_events = state.events.clone();
+    let stderr_seq = state.next_event_seq.clone();
+    let stderr_sink: EventSink = Arc::new(move |value| {
+        push_event_parts(&stderr_app, &stderr_events, &stderr_seq, value);
+    });
+    spawn_output_reader(stderr, true, stderr_sink);
     spawn_exit_watcher(
         app.clone(),
         state.child.clone(),
@@ -865,10 +871,7 @@ fn push_event_parts(
     event: Value,
 ) {
     let seq = next_event_seq.fetch_add(1, Ordering::SeqCst);
-    let buffered = BufferedEvent {
-        seq,
-        event: event.clone(),
-    };
+    let buffered = BufferedEvent { seq, event };
     if let Ok(mut buffer) = events.lock() {
         buffer.push(buffered.clone());
         let extra = buffer.len().saturating_sub(1200);
@@ -876,17 +879,17 @@ fn push_event_parts(
             buffer.drain(0..extra);
         }
     }
+    // The webview listens ONLY to ares:event-buffered (seq carries ordering +
+    // catch-up). The old plain ares:event emit had zero listeners — dead, dropped.
     let _ = app.emit("ares:event-buffered", buffered);
-    let _ = app.emit("ares:event", event);
 }
 
-fn spawn_output_reader<R>(
-    app: tauri::AppHandle,
-    reader: R,
-    stderr: bool,
-    events: Arc<Mutex<Vec<BufferedEvent>>>,
-    next_event_seq: Arc<AtomicU64>,
-) where
+/// Where a reader thread hands each parsed event. stdout routes through the
+/// coalescer; stderr goes straight to push_event_parts.
+type EventSink = Arc<dyn Fn(Value) + Send + Sync + 'static>;
+
+fn spawn_output_reader<R>(reader: R, stderr: bool, sink: EventSink)
+where
     R: std::io::Read + Send + 'static,
 {
     thread::spawn(move || {
@@ -895,35 +898,123 @@ fn spawn_output_reader<R>(
                 break;
             };
             if stderr {
-                push_event_parts(
-                    &app,
-                    &events,
-                    &next_event_seq,
-                    json!({ "type": "daemon_stderr", "text": line }),
-                );
+                sink(json!({ "type": "daemon_stderr", "text": line }));
                 continue;
             }
             match serde_json::from_str::<serde_json::Value>(&line) {
-                Ok(value) => {
-                    push_event_parts(&app, &events, &next_event_seq, value);
+                Ok(value) => sink(value),
+                Err(_) => sink(json!({ "type": "daemon_stdout", "text": line })),
+            }
+        }
+        sink(json!({ "type": "desktop_daemon_stream_closed" }));
+    });
+}
+
+/// Accumulated run of same-kind streaming deltas awaiting a single flush.
+struct PendingDelta {
+    kind: &'static str,
+    session: Option<String>,
+    text: String,
+}
+
+/// Which streaming event types may be merged (both carry a `text` field that the
+/// webview simply appends). A signatured thinking_delta is NOT merged — its
+/// signature must reach the UI intact — so it's handled at the call site.
+fn coalescible_kind(value: &Value) -> Option<&'static str> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("text_delta") => Some("text_delta"),
+        Some("thinking_delta") => Some("thinking_delta"),
+        _ => None,
+    }
+}
+
+fn flush_pending(
+    app: &tauri::AppHandle,
+    events: &Arc<Mutex<Vec<BufferedEvent>>>,
+    next_event_seq: &Arc<AtomicU64>,
+    pending: Option<PendingDelta>,
+) {
+    let Some(p) = pending else { return };
+    if p.text.is_empty() {
+        return;
+    }
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), Value::String(p.kind.to_string()));
+    obj.insert("text".into(), Value::String(p.text));
+    if let Some(sid) = p.session {
+        obj.insert("sessionId".into(), Value::String(sid));
+    }
+    push_event_parts(app, events, next_event_seq, Value::Object(obj));
+}
+
+/// Coalesce rapid streaming deltas into one buffered/emitted event so a fast
+/// token burst becomes a handful of IPC pushes instead of hundreds. Runs of the
+/// same (type, session) accumulate until a different event arrives, the size cap
+/// is hit, or a short idle window elapses — then flush as a single delta. Order
+/// is preserved: any non-delta (or a differing delta) flushes the pending run
+/// first. Returns the Sender the stdout reader pushes parsed events into.
+fn spawn_event_coalescer(
+    app: tauri::AppHandle,
+    events: Arc<Mutex<Vec<BufferedEvent>>>,
+    next_event_seq: Arc<AtomicU64>,
+) -> mpsc::Sender<Value> {
+    const FLUSH_AFTER: Duration = Duration::from_millis(24);
+    const MAX_BYTES: usize = 4096;
+    let (tx, rx) = mpsc::channel::<Value>();
+    thread::spawn(move || {
+        let mut pending: Option<PendingDelta> = None;
+        loop {
+            match rx.recv_timeout(FLUSH_AFTER) {
+                Ok(value) => match coalescible_kind(&value) {
+                    Some(kind) => {
+                        let session = value
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let text = value.get("text").and_then(Value::as_str).unwrap_or("");
+                        let signatured = value.get("signature").is_some();
+                        let mergeable = !signatured
+                            && pending
+                                .as_ref()
+                                .is_some_and(|p| p.kind == kind && p.session == session);
+                        if mergeable {
+                            let p = pending.as_mut().unwrap();
+                            p.text.push_str(text);
+                            if p.text.len() >= MAX_BYTES {
+                                flush_pending(&app, &events, &next_event_seq, pending.take());
+                            }
+                        } else {
+                            // Type/session change, or a signatured delta: flush the
+                            // current run first to preserve order.
+                            flush_pending(&app, &events, &next_event_seq, pending.take());
+                            if signatured {
+                                push_event_parts(&app, &events, &next_event_seq, value);
+                            } else {
+                                pending = Some(PendingDelta {
+                                    kind,
+                                    session,
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    None => {
+                        // A non-delta event flushes any pending deltas before it.
+                        flush_pending(&app, &events, &next_event_seq, pending.take());
+                        push_event_parts(&app, &events, &next_event_seq, value);
+                    }
+                },
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    flush_pending(&app, &events, &next_event_seq, pending.take());
                 }
-                Err(_) => {
-                    push_event_parts(
-                        &app,
-                        &events,
-                        &next_event_seq,
-                        json!({ "type": "daemon_stdout", "text": line }),
-                    );
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    flush_pending(&app, &events, &next_event_seq, pending.take());
+                    break;
                 }
             }
         }
-        push_event_parts(
-            &app,
-            &events,
-            &next_event_seq,
-            json!({ "type": "desktop_daemon_stream_closed" }),
-        );
     });
+    tx
 }
 
 fn discover_ollama_models() -> OllamaDiscovery {
