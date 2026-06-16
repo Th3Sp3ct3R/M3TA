@@ -67,6 +67,17 @@ jobs:
       - name: Build web frontend
         run: pnpm --filter ares-tauri build:web
 
+      # tauri-build validates that the bundle's `runtime/` resource path exists at
+      # compile time. The real runtime (bundled node + Playwright) is produced by
+      # `build:runtime` at packaging time, which we deliberately skip in CI — a
+      # one-file stub satisfies the existence check so cargo build can prove the
+      # shell compiles.
+      - name: Stub the runtime resource dir
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force tauri/src-tauri/runtime | Out-Null
+          Set-Content tauri/src-tauri/runtime/.ci-placeholder "stub; real runtime is built by build:runtime at packaging time"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
