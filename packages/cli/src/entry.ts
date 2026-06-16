@@ -227,7 +227,7 @@ import {
   type EvalTask,
   type VerificationSpec,
 } from "@ares/operator";
-import { bridgeLegacyEnv, buildForegroundReminder, classifyUserIntent, diagnoseMemory, MemoryStore, mindPaths, type MemoryKind } from "@ares/mind";
+import { bridgeLegacyEnv, buildForegroundReminder, classifyUserIntent, diagnoseMemory, MemoryStore, mindPaths, reflectOnRun, detectWorkspaceProjectId, type MemoryKind } from "@ares/mind";
 import { SessionManager, GarrisonServer, Scheduler, ApprovalQueue, tokenPath, DEFAULT_GARRISON_PORT, type GatewayServerFrame } from "@ares/garrison";
 import { TelegramApi, TelegramBridge } from "@ares/channels";
 import { buildHolotableHtml, MECH_SPEC, ROBOT_ARM_SPEC, type HoloSpec } from "./holotable.js";
@@ -2538,6 +2538,35 @@ async function daemonCommand(args: ParsedArgs): Promise<number> {
     process.stdout.write(JSON.stringify(payload) + "\n");
   };
 
+  // After-action reflection trigger: when a turn lands a NEW commit, summarize it
+  // into the war map. Seed with the current HEAD so existing history isn't
+  // re-reflected; reflectOnRun dedupes by SHA so a re-fire is a no-op. Disable
+  // with ARES_REFLECT=0. Entirely best-effort — it never touches the turn.
+  let lastReflectedSha = (await gatherGitRunFacts(live.context.workspace).catch(() => null))?.sha;
+  const reflectAfterTurn = async (goal: string): Promise<void> => {
+    if (process.env.ARES_REFLECT === "0") return;
+    const facts = await gatherGitRunFacts(live.context.workspace).catch(() => null);
+    if (!facts || facts.sha === lastReflectedSha) return; // no new commit this turn
+    lastReflectedSha = facts.sha;
+    const projectId = await detectWorkspaceProjectId(live.context.workspace).catch(() => undefined);
+    const out = await reflectOnRun(
+      {
+        workspace: live.context.workspace,
+        projectId,
+        task: facts.subject || goal.slice(0, 120),
+        result: "success",
+        summary: facts.subject || `commit ${facts.sha.slice(0, 8)}`,
+        commits: [facts.sha.slice(0, 10)],
+        changedFiles: facts.changedFiles,
+        sourcePointers: [facts.sha],
+      },
+      live.context.home,
+    ).catch(() => null);
+    if (out?.recorded) {
+      tagEmit(undefined, { type: "lifecycle", event: { kind: "after_action", commit: facts.sha.slice(0, 10), task: facts.subject } });
+    }
+  };
+
   const resolveEntry = async (sessionId: string | undefined): Promise<DaemonEntry> => {
     const sid = sessionId || DEFAULT_SID;
     if (sid === DEFAULT_SID) return primaryEntry;
@@ -3007,6 +3036,9 @@ async function daemonCommand(args: ParsedArgs): Promise<number> {
             }
           }
           await finishTurn(entry.live, turnState.status);
+          // A completed turn may have landed a commit — reflect it into the war
+          // map. Fire-and-forget; reflection never delays or breaks the turn.
+          if (turnState.status === "completed") void reflectAfterTurn(goal).catch(() => {});
         } catch (err) {
           tagEmit(command.sessionId, { type: "error", error: { code: "turn_throw", message: err instanceof Error ? err.message : String(err), retriable: false } });
           tagEmit(command.sessionId, { type: "turn_end", status: "failed", usage: {}, durationMs: 0 });
@@ -4370,6 +4402,33 @@ const LIVE_MEMORY_BLOCK_CHARS = 2_400;
  * tool calls rediscovering the project every session (the way Claude Code does).
  * Best-effort and cheap; silent when the cwd isn't a git repo.
  */
+function gitRun(cwd: string, args: string[]): Promise<string> {
+  return new Promise((resolve) => {
+    const child = spawn("git", args, { cwd, windowsHide: true });
+    let out = "";
+    child.stdout?.on("data", (b: Buffer) => (out += b.toString("utf8")));
+    child.on("error", () => resolve(""));
+    child.on("close", () => resolve(out.trim()));
+    setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        /* ignore */
+      }
+    }, 3000);
+  });
+}
+
+/** Facts about the current HEAD commit for the after-action reflection trigger. */
+async function gatherGitRunFacts(workspace: string): Promise<{ sha: string; subject: string; changedFiles: string[] } | null> {
+  const sha = await gitRun(workspace, ["rev-parse", "HEAD"]);
+  if (!sha) return null; // not a git repo / no commits
+  const subject = await gitRun(workspace, ["log", "-1", "--format=%s"]);
+  const filesRaw = await gitRun(workspace, ["show", "--name-only", "--format=", "HEAD"]);
+  const changedFiles = filesRaw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(0, 50);
+  return { sha, subject, changedFiles };
+}
+
 async function loadGitContext(context: CliRuntimeContext): Promise<string> {
   const cwd = context.workspace;
   const run = (args: string[]): Promise<string> =>

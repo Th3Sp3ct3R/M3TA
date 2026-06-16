@@ -14,7 +14,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { writeFileAtomic } from "../io.js";
-import { stateDir, safeProjectId, loadProjectState, saveProjectState, type ProjectState } from "./missionState.js";
+import { stateDir, safeProjectId, inferProjectId, loadProjectState, saveProjectState, type ProjectState } from "./missionState.js";
 import type { MemoryFragment } from "./contextCompiler.js";
 
 export const AFTER_ACTION_SCHEMA = 1;
@@ -171,6 +171,88 @@ export async function recordAfterAction(
   const updated = applyAfterActionToProjectState(project, saved);
   await saveProjectState(updated, home);
   return { record: saved, project: updated };
+}
+
+// ─── Deterministic session summarizer + live trigger ────────────────────────
+
+/** Known facts about a finished run — gathered by the caller (git, the gate),
+ *  NOT a transcript. The summarizer extracts a record from these, no model. */
+export interface RunFacts {
+  workspace?: string;
+  projectId?: string;
+  repo?: string;
+  /** What the run was about (a goal, or the commit subject). */
+  task?: string;
+  result?: AfterActionResult;
+  summary?: string;
+  commits?: string[];
+  changedFiles?: string[];
+  tests?: string[];
+  ciStatus?: string;
+  lessons?: string[];
+  risks?: string[];
+  nextActions?: string[];
+  sourcePointers?: string[];
+  timestamp?: string;
+}
+
+const clip = (s: string, n: number): string => (s.length <= n ? s : `${s.slice(0, n - 1).trimEnd()}…`);
+
+/**
+ * Build a compact after-action record from KNOWN FACTS — deterministic, no model
+ * (so memory gets "commit 55b8ebd2 added after-action records, 615/615, CI green",
+ * never "the warrior conquered the TypeScript dragon"). A model-based summarizer
+ * can produce richer RunFacts later; this is the floor.
+ */
+export function summarizeRun(facts: RunFacts): AfterActionRecord {
+  const result: AfterActionResult = facts.result ?? (facts.commits?.length ? "success" : "partial");
+  const task = clip((facts.task ?? facts.summary ?? "work").trim(), 120) || "work";
+  const summary = clip((facts.summary ?? task).trim(), 200);
+  const changed = facts.changedFiles ?? [];
+  const importantChanges = changed.length
+    ? [`changed ${changed.length} file(s): ${changed.slice(0, 6).join(", ")}${changed.length > 6 ? ", …" : ""}`]
+    : undefined;
+  const pointers = capList([...(facts.sourcePointers ?? []), ...(facts.commits ?? [])], 8);
+  return {
+    schemaVersion: AFTER_ACTION_SCHEMA,
+    timestamp: facts.timestamp ?? new Date().toISOString(),
+    projectId: safeProjectId(facts.projectId ?? inferProjectId({ repo: facts.repo, path: facts.workspace })),
+    task,
+    result,
+    summary,
+    importantChanges,
+    commits: facts.commits?.length ? facts.commits : undefined,
+    tests: facts.tests?.length ? facts.tests : undefined,
+    ciStatus: facts.ciStatus,
+    lessons: facts.lessons?.length ? facts.lessons : undefined,
+    risks: facts.risks?.length ? facts.risks : undefined,
+    nextActions: facts.nextActions?.length ? facts.nextActions : undefined,
+    sourcePointers: pointers.length ? pointers : undefined,
+  };
+}
+
+export interface ReflectOutcome {
+  recorded: boolean;
+  record?: AfterActionRecord;
+  project?: ProjectState;
+  /** Why nothing new was written, when recorded === false. */
+  skipped?: "duplicate";
+}
+
+/**
+ * The live trigger: summarize a finished run and fold it in — but never twice for
+ * the same commit (a re-fired trigger is a no-op, not duplicate sludge). Returns
+ * what happened so a caller can log it; throws nothing it can avoid.
+ */
+export async function reflectOnRun(facts: RunFacts, home?: string): Promise<ReflectOutcome> {
+  const record = summarizeRun(facts);
+  const sha = record.commits?.[0];
+  if (sha) {
+    const recent = await loadRecentAfterActions(record.projectId, 50, home).catch(() => []);
+    if (recent.some((r) => r.commits?.includes(sha))) return { recorded: false, skipped: "duplicate" };
+  }
+  const { record: saved, project } = await recordAfterAction(record, home);
+  return { recorded: true, record: saved, project };
 }
 
 // ─── Render (compact; receipts kept, logs never) ─────────────────────────────

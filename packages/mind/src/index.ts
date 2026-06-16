@@ -63,10 +63,14 @@ export {
   applyAfterActionToProjectState,
   recordAfterAction,
   renderAfterActionFragment,
+  summarizeRun,
+  reflectOnRun,
   afterActionDir,
   AFTER_ACTION_SCHEMA,
   type AfterActionRecord,
   type AfterActionResult,
+  type RunFacts,
+  type ReflectOutcome,
 } from "./memory/afterAction.js";
 export {
   mindPaths,

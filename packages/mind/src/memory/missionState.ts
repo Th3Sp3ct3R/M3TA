@@ -84,11 +84,14 @@ export function inferProjectId(opts: { repo?: string; path?: string }): string {
   return "project";
 }
 
-/** Best-effort: read the workspace's git remote and infer a project id from it. */
+/** Best-effort: read the workspace's git remote and infer a project id from it.
+ *  Prefers the `origin` remote over any other (e.g. a renamed old remote), so a
+ *  repo that was re-homed reports its CURRENT identity, not a leftover one. */
 export async function detectWorkspaceProjectId(workspace: string): Promise<string | undefined> {
   try {
     const cfg = await fs.readFile(path.join(workspace, ".git", "config"), "utf8");
-    const url = /url\s*=\s*(\S+)/i.exec(cfg)?.[1];
+    const originUrl = /\[remote "origin"\][^[]*?url\s*=\s*(\S+)/i.exec(cfg)?.[1];
+    const url = originUrl ?? /url\s*=\s*(\S+)/i.exec(cfg)?.[1];
     if (url) return inferProjectId({ repo: url });
   } catch {
     // no git / unreadable — fall through
