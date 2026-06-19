@@ -106,7 +106,7 @@ const MAX_FILE_BYTES = 256 * 1024;
 
 export const CodebaseSearchTool = buildTool({
   name: "CodebaseSearch",
-  description: `Semantic-ish search over the workspace. Returns the most relevant code chunks for a natural-language question.
+  description: `Ranked KEYWORD search over the workspace (token/TF-IDF overlap, NOT true semantic search — it has no embeddings, so it can miss synonyms, e.g. searching "auth failure" may not surface "401" or "rejectUnauthorized"). Returns the most keyword-relevant code chunks for a question. For exact strings or symbol names, prefer Grep.
 
 WHEN TO USE:
 - "How does X work?" / "Where is Y handled?" / "Show me Z usage"

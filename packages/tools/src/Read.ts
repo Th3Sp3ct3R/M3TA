@@ -114,6 +114,13 @@ export const ReadTool = buildTool({
       })
       .join("\n");
 
+    // Self-correcting output: when the view is partial, the result text itself
+    // tells the model exactly how to fetch the rest (Pi's "the error is the fix").
+    const truncated = end < total;
+    const content = truncated
+      ? `${formatted}\n\n[Read stopped at line ${end} of ${total}. Use offset=${end}${i.limit !== undefined ? ` limit=${i.limit}` : ""} to continue.]`
+      : formatted;
+
     ctx.fileReadStamps.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, hash: contentHash(raw), lines: total });
 
     return {
@@ -122,8 +129,8 @@ export const ReadTool = buildTool({
         totalLines: total,
         startLine: start + 1,
         endLine: end,
-        content: formatted,
-        truncated: end < total,
+        content,
+        truncated,
       },
       display: `Read ${filePath} (${slice.length}/${total} lines)`,
     };

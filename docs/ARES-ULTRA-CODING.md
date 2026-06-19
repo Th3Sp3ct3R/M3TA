@@ -139,5 +139,16 @@ images to the text-only DeepSeek endpoint.
   tool → file created → completed in 4.4s**, with `cacheReadTokens: 26752` (DeepSeek server-side KV
   cache hit). Tests: `tests/c3-deepseek-dialect` (echo + negative-anthropic-drops + no-cache-control +
   no-budget-inflation). Suite 777 tests, 775 pass (1 pre-existing holotable red, 1 skip).
-- (next) Phase 0 remainder: act-first system addendum + first-turn `tool_choice:any` (goal-mode only),
-  image-routing guard, bidirectional strip-on-switch. Then Phase 1 prompt/honesty wins.
+- **2026-06-19 — Phase 1 LANDED (prompt + honesty).** Added a **Coding doctrine** block to the system
+  prompt (act-first/plan-light, minimum-complexity, faithful-reporting, diagnose-before-retry,
+  comment-discipline — CC's doctrines in Ares' voice); **honest CodebaseSearch** (relabeled "semantic"→
+  "ranked keyword, no embeddings, use Grep for exact" in both tool description and prompt); **TodoWrite
+  skip-signal** for 1-2 step tasks; **self-correcting Read** (truncated reads now say `offset=N` to continue).
+- **2026-06-19 — Phase 2 (1/?) LANDED: MultiEdit.** Edit tool gained an atomic `edits[]` batch mode —
+  hunks applied in order to an in-memory working copy, written ONCE only if all match; a failing hunk
+  leaves the file byte-unchanged (kills the half-applied multi-site edit). Sequential (hunk N sees hunk
+  N-1's result); per-hunk validateInput (empty/no-op/mode); errors name the failing edit index +
+  "all-or-nothing". `tests/c4-multiedit`. Suite 782 tests, 780 pass.
+- (next) Phase 2 cont.: max-output-tokens recovery ladder, structured compaction summary, tie TodoWrite
+  to turn-end. Then Phase 3: adversarial verification subagent + verification-as-contract. (Deferred from
+  Phase 0: tool_choice plumbing — the /anthropic endpoint already killed the runaway, so it's belt-only.)

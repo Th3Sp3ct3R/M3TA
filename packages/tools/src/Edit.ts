@@ -17,17 +17,40 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { buildTool, contentHash, resolveWorkspacePath, toolError, zPath } from "./_shared.js";
 
+const editHunk = z
+  .object({
+    old_string: z.string().describe("Exact text to replace. Must be unique unless replace_all."),
+    new_string: z.string().describe("Replacement text. Must differ from old_string."),
+    replace_all: z.boolean().default(false).describe("If true, replace every occurrence of this hunk."),
+  })
+  .strict();
+
 const inputSchema = z
   .object({
     file_path: zPath,
-    old_string: z.string().describe("Exact text to replace. Must be unique unless replace_all."),
-    new_string: z.string().describe("Replacement text. Must differ from old_string."),
-    replace_all: z
-      .boolean()
-      .default(false)
-      .describe("If true, replace every occurrence; otherwise old_string must be unique."),
+    // Single-edit mode (omit when using `edits`).
+    old_string: z.string().optional().describe("Single-edit mode: exact text to replace. Omit when using `edits`."),
+    new_string: z.string().optional().describe("Single-edit mode: replacement text."),
+    replace_all: z.boolean().default(false).describe("Single-edit mode: replace every occurrence."),
+    // Batch mode.
+    edits: z
+      .array(editHunk)
+      .optional()
+      .describe(
+        "Batch mode: multiple edits applied ATOMICALLY and in order to this ONE file. When set, the top-level old_string/new_string are ignored. All-or-nothing — if ANY hunk fails to match, NOTHING is written. Prefer this over several separate Edit calls for multi-site changes in the same file.",
+      ),
   })
   .strict();
+
+type EditInput = z.infer<typeof inputSchema>;
+
+/** Normalize either mode into an ordered list of hunks. */
+function editHunks(i: EditInput): Array<{ old_string: string; new_string: string; replace_all: boolean }> {
+  if (Array.isArray(i.edits) && i.edits.length > 0) {
+    return i.edits.map((h) => ({ old_string: h.old_string, new_string: h.new_string, replace_all: h.replace_all }));
+  }
+  return [{ old_string: i.old_string ?? "", new_string: i.new_string ?? "", replace_all: i.replace_all }];
+}
 
 export interface EditOutput {
   path: string;
@@ -39,29 +62,45 @@ export interface EditOutput {
 export const EditTool = buildTool({
   name: "Edit",
   description:
-    "Replace exact text in a file. Requires prior Read. Fails if old_string is non-unique (set replace_all to true to replace every occurrence). Tolerates CRLF/LF and trailing-whitespace drift.",
+    "Replace exact text in a file (requires prior Read; tolerates CRLF/LF + trailing-whitespace drift). Single edit: old_string/new_string. Multi-site: pass `edits` — an ATOMIC, all-or-nothing batch applied in order (use this instead of many separate Edit calls on one file). Fails if an old_string is non-unique (set replace_all).",
   safety: "workspace-write",
   concurrency: "exclusive",
   inputZod: inputSchema,
   activityDescription: (i) => `Editing ${path.basename(i.file_path)}`,
 
-  // Cheap, pure pre-check (runs before permission/exec): an empty old_string is a
-  // common model mistake that would otherwise fail deep in matching as "not found".
-  // Catch it early with a clear, correctable message.
+  // Cheap, pure pre-checks (run before permission/exec), per hunk for both modes:
+  // a missing mode, an empty old_string, or a no-op identical edit are common
+  // model mistakes that would otherwise fail deep in matching. Catch them early
+  // with a clear, correctable message.
   async validateInput(i) {
-    if (i.old_string === "") {
+    const usingBatch = Array.isArray(i.edits) && i.edits.length > 0;
+    if (!usingBatch && (i.old_string === undefined || i.new_string === undefined)) {
       return {
         ok: false,
-        message:
-          "old_string is empty. Provide the exact existing text to replace, or use Write to create/replace the whole file.",
+        message: "Provide both old_string and new_string for a single edit, or an `edits` array for an atomic batch.",
       };
+    }
+    const hunks = editHunks(i);
+    for (let idx = 0; idx < hunks.length; idx++) {
+      const where = hunks.length > 1 ? ` (edit ${idx + 1})` : "";
+      if (hunks[idx].old_string === "") {
+        return {
+          ok: false,
+          message: `old_string is empty${where}. Provide the exact existing text to replace, or use Write to create/replace the whole file.`,
+        };
+      }
+      if (hunks[idx].old_string === hunks[idx].new_string) {
+        return { ok: false, message: `old_string and new_string are identical${where} — the edit would be a no-op.` };
+      }
     }
     return { ok: true };
   },
 
   async checkPermissions(i, ctx) {
     const filePath = await resolveWorkspacePath(ctx, i.file_path, "file_path", "write");
-    if (i.old_string === i.new_string) {
+    // Guard the identical check on single mode (old_string defined) — in batch
+    // mode both are undefined and this must not fire.
+    if (i.old_string !== undefined && i.old_string === i.new_string) {
       return { kind: "deny", reason: "old_string and new_string are identical" };
     }
     if (!ctx.fileReadStamps.has(filePath)) {
@@ -93,29 +132,46 @@ export const EditTool = buildTool({
         );
       }
     }
-    const result = replaceResilient(content, i.old_string, i.new_string, i.replace_all);
-
-    if (!result.ok) {
-      if (result.reason === "not-found") {
+    // Atomic batch: apply every hunk in order to an in-memory working copy.
+    // Only write once ALL hunks resolve — if any fails the file is untouched, so
+    // a multi-site edit can never half-apply (the classic "edit 2's text is gone
+    // after edit 1" failure becomes a clean, recoverable error instead).
+    const hunks = editHunks(i);
+    let working = content;
+    let totalReplacements = 0;
+    const matchedBys = new Set<string>();
+    for (let idx = 0; idx < hunks.length; idx++) {
+      const h = hunks[idx];
+      const result = replaceResilient(working, h.old_string, h.new_string, h.replace_all);
+      if (!result.ok) {
+        const where = hunks.length > 1 ? ` (edit ${idx + 1} of ${hunks.length})` : "";
+        const batchNote = hunks.length > 1 ? " No edits were applied — the batch is all-or-nothing." : "";
+        if (result.reason === "not-found") {
+          throw toolError(
+            `old_string not found in ${filePath}${where} (tried exact and whitespace-tolerant matching). ` +
+              `Re-Read the file and copy the text exactly as it appears, without line-number prefixes.${batchNote}`,
+          );
+        }
         throw toolError(
-          `old_string not found in ${filePath} (tried exact and whitespace-tolerant matching). ` +
-            `Re-Read the file and copy the text exactly as it appears, without line-number prefixes.`,
+          `old_string is not unique in ${filePath}${where} (${result.occurrences} matches). Provide more context or set replace_all to true.${batchNote}`,
         );
       }
-      throw toolError(
-        `old_string is not unique in ${filePath} (${result.occurrences} matches). Provide more context or set replace_all to true.`,
-      );
+      working = result.text;
+      totalReplacements += result.replacements;
+      matchedBys.add(result.matchedBy);
     }
 
-    await fs.writeFile(filePath, result.text, "utf8");
+    await fs.writeFile(filePath, working, "utf8");
     const newStat = await fs.stat(filePath);
-    ctx.fileReadStamps.set(filePath, { mtimeMs: newStat.mtimeMs, size: newStat.size, hash: contentHash(result.text) });
+    ctx.fileReadStamps.set(filePath, { mtimeMs: newStat.mtimeMs, size: newStat.size, hash: contentHash(working) });
 
-    const note = result.matchedBy === "exact" ? "" : ` [matched via ${result.matchedBy}]`;
+    const matchedBy = [...matchedBys].join(",");
+    const note = matchedBy === "exact" ? "" : ` [matched via ${matchedBy}]`;
+    const across = hunks.length > 1 ? ` across ${hunks.length} edits` : "";
     return {
-      output: { path: filePath, replacements: result.replacements, matchedBy: result.matchedBy },
+      output: { path: filePath, replacements: totalReplacements, matchedBy },
       touchedFiles: [filePath],
-      display: `Edited ${filePath} (${result.replacements} replacement${result.replacements === 1 ? "" : "s"})${note}`,
+      display: `Edited ${filePath} (${totalReplacements} replacement${totalReplacements === 1 ? "" : "s"}${across})${note}`,
     };
   },
 });
