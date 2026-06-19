@@ -6,7 +6,7 @@
 import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { buildTool, contentHash, resolveWorkspacePath, zPath } from "./_shared.js";
+import { buildTool, contentHash, resolveWorkspacePath, toolError, zPath } from "./_shared.js";
 import { safeOverwrite } from "./safeWrite.js";
 
 const inputSchema = z
@@ -55,7 +55,7 @@ export const WriteTool = buildTool({
     const filePath = await resolveWorkspacePath(ctx, i.file_path, "file_path", "write");
     const existed = await fs.stat(filePath).then(() => true).catch(() => false);
     if (existed && !ctx.fileReadStamps.has(filePath)) {
-      throw new Error(`${filePath} exists; Read it before overwriting so you've seen the current contents.`);
+      throw toolError(`${filePath} exists; Read it before overwriting so you've seen the current contents.`);
     }
     // Staleness guard (matches Edit's discipline): a blind overwrite must not
     // clobber changes made on disk since the last Read. New files (no stamp) are
@@ -66,7 +66,7 @@ export const WriteTool = buildTool({
       if (stamp?.hash !== undefined) {
         const current = await fs.readFile(filePath, "utf8").catch(() => null);
         if (current !== null && contentHash(current) !== stamp.hash) {
-          throw new Error(`${filePath} was modified on disk since the last Read. Re-Read it and retry so you don't clobber newer changes.`);
+          throw toolError(`${filePath} was modified on disk since the last Read. Re-Read it and retry so you don't clobber newer changes.`);
         }
       }
     }

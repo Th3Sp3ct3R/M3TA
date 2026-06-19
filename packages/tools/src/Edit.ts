@@ -15,7 +15,7 @@
 import { z } from "zod";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { buildTool, contentHash, resolveWorkspacePath, zPath } from "./_shared.js";
+import { buildTool, contentHash, resolveWorkspacePath, toolError, zPath } from "./_shared.js";
 
 const inputSchema = z
   .object({
@@ -45,6 +45,20 @@ export const EditTool = buildTool({
   inputZod: inputSchema,
   activityDescription: (i) => `Editing ${path.basename(i.file_path)}`,
 
+  // Cheap, pure pre-check (runs before permission/exec): an empty old_string is a
+  // common model mistake that would otherwise fail deep in matching as "not found".
+  // Catch it early with a clear, correctable message.
+  async validateInput(i) {
+    if (i.old_string === "") {
+      return {
+        ok: false,
+        message:
+          "old_string is empty. Provide the exact existing text to replace, or use Write to create/replace the whole file.",
+      };
+    }
+    return { ok: true };
+  },
+
   async checkPermissions(i, ctx) {
     const filePath = await resolveWorkspacePath(ctx, i.file_path, "file_path", "write");
     if (i.old_string === i.new_string) {
@@ -67,14 +81,14 @@ export const EditTool = buildTool({
     // hash existed (resumed sessions / older rollouts).
     if (stamp.hash !== undefined) {
       if (contentHash(content) !== stamp.hash) {
-        throw new Error(
+        throw toolError(
           `${filePath} was modified on disk since the last Read. Re-Read and retry.`,
         );
       }
     } else {
       const stat = await fs.stat(filePath);
       if (stat.mtimeMs > stamp.mtimeMs + 5) {
-        throw new Error(
+        throw toolError(
           `${filePath} was modified on disk since the last Read. Re-Read and retry.`,
         );
       }
@@ -83,12 +97,12 @@ export const EditTool = buildTool({
 
     if (!result.ok) {
       if (result.reason === "not-found") {
-        throw new Error(
+        throw toolError(
           `old_string not found in ${filePath} (tried exact and whitespace-tolerant matching). ` +
             `Re-Read the file and copy the text exactly as it appears, without line-number prefixes.`,
         );
       }
-      throw new Error(
+      throw toolError(
         `old_string is not unique in ${filePath} (${result.occurrences} matches). Provide more context or set replace_all to true.`,
       );
     }

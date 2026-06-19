@@ -71,9 +71,21 @@ export interface ToolResult<O> extends EngineToolResult {
   images?: Array<{ mediaType: string; data: string }>;
 }
 
+/**
+ * Result of a tool's semantic input check ({@link Tool.validateInput}). `ok:false`
+ * carries a model-facing message the loop wraps as a correctable
+ * `<tool_use_error>` so the model fixes the call on its next turn instead of the
+ * tool throwing an opaque error. Wired in Phase 4 (tool-contract hardening).
+ */
+export type ToolInputValidation = { ok: true } | { ok: false; message: string };
+
 export interface Tool<I extends z.ZodTypeAny = z.ZodTypeAny, O = unknown> {
   readonly schema: ToolSchema;
   readonly inputZod: I;
+  /** Optional semantic check run AFTER zod parse, BEFORE call(). See {@link ToolInputValidation}.
+   *  Method syntax (not an arrow property) so the parameter stays bivariant —
+   *  otherwise `Tool<ConcreteSchema>` would not be assignable to `Tool<ZodTypeAny>`. */
+  validateInput?(input: z.infer<I>, ctx: RichToolContext): Promise<ToolInputValidation>;
   checkPermissions(input: z.infer<I>, ctx: RichToolContext): Promise<PermissionDecision>;
   call(input: z.infer<I>, ctx: RichToolContext): Promise<ToolResult<O>>;
   activityDescription(input: z.infer<I>): string;
@@ -89,7 +101,11 @@ export interface ToolDef<I extends z.ZodTypeAny, O> {
   /** Per-tool execution watchdog (ms). 0 = uncapped (self-capping tools);
    *  omitted = engine picks a class default from `safety`. */
   watchdogTimeoutMs?: number;
+  /** Max chars of result kept inline before the engine spills to disk (Phase 4). */
+  maxResultSizeChars?: number;
   inputZod: I;
+  /** Optional semantic input check (Phase 4). See {@link ToolInputValidation}. */
+  validateInput?: (input: z.infer<I>, ctx: RichToolContext) => Promise<ToolInputValidation>;
   checkPermissions?: (input: z.infer<I>, ctx: RichToolContext) => Promise<PermissionDecision>;
   call: (input: z.infer<I>, ctx: RichToolContext) => Promise<ToolResult<O>>;
   activityDescription: (input: z.infer<I>) => string;
@@ -110,6 +126,7 @@ export function buildTool<I extends z.ZodTypeAny, O>(def: ToolDef<I, O>): Tool<I
     providerHint: def.providerHint,
     deferLoading: def.deferLoading,
     watchdogTimeoutMs: def.watchdogTimeoutMs,
+    maxResultSizeChars: def.maxResultSizeChars,
   };
 
   const checkPermissions = async (
@@ -124,6 +141,7 @@ export function buildTool<I extends z.ZodTypeAny, O>(def: ToolDef<I, O>): Tool<I
   return {
     schema,
     inputZod: def.inputZod,
+    validateInput: def.validateInput,
     checkPermissions,
     call: def.call,
     activityDescription: def.activityDescription,
@@ -176,6 +194,18 @@ function throwToolInputError(error: z.ZodError, toolName: string): never {
   throw new Error(`${toolName}: invalid arguments — ${detail}`);
 }
 
+/**
+ * Wrap a model-facing, correctable message in a recognizable envelope. The engine
+ * surfaces a thrown error's `.message` as an `is_error` tool_result, so the model
+ * sees `<tool_use_error>…</tool_use_error>` and learns to fix the CALL rather than
+ * treating it as a runtime failure to retry blindly. Exported so individual tools
+ * can throw correctable domain errors (e.g. Edit "old_string not found") in the
+ * same recognizable shape as the loop's input-validation gate.
+ */
+export function toolError(message: string): Error {
+  return new Error(`<tool_use_error>${message}</tool_use_error>`);
+}
+
 export function adaptToolForEngine(
   tool: Tool<z.ZodTypeAny, unknown>,
   enrich: (base: ToolCallContext) => RichToolContext,
@@ -183,11 +213,31 @@ export function adaptToolForEngine(
   return {
     schema: tool.schema,
     async call(input, ctx) {
-      const parsed = parseToolInputLenient(tool.inputZod, input, tool.schema.name);
+      // Two-stage input validation BEFORE the tool runs (CC pattern). Bad model
+      // input becomes a recognizable, correctable <tool_use_error> the model fixes
+      // on its next turn — instead of an opaque throw that reads like a tool crash
+      // (a dominant cause of tool-call failures and dead-loop retries).
+      let parsed: z.infer<typeof tool.inputZod>;
+      try {
+        // Stage 1 — shape: zod parse (lenient on extra keys), throws on genuine
+        // type/required errors with a readable, field-level message.
+        parsed = parseToolInputLenient(tool.inputZod, input, tool.schema.name);
+      } catch (e) {
+        throw toolError(e instanceof Error ? e.message : String(e));
+      }
       const rich = enrich(ctx);
+      // Stage 2 — semantics: optional tool-specific check (e.g. "old_string not
+      // found", "path escapes workspace") AFTER parse, BEFORE permission/exec.
+      if (tool.validateInput) {
+        const verdict = await tool.validateInput(parsed, rich);
+        if (!verdict.ok) throw toolError(verdict.message);
+      }
       const decision = await tool.checkPermissions(parsed, rich);
       if (decision.kind === "deny") {
-        throw new Error(decision.reason);
+        // A policy deny ("Read the file first", "disabled in plan mode") is a
+        // correctable signal — envelope it like the validation gate so the model
+        // treats it as "fix the call", not an opaque crash.
+        throw toolError(decision.reason);
       }
       if (decision.kind === "ask") {
         if (!ctx.requestPermission) {

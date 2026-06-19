@@ -211,6 +211,13 @@ export interface ToolSchema {
    *  `safety`. Bounds a single tool call so a hung network fetch can't stall the
    *  whole turn for minutes. */
   watchdogTimeoutMs?: number;
+  /** Max characters of this tool's result kept inline in the model's context.
+   *  When the result exceeds it, the engine spills the full output to disk and
+   *  hands the model a preview + a path it can re-Read — so a giant file read or
+   *  vision dump can't bloat the window or be silently truncated-and-lost.
+   *  Omitted = engine default; `0` = never spill (e.g. tools that self-bound).
+   *  Wired in Phase 4 (tool-contract hardening); inert until then. */
+  maxResultSizeChars?: number;
 }
 
 // ─── Permissions ────────────────────────────────────────────────────────

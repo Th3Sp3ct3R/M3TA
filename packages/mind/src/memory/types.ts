@@ -66,6 +66,11 @@ export interface MemoryNode {
   tags?: string[];
   /** Origin: a session/mission/skill id, etc. */
   source?: string;
+  /** Owning tenant for multi-user isolation (e.g. per-Telegram-user). Absent =
+   *  the owner. Additive + optional, so no schema-version bump: older binaries
+   *  ignore it, newer ones default it to the owner. Recall/write filtering is
+   *  wired in Phase 2 (memory unification); inert until then. */
+  scope?: string;
   /** Confidence (0..1) for a synthesized belief/insight. Absent on raw episodes. */
   confidence?: number;
   /** Provenance: member node ids a synthesis was distilled from. */
