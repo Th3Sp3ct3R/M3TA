@@ -340,8 +340,8 @@ function sessionFromHistory(id: string, rawMessages: unknown, meta: unknown): Se
     if (message.role === "user") {
       const text = blocks.filter((b) => b.type === "text").map((b) => String(b.text ?? "")).join("\n").trim();
       if (text) items.push({ kind: "user", key: nextKey(), text });
-      const reminder = blocks.filter((b) => b.type === "system_reminder").map((b) => String(b.text ?? "")).join("\n").trim();
-      if (reminder) items.push({ kind: "notice", key: nextKey(), text: reminder, tone: "dim" });
+      // system_reminder blocks on saved user turns are internal context assembly
+      // (memory/instructions/recall) — never user-facing. Don't replay them.
     }
   }
   const firstUser = items.find((item): item is Extract<Item, { kind: "user" }> => item.kind === "user");
@@ -599,13 +599,20 @@ function foldEvent(s: SessionVm, e: AresEvent): SessionVm {
       break;
     }
     case "system_reminder_injected": {
-      // Surface ALL injected context, not just verifier — memory/recall/dream/
-      // undo/hook reminders steer the model's behavior, so hiding them makes
-      // Ares look like it "suddenly changed course" for no visible reason.
+      // Most injected context is prompt assembly — memory recall, loaded
+      // instructions, the foreground-intent reminder, dream/heartbeat/skill/hook
+      // notes. It steers the model but is pure noise in the transcript: a bare
+      // "hi" was dumping the whole "Loaded global memory… / Foreground request
+      // (greeting): hi" trace. Hide that, but KEEP the genuinely user-facing
+      // runtime notices (provider failover, token-cap, loop/circuit guards).
+      // The model still receives every reminder — only the UI rendering changes.
       const src = e.source ?? "context";
+      const text = e.text ?? "";
+      const NOISE = new Set(["memory", "recall", "dream", "heartbeat", "hook", "skill", "compaction", "undo"]);
+      const isStartupNoise = src === "instructions" && /^(Loaded |Foreground request)/i.test(text);
+      if (NOISE.has(src) || isStartupNoise) break;
       const tone = src === "verifier" ? "warn" : "dim";
-      const prefix = src === "verifier" ? "" : `${src}: `;
-      items.push({ kind: "notice", key: nextKey(), text: prefix + compact(e.text ?? "", 400), tone });
+      items.push({ kind: "notice", key: nextKey(), text: compact(text, 400), tone });
       break;
     }
     case "compaction": {
@@ -718,9 +725,39 @@ function foldEvent(s: SessionVm, e: AresEvent): SessionVm {
 
 // ─── Small utilities ───────────────────────────────────────────────────────
 
-/** Human label for a tool call from its name + input — "Write ares-fact.html",
- *  "Grep validateSession", "Bash npm test". The daemon doesn't always send an
- *  activityDescription, and a bare tool name tells the user nothing. */
+/** Coarse action family for a tool — drives the verb, the glyph, and the
+ *  human roll-up summary. Keep in sync with toolGlyph (which folds create→edit
+ *  for the icon, but the summary wants them split). */
+type ToolKind = "read" | "search" | "edit" | "create" | "shell" | "web" | "task" | "other";
+function toolKind(name: string): ToolKind {
+  if (/^(Write)$/i.test(name)) return "create";
+  if (/^(Edit|ApplyIntent|FindAndEdit|NotebookEdit|MultiEdit)$/i.test(name)) return "edit";
+  if (/^(Read|Glob|NotebookRead|LS)$/i.test(name)) return "read";
+  if (/^(Grep|CodebaseSearch|WebSearch|Search)$/i.test(name)) return "search";
+  if (/^(Bash|PowerShell|BashOutput|KillShell|Shell)$/i.test(name)) return "shell";
+  if (/^(WebFetch|Browser|Fetch)/i.test(name)) return "web";
+  if (/^(Task|Operator|Agent)$/i.test(name)) return "task";
+  return "other";
+}
+
+/** Present-tense verb for an in-flight call — "Editing", "Creating", "Running". */
+function toolVerb(name: string): string {
+  switch (toolKind(name)) {
+    case "create": return "Creating";
+    case "edit": return "Editing";
+    case "read": return "Reading";
+    case "search": return /websearch/i.test(name) ? "Searching the web for" : "Searching";
+    case "shell": return "Running";
+    case "web": return "Fetching";
+    case "task": return "Delegating";
+    default: return name;
+  }
+}
+
+/** Human, verb-first label for a tool call from its name + input —
+ *  "Creating ares-fact.html", "Searching validateSession", "Running npm test".
+ *  The daemon doesn't always send an activityDescription, and a bare tool name
+ *  ("tools ran") tells the user nothing about what's actually happening. */
 function toolStartLabel(name: string, input: unknown): string {
   const rec = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
   const firstString = (...keys: string[]) => {
@@ -730,12 +767,35 @@ function toolStartLabel(name: string, input: unknown): string {
     }
     return "";
   };
-  const target =
-    firstString("file_path", "path", "notebook_path") ||
-    firstString("pattern", "query", "url", "command", "description", "goal");
-  if (!target) return name;
-  const short = target.length > 64 ? `${target.slice(0, 64)}…` : target;
-  return `${name} · ${short.split(/[\\/]/).length > 3 ? short.split(/[\\/]/).slice(-2).join("/") : short}`;
+  const verb = toolVerb(name);
+  const path = firstString("file_path", "path", "notebook_path");
+  const target = path || firstString("pattern", "query", "url", "command", "description", "goal");
+  if (!target) return verb === name ? name : `${verb}…`;
+  // For paths, show the last 1–2 segments; for everything else, a clipped phrase.
+  const segs = target.split(/[\\/]/).filter(Boolean);
+  const compactTarget = path && segs.length > 2 ? segs.slice(-2).join("/") : target;
+  const short = compactTarget.length > 64 ? `${compactTarget.slice(0, 64)}…` : compactTarget;
+  return verb === name ? `${name} · ${short}` : `${verb} ${short}`;
+}
+
+/** A transparent one-line roll-up of a finished tool group — "Read 3 files ·
+ *  edited 2 · ran 1 command" instead of the opaque "6 actions · 6 done". */
+function summarizeSteps(steps: ToolStep[]): string {
+  const counts: Record<ToolKind, number> = { read: 0, search: 0, edit: 0, create: 0, shell: 0, web: 0, task: 0, other: 0 };
+  for (const s of steps) counts[toolKind(s.name)]++;
+  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  const parts: string[] = [];
+  if (counts.create) parts.push(`created ${plural(counts.create, "file", "files")}`);
+  if (counts.edit) parts.push(`edited ${plural(counts.edit, "file", "files")}`);
+  if (counts.read) parts.push(`read ${plural(counts.read, "file", "files")}`);
+  if (counts.search) parts.push(`${plural(counts.search, "search", "searches")}`);
+  if (counts.shell) parts.push(`ran ${plural(counts.shell, "command", "commands")}`);
+  if (counts.web) parts.push(`fetched ${plural(counts.web, "page", "pages")}`);
+  if (counts.task) parts.push(`${plural(counts.task, "delegation", "delegations")}`);
+  if (counts.other) parts.push(`${plural(counts.other, "action", "actions")}`);
+  // Capitalize the first word so it reads like a sentence fragment.
+  const joined = parts.join(" · ");
+  return joined ? joined.charAt(0).toUpperCase() + joined.slice(1) : `${steps.length} actions`;
 }
 
 function compact(text: string, max: number): string {
@@ -939,6 +999,9 @@ interface Prefs {
   routingMode: "manual" | "auto";
   /** Tool-call rendering: product = concise summaries; technical = raw input/output. */
   toolDisplay: "product" | "technical";
+  /** Screen flame border intensity while working — immersive (default tongues),
+   *  clean (no border, just a soft ember rim), or combat (hotter, taller). */
+  flameMode: "immersive" | "clean" | "combat";
   /** Pinned session ids (shown in their own rail section). */
   pinned: string[];
   /** Accent theme for the desktop chrome. */
@@ -975,6 +1038,7 @@ function loadPrefs(): Prefs {
     routing: {},
     routingMode: "manual",
     toolDisplay: "product",
+    flameMode: "immersive",
     pinned: [],
     theme: "rage",
     engine: {},
@@ -993,6 +1057,7 @@ function loadPrefs(): Prefs {
         ? raw.routingMode
         : Object.keys(routing).length > 0 ? "auto" : "manual",
       toolDisplay: raw.toolDisplay === "technical" ? "technical" : "product",
+      flameMode: raw.flameMode === "clean" || raw.flameMode === "combat" ? raw.flameMode : "immersive",
       pinned: Array.isArray(raw.pinned) ? raw.pinned.filter((p): p is string => typeof p === "string") : [],
       theme: themeOk ? (raw.theme as ThemeName) : "rage",
       engine: raw.engine && typeof raw.engine === "object" ? raw.engine : {},
@@ -1560,6 +1625,9 @@ function App() {
           return true;
         case "interrupted_by_user":
           pushLog("[garrison] turn interrupted by user");
+          // The daemon confirmed the abort — free the session that owned the
+          // turn (not just whatever card is focused now) so its composer unlocks.
+          applyTo(e.sessionId ?? activeRef.current, (s) => ({ ...s, busy: false, steerQueued: 0, activity: undefined }));
           return true;
         case "reasoning_set":
         case "routing_set":
@@ -1878,7 +1946,9 @@ function App() {
         setDaemon("error");
         apply((s) => foldEvent(s, { type: "desktop_error", text: String(err) }));
       }
-      window.setTimeout(() => mounted && setBootGone(true), 1500);
+      // A touch longer so the boot can play its full three-beat ignition + a
+      // forge-bloom exit (Boot owns the exit anim; this is the hard unmount).
+      window.setTimeout(() => mounted && setBootGone(true), 2150);
       void poll();
       // The push listener (ares:event-buffered) carries events in real time;
       // this poll is just a slow reconciliation net for any missed push, so it
@@ -1971,8 +2041,19 @@ function App() {
 
   const stopTurn = useCallback(() => {
     const sid = activeRef.current;
+    // Free the UI immediately — never wait on the daemon round-trip. If the turn
+    // is wedged (no turn_end ever arrives) waiting would leave Stop feeling dead
+    // and the composer frozen. Clearing busy + steer here re-enables input now;
+    // the daemon abort below tears down the real turn.
+    applyTo(sid, (s) => ({
+      ...s,
+      busy: false,
+      steerQueued: 0,
+      activity: undefined,
+      items: s.items.map((it) => (it.kind === "assistant" && it.streaming ? { ...it, streaming: false } : it)),
+    }));
     if (native) void invoke("ares_interrupt", { sessionId: sid }).catch(() => null);
-    else applyTo(sid, (s) => ({ ...foldEvent(s, { type: "turn_end", status: "interrupted", durationMs: 0 }), busy: false }));
+    else applyTo(sid, (s) => foldEvent(s, { type: "turn_end", status: "interrupted", durationMs: 0 }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [native, applyTo]);
 
@@ -2060,6 +2141,14 @@ function App() {
     setPrefs(p);
     savePrefs(p);
     if (native) void invoke("ares_set_reasoning", { level: next }).catch(() => null);
+  };
+
+  const FLAME_MODES: Prefs["flameMode"][] = ["immersive", "clean", "combat"];
+  const cycleFlame = () => {
+    const next = FLAME_MODES[(FLAME_MODES.indexOf(prefs.flameMode) + 1) % FLAME_MODES.length];
+    const p = { ...prefs, flameMode: next };
+    setPrefs(p);
+    savePrefs(p);
   };
 
   // ── the Forge ─────────────────────────────────────────────────────────────
@@ -2245,6 +2334,10 @@ function App() {
   };
 
   const routedLanes = ROUTE_LANES.filter((l) => prefs.routing[l]);
+  // The model that ACTUALLY handled this session's last turn (sticky/lane/
+  // failover-aware), falling back to the picked default before any turn runs.
+  // The footer/composer show this so they never contradict the per-message badge.
+  const liveModel = active?.turnModel ?? (prefs.routingMode === "auto" ? "routing (auto)" : prefs.model);
 
   // ── rail: search, pins, and the artifact vault ───────────────────────────
   const q = sessionQuery.trim().toLowerCase();
@@ -2311,6 +2404,7 @@ function App() {
       className="ares"
       data-daemon={daemon}
       data-theme={prefs.theme}
+      data-flame={prefs.flameMode}
       data-panel={forge.open ? "1" : "0"}
       data-working={active?.busy ? "1" : "0"}
       style={{ ["--forge-w" as string]: `${forgeWidth}px`, ["--heat" as string]: heat.toFixed(3), ["--draft" as string]: draft.toFixed(3) }}
@@ -2474,7 +2568,7 @@ function App() {
           <div>
             <h2>{active?.title ?? "Session"}</h2>
             <span>
-              {prefs.routingMode === "auto" ? "routing (auto)" : `${prefs.provider} / ${prefs.model}`}
+              {prefs.routingMode === "auto" ? `routing · ${liveModel}` : `${prefs.provider} / ${prefs.model}`}
               {prefs.routingMode === "auto" && routedLanes.length > 0 ? ` · ${routedLanes.length} lane${routedLanes.length === 1 ? "" : "s"}` : ""}
             </span>
           </div>
@@ -2501,6 +2595,7 @@ function App() {
           />
         ) : (
           <div className="chat" ref={scroller} onScroll={onChatScroll}>
+            <div className="chatWatermark" aria-hidden="true" />
             {active?.loading ? (
               <div className="empty">
                 <div className="wordmark">LOADING</div>
@@ -2545,7 +2640,7 @@ function App() {
         {view !== "helm" ? (
           <Composer
             busy={active?.busy ?? false}
-            model={prefs.routingMode === "auto" ? "routing (auto)" : prefs.model}
+            model={liveModel}
             autoRouting={prefs.routingMode === "auto"}
             reasoning={prefs.reasoning}
             routedLanes={routedLanes}
@@ -2561,46 +2656,51 @@ function App() {
         ) : null}
 
         <footer className="statusBar">
-          <button className="statusSeg" onClick={() => setGarrisonOpen(true)} title="Garrison panel — status, log, restart">
-            <i className="dot" data-state={daemon} /> Garrison {daemon}
-          </button>
-          <button className="statusSeg" onClick={() => setModelPopOpen(true)} title="switch provider / model">
-            {prefs.routingMode === "auto" ? "routing (auto)" : `${prefs.provider} · ${prefs.model}`}
-          </button>
-          <button className="statusSeg" onClick={() => setReasoningOpen(true)} title="reasoning effort">
-            reasoning {prefs.reasoning}
-          </button>
-          <button className="statusSeg" onClick={() => setRoutingOpen(true)} title="per-lane model routing">
-            {prefs.routingMode === "auto"
-              ? `routing auto · ${routedLanes.length}`
-              : routedLanes.length > 0 ? `routing ready · ${routedLanes.length}` : "routing off"}
-          </button>
-          <button
-            className="statusSeg"
-            onClick={() => {
-              daemonCmd({ type: "operator_status" });
-              setCronOpen(true);
-            }}
-            title="durable missions (Operator)"
-          >
-            <i className="dot" data-state={opStatus?.activeCount ? "running" : "stopped"} /> missions {opStatus?.activeCount ?? 0}
-          </button>
-          <span className="grow" />
-          {native && daemon !== "running" && daemon !== "starting" ? (
-            <button className="statusAction" onClick={() => { restartAttempts.current = 0; restartDaemon(); }}>
-              ⟳ Restart
+          <div className="statusGroup">
+            <button className="statusSeg" onClick={() => setGarrisonOpen(true)} title="Garrison panel — status, log, restart">
+              <i className="dot" data-state={daemon} /><b>garrison</b><span>{daemon}</span>
             </button>
-          ) : null}
-          <button className="statusAction" onClick={() => void exportSessionLog()} title="Export this session (chat + tool calls + errors) to a file for feedback">
-            ⤓ Export log
-          </button>
-          <button className="statusAction" onClick={() => setPaletteOpen(true)} title="command palette">
-            ⌘ Ctrl+K
-          </button>
-          <span>
-            ↑{fmtTokens(active?.tokensIn ?? 0)} ↓{fmtTokens(active?.tokensOut ?? 0)}
-          </span>
-          <span>v0.10.2</span>
+            <button className="statusSeg" onClick={() => setModelPopOpen(true)} title={prefs.routingMode === "auto" ? "auto-routing — model that handled the last turn" : "switch provider / model"}>
+              <b>model</b><span>{liveModel}</span>
+            </button>
+            <button className="statusSeg" onClick={() => setReasoningOpen(true)} title="reasoning effort">
+              <b>mode</b><span>{prefs.reasoning}</span>
+            </button>
+            <button className="statusSeg" onClick={() => setRoutingOpen(true)} title="per-lane model routing">
+              <b>route</b><span>{prefs.routingMode === "auto" ? `auto · ${routedLanes.length}` : routedLanes.length > 0 ? `ready · ${routedLanes.length}` : "off"}</span>
+            </button>
+            <button
+              className="statusSeg"
+              onClick={() => {
+                daemonCmd({ type: "operator_status" });
+                setCronOpen(true);
+              }}
+              title="durable missions (Operator)"
+            >
+              <i className="dot" data-state={opStatus?.activeCount ? "running" : "stopped"} /><b>missions</b><span>{opStatus?.activeCount ?? 0}</span>
+            </button>
+            <button className="statusSeg" onClick={cycleFlame} title="screen flame border — immersive / clean / combat">
+              <b>flame</b><span>{prefs.flameMode}</span>
+            </button>
+          </div>
+          <span className="grow" />
+          <div className="statusGroup">
+            {native && daemon !== "running" && daemon !== "starting" ? (
+              <button className="statusAction" onClick={() => { restartAttempts.current = 0; restartDaemon(); }}>
+                ⟳ Restart
+              </button>
+            ) : null}
+            <button className="statusAction" onClick={() => void exportSessionLog()} title="Export this session (chat + tool calls + errors) to a file for feedback">
+              ⤓ Export
+            </button>
+            <button className="statusAction" onClick={() => setPaletteOpen(true)} title="command palette">
+              ⌘ Ctrl+K
+            </button>
+            <span className="hudReadout" title="tokens in / out this session">
+              ↑{fmtTokens(active?.tokensIn ?? 0)} ↓{fmtTokens(active?.tokensOut ?? 0)}
+            </span>
+            <span className="hudVersion">v{__APP_VERSION__}</span>
+          </div>
         </footer>
       </main>
 
@@ -2835,21 +2935,20 @@ function App() {
 
       {garrisonOpen ? (
         <div className="scrim" onClick={() => setGarrisonOpen(false)}>
-          <div className="drawer wide" onClick={(e) => e.stopPropagation()}>
-            <header>
-              <h3>Garrison</h3>
-              <button className="ghost" onClick={() => setGarrisonOpen(false)}>
-                Close
-              </button>
-            </header>
-            <div className="garrisonStatus">
+          <div className="drawer wide consoleDrawer" onClick={(e) => e.stopPropagation()}>
+            <header className="consoleHead">
+              <h3>Daemon Console</h3>
               <span className="pill" data-state={daemon}>
-                {daemon.toUpperCase()}
-              </span>
-              <span className="garrisonInfo">
-                {prefs.routingMode === "auto" ? "routing (auto)" : `${prefs.provider} · ${prefs.model}`} · reasoning {prefs.reasoning}
+                <i className="dot" data-state={daemon} />{daemon.toUpperCase()}
               </span>
               <span className="grow" />
+              <button
+                className="ghost"
+                title="Copy the log — paste it when reporting a bug"
+                onClick={() => void navigator.clipboard?.writeText(logLines.join("\n")).catch(() => null)}
+              >
+                ⧉ Copy
+              </button>
               <button
                 className="ghost"
                 onClick={() => {
@@ -2860,12 +2959,18 @@ function App() {
                 ⟳ Restart
               </button>
               {native ? (
-                <button className="ghost" onClick={() => void invoke("ares_stop_daemon").catch(() => null)}>
+                <button className="ghost danger" onClick={() => void invoke("ares_stop_daemon").catch(() => null)}>
                   ■ Stop
                 </button>
               ) : null}
-            </div>
-            <pre className="logView">{logLines.length ? logLines.join("\n") : "No daemon output yet."}</pre>
+              <button className="ghost" onClick={() => setGarrisonOpen(false)}>
+                Close
+              </button>
+            </header>
+            <pre className="logView">{logLines.length ? logLines.join("\n") : "No daemon output yet — the Garrison hasn't written to stderr."}</pre>
+            <footer className="consoleFoot">
+              {logLines.length} line{logLines.length === 1 ? "" : "s"} · live stdout/stderr from the Garrison daemon
+            </footer>
           </div>
         </div>
       ) : null}
@@ -4309,6 +4414,10 @@ function ThinkingView({ text }: { text: string }) {
   );
 }
 
+// A SINGLE tool card that MORPHS as the agent works: one icon slot crossfades
+// through each tool (Read→Edit→Run…), the title rewrites to the live action, and
+// when the batch finishes it collapses to "N tools attempted · …". The full
+// per-step breakdown stays one click away. One reused card, not a stack.
 function ToolGroup({ item, technical }: { item: Extract<Item, { kind: "tools" }>; technical?: boolean }) {
   const [open, setOpen] = useState(false);
   const running = item.steps.some((s) => s.status === "running" || s.status === "drafting");
@@ -4317,20 +4426,37 @@ function ToolGroup({ item, technical }: { item: Extract<Item, { kind: "tools" }>
   const slowestStep = item.steps.reduce((n, s) => Math.max(n, s.durationMs ?? 0), 0);
   const elapsed = wallElapsed > 0 ? wallElapsed : slowestStep;
   const runningSteps = item.steps.filter((s) => s.status === "running" || s.status === "drafting");
-  const current = runningSteps[0];
-  const summary = running && current
-    ? `${current.label}${runningSteps.length > 1 ? ` +${runningSteps.length - 1} parallel` : ""}`
-    : `${item.steps.length} action${item.steps.length === 1 ? "" : "s"} · ${item.steps.filter((s) => s.status === "ok").length} done${failed ? ` · ${item.steps.filter((s) => s.status === "error").length} failed` : ""}`;
+  const doneCount = item.steps.filter((s) => s.status === "ok").length;
+  const failedCount = item.steps.filter((s) => s.status === "error").length;
+  const total = item.steps.length;
+  // The step the card is currently "wearing": the first live one, else the last.
+  const current = runningSteps[0] ?? item.steps[item.steps.length - 1];
+  const activeGlyph = toolGlyph(current?.name ?? "");
+
+  const title = running ? current?.label ?? "working…" : `${total} tool${total === 1 ? "" : "s"} attempted`;
+  const subline = running
+    ? `${doneCount}/${total} done${runningSteps.length > 1 ? ` · ${runningSteps.length} running` : ""}`
+    : `${summarizeSteps(item.steps)}${failed ? ` · ${failedCount} failed` : ""} · ${fmtMs(elapsed)}`;
+
   return (
-    <div className="toolGroup" data-state={failed ? "error" : running ? "running" : "ok"}>
-      <button className="toolHead" onClick={() => setOpen(!open)}>
-        <i className="caret" data-open={open ? "1" : "0"} />
-        <span>{summary}</span>
-        <span className="toolTrail">
-          {!open ? item.steps.slice(0, 10).map((s) => <i key={s.id} className="glyph mini" data-glyph={toolGlyph(s.name)} data-status={s.status} />) : null}
+    <div className="toolCard" data-state={failed ? "error" : running ? "running" : "ok"} data-open={open ? "1" : "0"}>
+      <button className="toolCardHead" onClick={() => setOpen(!open)}>
+        <span className="toolCardIcon">
+          {/* keyed so the glyph re-animates (morphs) each time the active tool changes */}
+          <i className="glyph morphGlyph" key={`${activeGlyph}-${running ? current?.id : "done"}`} data-glyph={activeGlyph} data-status={running ? current?.status : failed ? "error" : "ok"} />
         </span>
-        <span className="toolMeta">{running ? `${runningSteps.length} live` : fmtMs(elapsed)}</span>
+        <span className="toolCardBody">
+          <span className="toolCardTitle" key={title}>{title}</span>
+          <span className="toolCardSub">{subline}</span>
+        </span>
+        <span className="toolCardTrail">
+          {item.steps.slice(-14).map((s) => <i key={s.id} className="glyph mini" data-glyph={toolGlyph(s.name)} data-status={s.status} />)}
+        </span>
+        <i className="caret" data-open={open ? "1" : "0"} />
       </button>
+      {running && current?.liveTail && !open ? (
+        <pre className="stepLiveTail cardTail">{current.liveTail.split("\n").slice(-10).join("\n")}</pre>
+      ) : null}
       {open ? (
         <div className="toolBody">
           {item.steps.map((s) => (
@@ -4342,15 +4468,19 @@ function ToolGroup({ item, technical }: { item: Extract<Item, { kind: "tools" }>
   );
 }
 
-/** Tiny glyph class per tool family — rendered as CSS-drawn icons. */
+/** Tiny glyph class per tool family — rendered as CSS-drawn icons. Derived from
+ *  toolKind so the icon, the verb, and the roll-up summary never disagree. */
 function toolGlyph(name: string): string {
-  if (/^(Read|Glob|NotebookRead)$/i.test(name)) return "file";
-  if (/^(Grep|CodebaseSearch|WebSearch)$/i.test(name)) return "search";
-  if (/^(Edit|Write|ApplyIntent|FindAndEdit|NotebookEdit)$/i.test(name)) return "edit";
-  if (/^(Bash|PowerShell|BashOutput|KillShell)$/i.test(name)) return "shell";
-  if (/^(WebFetch|Browser)/i.test(name)) return "web";
-  if (/^(Task|Operator)$/i.test(name)) return "task";
-  return "dot";
+  switch (toolKind(name)) {
+    case "read": return "file";
+    case "search": return "search";
+    case "create": return "create";
+    case "edit": return "edit";
+    case "shell": return "shell";
+    case "web": return "web";
+    case "task": return "task";
+    default: return "dot";
+  }
 }
 
 function ToolStepRow({ step, technical }: { step: ToolStep; technical?: boolean }) {
@@ -4446,13 +4576,18 @@ const BOOT_LOG = [
 
 function Boot() {
   const [logIdx, setLogIdx] = useState(0);
+  const [exiting, setExiting] = useState(false);
   useEffect(() => {
-    const t = window.setInterval(() => setLogIdx((i) => Math.min(i + 1, BOOT_LOG.length - 1)), 210);
-    return () => window.clearInterval(t);
+    const t = window.setInterval(() => setLogIdx((i) => Math.min(i + 1, BOOT_LOG.length - 1)), 300);
+    // Forge-bloom exit just before the parent unmounts — the splash blooms hot
+    // and dissolves into the live shell instead of vanishing instantly.
+    const ex = window.setTimeout(() => setExiting(true), 1720);
+    return () => { window.clearInterval(t); window.clearTimeout(ex); };
   }, []);
   return (
-    <div className="boot">
+    <div className="boot" data-exit={exiting ? "1" : "0"}>
       <div className="bootScan" aria-hidden="true" />
+      <div className="bootEmbers" aria-hidden="true" />
       <svg className="bootEmblemSvg" viewBox="0 0 800 1000" fill="none" stroke="#d6402e" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
         <g className="draw d1" strokeWidth="2.5" strokeOpacity="0.55">
           <circle cx="215" cy="600" r="205" />
@@ -4470,6 +4605,7 @@ function Boot() {
         </g>
       </svg>
       <div className="bootTitle">ARES</div>
+      <div className="bootSub">THE BATTLE-TESTED AGENT</div>
       <div className="bootLine" />
       <div className="bootLog">
         {BOOT_LOG.slice(0, logIdx + 1).map((line, i) => (
