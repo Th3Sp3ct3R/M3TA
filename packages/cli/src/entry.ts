@@ -2204,7 +2204,12 @@ function modelContextWindow(modelId: string): number {
 function isProviderFatalError(err: { code?: string; message?: string } | undefined): boolean {
   if (!err) return false;
   const blob = `${err.code ?? ""} ${err.message ?? ""}`.toLowerCase();
-  return /http_4\d\d|\b401\b|\b403\b|\b404\b|_throw|unauthorized|forbidden|not ?found|fetch failed|unreachable|enotfound|econnrefused|etimedout/.test(
+  // Context-limit / bad-request (400) errors are the PAYLOAD's fault, not the
+  // provider's health — failing over ships the same oversized prompt to the next
+  // provider and 400s identically (the cascade the user hit). Never fail over on
+  // these; the engine's context-shrink retry handles them.
+  if (/too long|too many tokens|maximum context|max context|context window|context_length|input length|exceeded max context|http_400|\b400\b/.test(blob)) return false;
+  return /http_(401|403|404|5\d\d)|\b401\b|\b403\b|\b404\b|_throw|unauthorized|forbidden|not ?found|fetch failed|unreachable|enotfound|econnrefused|etimedout/.test(
     blob,
   );
 }
@@ -2666,12 +2671,13 @@ async function terminalSettingsLines(live: LiveSession): Promise<string[]> {
 }
 
 function terminalKeyStatus(settings: UiSettings): Array<[string, boolean]> {
+  // Mirror daemon_ready: a key in the environment counts as configured too.
   return [
-    ["anthropic", Boolean(settings.anthropicKey)],
-    ["deepseek", Boolean(settings.deepSeekKey)],
-    ["openrouter", Boolean(settings.openRouterKey)],
-    ["ollama", Boolean(settings.ollamaApiKey)],
-    ["brave", Boolean(settings.braveKey)],
+    ["anthropic", Boolean(settings.anthropicKey || process.env.ANTHROPIC_API_KEY || process.env.ARES_ANTHROPIC_API_KEY)],
+    ["deepseek", Boolean(settings.deepSeekKey || process.env.DEEPSEEK_API_KEY)],
+    ["openrouter", Boolean(settings.openRouterKey || process.env.OPENROUTER_API_KEY)],
+    ["ollama", Boolean(settings.ollamaApiKey || process.env.OLLAMA_API_KEY)],
+    ["brave", Boolean(settings.braveKey || process.env.ARES_BRAVE_API_KEY)],
   ];
 }
 
@@ -3279,9 +3285,36 @@ async function daemonCommand(args: ParsedArgs): Promise<number> {
 
   commands.onInterrupt = (command) => {
     const sid = command.sessionId || DEFAULT_SID;
-    const entry = sessions.get(sid) ?? primaryEntry;
+    const entry = sessions.get(sid);
+    if (!entry) {
+      // Unknown/not-yet-spawned session id: do NOT silently interrupt the
+      // primary (that was hitting the wrong target and leaving the real busy
+      // session running). Abort every session that's actually mid-turn instead.
+      let hit = false;
+      for (const e of sessions.values()) {
+        if (e.turnActive) { e.live.session.interrupt(); hit = true; }
+      }
+      if (!hit) primaryEntry.live.session.interrupt();
+      tagEmit(command.sessionId, { type: "interrupted_by_user" });
+      return;
+    }
     entry.live.session.interrupt();
     tagEmit(command.sessionId, { type: "interrupted_by_user" });
+    // Watchdog: the abort above should make the turn tear down promptly (the
+    // engine now checks the signal every loop iteration). But if the turn is
+    // genuinely wedged (a tool ignoring its signal, a stalled provider stream),
+    // force the session free so it can accept new messages instead of rejecting
+    // every send with "a turn is already running".
+    if (entry.turnActive) {
+      const wedged = entry;
+      const t = setTimeout(() => {
+        if (wedged.turnActive) {
+          wedged.turnActive = false;
+          tagEmit(command.sessionId, { type: "turn_end", status: "interrupted", usage: {}, durationMs: 0 });
+        }
+      }, 5000);
+      t.unref?.();
+    }
   };
 
   // Apply any persisted Advanced-tab engine knobs (env-backed ones) on boot.
@@ -3343,6 +3376,11 @@ async function daemonCommand(args: ParsedArgs): Promise<number> {
     })();
   }, 60_000);
   const readySettings = await loadUiSettings();
+  // "Configured" must mean USABLE, not just "pasted into ui.json". A provider is
+  // configured if its key is in settings OR in the environment, plus OpenAI via
+  // its ChatGPT OAuth session. Otherwise an env-keyed Ollama-Cloud user (the
+  // default!) or an OAuth'd OpenAI user wrongly sees "only deepseek configured".
+  const readyAuth = await authStatus().catch(() => null);
   process.stdout.write(
     JSON.stringify({
       type: "daemon_ready",
@@ -3354,11 +3392,12 @@ async function daemonCommand(args: ParsedArgs): Promise<number> {
       routing: readySettings.routing ?? {},
       engine: readySettings.engine ?? {},
       keyStatus: {
-        anthropic: Boolean(readySettings.anthropicKey),
-        deepseek: Boolean(readySettings.deepSeekKey),
-        openrouter: Boolean(readySettings.openRouterKey),
-        ollama: Boolean(readySettings.ollamaApiKey),
-        brave: Boolean(readySettings.braveKey),
+        anthropic: Boolean(readySettings.anthropicKey || process.env.ANTHROPIC_API_KEY || process.env.ARES_ANTHROPIC_API_KEY),
+        openai: Boolean(readyAuth?.configured),
+        deepseek: Boolean(readySettings.deepSeekKey || process.env.DEEPSEEK_API_KEY),
+        openrouter: Boolean(readySettings.openRouterKey || process.env.OPENROUTER_API_KEY),
+        ollama: Boolean(readySettings.ollamaApiKey || process.env.OLLAMA_API_KEY),
+        brave: Boolean(readySettings.braveKey || process.env.ARES_BRAVE_API_KEY),
       },
     }) + "\n",
   );
@@ -3389,7 +3428,10 @@ async function daemonCommand(args: ParsedArgs): Promise<number> {
           process.stdout.write(JSON.stringify({ type: "daemon_error", error: "reasoning requires level: low|medium|high|max" }) + "\n");
           continue;
         }
+        // Apply to EVERY open session, not just the primary — otherwise changing
+        // the dial while in a spawned chat silently did nothing for that chat.
         live.session.setReasoningLevel(level);
+        for (const e of sessions.values()) e.live.session.setReasoningLevel(level);
         await updateUiSettings({ reasoningLevel: level });
         process.stdout.write(JSON.stringify({ type: "reasoning_set", level }) + "\n");
         continue;

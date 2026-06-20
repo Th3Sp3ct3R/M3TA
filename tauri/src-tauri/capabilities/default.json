@@ -12,6 +12,13 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-is-maximized",
     "core:window:allow-close",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-set-resizable",
+    "core:window:allow-set-always-on-top",
+    "core:window:allow-outer-size",
+    "core:window:allow-outer-position",
+    "core:window:allow-scale-factor",
     "updater:default",
     "process:default"
   ]

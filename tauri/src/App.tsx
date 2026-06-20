@@ -25,13 +25,19 @@ import React, { useCallback, useEffect, useImperativeHandle, useMemo, useRef, us
 import { createRoot } from "react-dom/client";
 import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, LogicalSize, PhysicalSize, PhysicalPosition } from "@tauri-apps/api/window";
 // The REAL holotable BUILD engine — same module the CLI's `ares holo` uses.
 // Any model plugged into Ares emits a HoloSpec (*.holo.json) and this renders
 // it: exploded view, assembly steps, wiring overlay, BOM with STL export.
 import { buildHolotableHtml, validateHoloSpec, type HoloSpec } from "../../packages/cli/src/holotable";
 import { UpdateBanner } from "./UpdateBanner";
 import "./styles.css";
+
+// The app version, injected by Vite's `define`. Guarded with typeof so that even
+// if the build ever fails to substitute the token (which white-screened the app
+// on a past update), this resolves to a harmless fallback instead of throwing a
+// ReferenceError that takes the whole UI down.
+const APP_VERSION: string = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "dev";
 
 // ─── Bridge contract ───────────────────────────────────────────────────────
 
@@ -1432,10 +1438,20 @@ function App() {
   const [reasoningOpen, setReasoningOpen] = useState(false);
   const [routingOpen, setRoutingOpen] = useState(false);
   const [cronOpen, setCronOpen] = useState(false);
+  // Floating-pill mode: shrink the window to an always-on-top mic bar.
+  const [pill, setPill] = useState(false);
+  const [pinTop, setPinTop] = useState(true);
+  const prePillGeom = useRef<{ size: PhysicalSize; pos: PhysicalPosition } | null>(null);
   const [anthropicAuth, setAnthropicAuth] = useState<{ open: boolean; status: "idle" | "opening" | "waiting" | "done" | "error"; error?: string }>({ open: false, status: "idle" });
   const oauthCtx = useRef<{ verifier: string; state: string }>({ verifier: "", state: "" });
   const [logLines, setLogLines] = useState<string[]>([]);
-  const [bootGone, setBootGone] = useState(!native);
+  const [bootGone, setBootGone] = useState(false);
+  // Universal splash dismiss — covers the web/demo build too (the native daemon
+  // connect path also clears it; whichever fires first wins, both idempotent).
+  useEffect(() => {
+    const t = window.setTimeout(() => setBootGone(true), 2150);
+    return () => window.clearTimeout(t);
+  }, []);
   const lastSeq = useRef(0);
   const scroller = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef("");
@@ -2303,6 +2319,11 @@ function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Notify themeable canvases (mermaid diagrams) so they re-tint on a war-band switch.
+  useEffect(() => {
+    window.dispatchEvent(new Event("ares-theme"));
+  }, [prefs.theme]);
+
   const paletteActions: PaletteAction[] = [
     { label: "New session", hint: "fresh Garrison session", run: newSession },
     { label: "Undo last agent change", hint: "restore the latest workspace checkpoint", run: undoLastChange },
@@ -2332,6 +2353,56 @@ function App() {
         .catch(() => null);
     }
   };
+
+  // ── floating pill: condense Ares to an always-on-top mic bar ───────────────
+  const PILL_W = 320;
+  const PILL_H = 60;
+  const enterPill = useCallback(async () => {
+    if (native) {
+      try {
+        const w = getCurrentWindow();
+        const [size, pos] = await Promise.all([w.outerSize(), w.outerPosition()]);
+        prePillGeom.current = { size, pos };
+        await w.setResizable(false);
+        await w.setAlwaysOnTop(pinTop);
+        await w.setSize(new LogicalSize(PILL_W, PILL_H));
+        // tuck it to the top-right of where the window was
+        const sf = await w.scaleFactor();
+        await w.setPosition(new PhysicalPosition(Math.round(pos.x + size.width - PILL_W * sf), pos.y));
+      } catch {
+        /* even if the window ops fail, still show the pill UI */
+      }
+    }
+    setPill(true);
+  }, [native, pinTop]);
+
+  const exitPill = useCallback(async () => {
+    if (native) {
+      try {
+        const w = getCurrentWindow();
+        await w.setAlwaysOnTop(false);
+        await w.setResizable(true);
+        const g = prePillGeom.current;
+        if (g) {
+          await w.setSize(g.size);
+          await w.setPosition(g.pos);
+        } else {
+          await w.setSize(new LogicalSize(1280, 820));
+        }
+      } catch {
+        /* ignore — UI still expands */
+      }
+    }
+    setPill(false);
+  }, [native]);
+
+  const togglePinTop = useCallback(async () => {
+    const next = !pinTop;
+    setPinTop(next);
+    if (native && pill) {
+      try { await getCurrentWindow().setAlwaysOnTop(next); } catch { /* noop */ }
+    }
+  }, [native, pill, pinTop]);
 
   const routedLanes = ROUTE_LANES.filter((l) => prefs.routing[l]);
   // The model that ACTUALLY handled this session's last turn (sticky/lane/
@@ -2407,9 +2478,23 @@ function App() {
       data-flame={prefs.flameMode}
       data-panel={forge.open ? "1" : "0"}
       data-working={active?.busy ? "1" : "0"}
+      data-pill={pill ? "1" : "0"}
       style={{ ["--forge-w" as string]: `${forgeWidth}px`, ["--heat" as string]: heat.toFixed(3), ["--draft" as string]: draft.toFixed(3) }}
     >
-      {!bootGone && native ? <Boot /> : null}
+      {pill ? (
+        <PillBar
+          daemon={daemon}
+          busy={active?.busy ?? false}
+          activity={activity ?? ""}
+          pinTop={pinTop}
+          onTogglePin={togglePinTop}
+          onExpand={exitPill}
+          onSend={(t) => send(t)}
+          onStop={stopTurn}
+          native={native}
+        />
+      ) : null}
+      {!bootGone ? <Boot /> : null}
       <UpdateBanner />
       <Backdrop />
       <div className="embers" aria-hidden="true" />
@@ -2419,44 +2504,52 @@ function App() {
       {/* Turbulence filter that makes the composer's flame rim actually lick + flicker. */}
       <svg width="0" height="0" style={{ position: "absolute" }} aria-hidden="true">
         <defs>
-          {/* coarse slow sway for the flame body */}
-          <filter id="flameTurbCoarse" x="-40%" y="-40%" width="180%" height="180%">
-            <feTurbulence type="fractalNoise" baseFrequency="0.012 0.028" numOctaves={2} seed={5} result="n">
-              <animate attributeName="baseFrequency" dur="2.6s" values="0.012 0.026;0.018 0.04;0.012 0.026" repeatCount="indefinite" />
+          {/* coarse slow sway for the flame body — higher octaves for organic
+             noise, then a soft blur so the displaced edge reads as fire, not a
+             jagged stretched polygon. */}
+          <filter id="flameTurbCoarse" x="-50%" y="-50%" width="200%" height="200%">
+            <feTurbulence type="fractalNoise" baseFrequency="0.011 0.026" numOctaves={4} seed={5} result="n">
+              <animate attributeName="baseFrequency" dur="3s" values="0.011 0.024;0.016 0.038;0.011 0.024" repeatCount="indefinite" />
             </feTurbulence>
-            <feDisplacementMap in="SourceGraphic" in2="n" scale={11} xChannelSelector="R" yChannelSelector="G" />
+            <feDisplacementMap in="SourceGraphic" in2="n" scale={13} xChannelSelector="R" yChannelSelector="G" result="d" />
+            <feGaussianBlur in="d" stdDeviation="1.1" />
           </filter>
           {/* medium licking for the mid layer */}
-          <filter id="flameTurb" x="-30%" y="-30%" width="160%" height="160%">
-            <feTurbulence type="fractalNoise" baseFrequency="0.02 0.05" numOctaves={2} seed={3} result="n">
-              <animate attributeName="baseFrequency" dur="1.4s" values="0.02 0.045;0.03 0.08;0.02 0.045" repeatCount="indefinite" />
+          <filter id="flameTurb" x="-40%" y="-40%" width="180%" height="180%">
+            <feTurbulence type="fractalNoise" baseFrequency="0.018 0.046" numOctaves={3} seed={3} result="n">
+              <animate attributeName="baseFrequency" dur="1.5s" values="0.018 0.042;0.028 0.072;0.018 0.042" repeatCount="indefinite" />
             </feTurbulence>
-            <feDisplacementMap in="SourceGraphic" in2="n" scale={7} xChannelSelector="R" yChannelSelector="G" />
+            <feDisplacementMap in="SourceGraphic" in2="n" scale={8} xChannelSelector="R" yChannelSelector="G" result="d" />
+            <feGaussianBlur in="d" stdDeviation="0.7" />
           </filter>
           {/* fast fine crackle for the white-hot core */}
-          <filter id="flameTurbFine" x="-30%" y="-30%" width="160%" height="160%">
-            <feTurbulence type="fractalNoise" baseFrequency="0.04 0.09" numOctaves={2} seed={8} result="n">
-              <animate attributeName="baseFrequency" dur="0.8s" values="0.04 0.08;0.06 0.13;0.04 0.08" repeatCount="indefinite" />
+          <filter id="flameTurbFine" x="-40%" y="-40%" width="180%" height="180%">
+            <feTurbulence type="fractalNoise" baseFrequency="0.038 0.086" numOctaves={3} seed={8} result="n">
+              <animate attributeName="baseFrequency" dur="0.85s" values="0.038 0.078;0.056 0.122;0.038 0.078" repeatCount="indefinite" />
             </feTurbulence>
-            <feDisplacementMap in="SourceGraphic" in2="n" scale={5} xChannelSelector="R" yChannelSelector="G" />
+            <feDisplacementMap in="SourceGraphic" in2="n" scale={5} xChannelSelector="R" yChannelSelector="G" result="d" />
+            <feGaussianBlur in="d" stdDeviation="0.4" />
           </filter>
           {/* body: deep red → orange, fading translucent at the tips */}
           <linearGradient id="flameGradBack" x1="0" y1="1" x2="0" y2="0">
-            <stop offset="0%" stopColor="var(--blood)" stopOpacity={0.9} />
-            <stop offset="45%" stopColor="var(--ember)" stopOpacity={0.8} />
+            <stop offset="0%" stopColor="var(--blood)" stopOpacity={0.95} />
+            <stop offset="35%" stopColor="var(--ember)" stopOpacity={0.85} />
+            <stop offset="72%" stopColor="var(--ember)" stopOpacity={0.4} />
             <stop offset="100%" stopColor="var(--ember)" stopOpacity={0} />
           </linearGradient>
           {/* mid: orange → gold, soft fade */}
           <linearGradient id="flameGradMid" x1="0" y1="1" x2="0" y2="0">
-            <stop offset="0%" stopColor="var(--ember)" stopOpacity={0.95} />
-            <stop offset="55%" stopColor="var(--ember-hi)" stopOpacity={0.95} />
-            <stop offset="100%" stopColor="#ffd98a" stopOpacity={0.15} />
+            <stop offset="0%" stopColor="var(--ember)" stopOpacity={0.98} />
+            <stop offset="40%" stopColor="var(--ember-hi)" stopOpacity={0.95} />
+            <stop offset="75%" stopColor="#ffd98a" stopOpacity={0.5} />
+            <stop offset="100%" stopColor="#ffd98a" stopOpacity={0} />
           </linearGradient>
           {/* core: gold → white-hot tips */}
           <linearGradient id="flameGradCore" x1="0" y1="1" x2="0" y2="0">
             <stop offset="0%" stopColor="var(--ember-hi)" stopOpacity={0} />
-            <stop offset="55%" stopColor="#ffe8b0" stopOpacity={0.85} />
-            <stop offset="100%" stopColor="#fff7e6" stopOpacity={0.98} />
+            <stop offset="45%" stopColor="#ffe8b0" stopOpacity={0.7} />
+            <stop offset="80%" stopColor="#fff7e6" stopOpacity={0.95} />
+            <stop offset="100%" stopColor="#fffdf7" stopOpacity={1} />
           </linearGradient>
         </defs>
       </svg>
@@ -2471,8 +2564,15 @@ function App() {
         <span className="pill" data-state={daemon}>
           {daemon === "running" ? "ONLINE" : daemon.toUpperCase()}
         </span>
-        {native ? (
-          <div className="winControls">
+        <div className="winControls">
+          <button className="winPill" aria-label="condense to floating pill" title="Condense to a floating pill" onClick={() => void enterPill()}>
+            <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="1.5" y="4.5" width="11" height="5" rx="2.5" />
+              <circle cx="4.2" cy="7" r="0.9" fill="currentColor" stroke="none" />
+            </svg>
+          </button>
+          {native ? (
+            <>
             <button aria-label="minimize" onClick={() => void invoke("ares_window_minimize").catch(() => null)}>
               <svg viewBox="0 0 10 10"><line x1="1" y1="5" x2="9" y2="5" /></svg>
             </button>
@@ -2482,8 +2582,9 @@ function App() {
             <button aria-label="close" className="winClose" onClick={() => void invoke("ares_window_close").catch(() => null)}>
               <svg viewBox="0 0 10 10"><line x1="1.5" y1="1.5" x2="8.5" y2="8.5" /><line x1="8.5" y1="1.5" x2="1.5" y2="8.5" /></svg>
             </button>
-          </div>
-        ) : null}
+            </>
+          ) : null}
+        </div>
       </header>
 
       <aside className="rail">
@@ -2595,7 +2696,6 @@ function App() {
           />
         ) : (
           <div className="chat" ref={scroller} onScroll={onChatScroll}>
-            <div className="chatWatermark" aria-hidden="true" />
             {active?.loading ? (
               <div className="empty">
                 <div className="wordmark">LOADING</div>
@@ -2699,7 +2799,7 @@ function App() {
             <span className="hudReadout" title="tokens in / out this session">
               ↑{fmtTokens(active?.tokensIn ?? 0)} ↓{fmtTokens(active?.tokensOut ?? 0)}
             </span>
-            <span className="hudVersion">v{__APP_VERSION__}</span>
+            <span className="hudVersion">v{APP_VERSION}</span>
           </div>
         </footer>
       </main>
@@ -2819,16 +2919,28 @@ function App() {
           onClose={() => setModelPopOpen(false)}
           onPickAuto={() => {
             setModelPopOpen(false);
-            const next = { ...prefs, routingMode: "auto" as const };
+            // Toggle: if auto is already on, clicking the card turns it OFF (back
+            // to the manual main model) — previously there was no way to disable.
+            const enabled = prefs.routingMode !== "auto";
+            const next = { ...prefs, routingMode: (enabled ? "auto" : "manual") as "auto" | "manual" };
             setPrefs(next);
             savePrefs(next);
-            daemonCmd({ type: "routing_mode", enabled: true });
+            // Reflect the switch in the footer/composer NOW. liveModel prefers the
+            // session's turnModel (the model that handled the last turn); without
+            // clearing it, the readout would keep showing the previous turn's model
+            // and the user's pick would look like it "did nothing".
+            apply((s) => ({ ...s, turnModel: enabled ? undefined : next.model, turnProvider: enabled ? undefined : next.provider }));
+            daemonCmd({ type: "routing_mode", enabled });
           }}
           onPick={(provider, model) => {
             setModelPopOpen(false);
             const next = { ...prefs, provider, model, routingMode: "manual" as const };
             setPrefs(next);
             savePrefs(next);
+            // Immediately show the picked model in the footer/composer. The next
+            // turn's route_resolved event overwrites this with whatever actually
+            // ran (failover-aware), but until then the readout must match the pick.
+            apply((s) => ({ ...s, turnModel: model, turnProvider: provider, turnLane: undefined }));
             if (native) {
               if (daemon === "running") {
                 void invoke("ares_daemon_command", { command: { type: "model_switch", provider, model } }).catch((err) => {
@@ -3072,25 +3184,24 @@ function RoutingPanel({
   return (
     <div className="paletteScrim" onClick={onClose}>
       <div className="palette routingPop" onClick={(e) => e.stopPropagation()}>
-        <div className="popTitle">
-          Routing — the war table
-          <button className="ghost popClose" onClick={onClose}>
-            Close
-          </button>
+        <div className="routingHead">
+          <div>
+            <strong>The War Table</strong>
+            <span>Assign a model to each kind of work. Any assignment turns on auto-routing; unset lanes use your main model ({prefs.model}).</span>
+          </div>
+          <button className="ghost popClose" onClick={onClose}>Close</button>
         </div>
         <div className="routingPopBody">
-          <p className="routingHint">
-            Assign a model to each task lane. Applying one or more lanes enables Routing (Auto); unassigned lanes fall back to the
-            main model ({prefs.provider} · {prefs.model}).
-          </p>
           {ROUTE_LANES.map((lane) => {
             const entry = routing[lane];
+            const open = !!entry;
             return (
-              <div key={lane} className="routeLane" data-on={entry ? "1" : "0"}>
+              <div key={lane} className="routeLane" data-on={open ? "1" : "0"}>
                 <button className="laneToggle" onClick={() => setLane(lane, entry ? undefined : { provider: prefs.provider, model: prefs.model })}>
                   <i />
-                  <span>{lane}</span>
-                  <em>{LANE_HINTS[lane]}</em>
+                  <span className="laneName">{lane}</span>
+                  <em className="laneHint">{LANE_HINTS[lane]}</em>
+                  {entry ? <span className="laneModel">{entry.model}</span> : <span className="laneFallback">main model</span>}
                 </button>
                 {entry ? (
                   <div className="laneBody">
@@ -3148,14 +3259,14 @@ function ModelPopover({
   return (
     <div className="paletteScrim" onClick={onClose}>
       <div className="palette modelSwap" onClick={(e) => e.stopPropagation()}>
-        <button className="autoRoutePick" data-on={prefs.routingMode === "auto" ? "1" : "0"} onClick={onPickAuto}>
+        <button className="autoRoutePick" data-on={prefs.routingMode === "auto" ? "1" : "0"} onClick={onPickAuto} title={prefs.routingMode === "auto" ? "Routing is ON — click to switch back to a single manual model" : "Enable per-lane auto routing"}>
           <span>
-            <strong>Routing (Auto)</strong>
-            <em>classifies each turn and uses your lane assignments</em>
+            <strong>Routing (Auto){prefs.routingMode === "auto" ? " · ON" : ""}</strong>
+            <em>{prefs.routingMode === "auto" ? "click to disable — pick a model below for manual" : "classifies each turn and uses your lane assignments"}</em>
           </span>
-          <i>{Object.keys(prefs.routing).length} lanes</i>
+          <i>{prefs.routingMode === "auto" ? "ON" : `${Object.keys(prefs.routing).length} lanes`}</i>
         </button>
-        <div className="segment" style={{ padding: "10px 12px 0" }}>
+        <div className="segment">
           {PROVIDERS.map((p) => (
             <button key={p} data-on={provider === p ? "1" : "0"} onClick={() => setProvider(p)}>
               {p}
@@ -3678,6 +3789,177 @@ function SessionRow({
   );
 }
 
+// ─── Dictation (speech → text) ───────────────────────────────────────────────
+// Mic → MediaRecorder (webm/opus) → Google Speech REST. Same public Chromium key
+// the rest of Ares uses for voice notes; the webview reaches the API directly
+// (verified: no CORS wall), so this needs no daemon, no native bridge, no keys.
+const STT_KEY_ENC = "QUl6YVN5Qk90aTRtTS02eDlXRG5aSWpJZXlFVTIxT3BCWHFXQmd3";
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const s = String(r.result ?? "");
+      resolve(s.slice(s.indexOf(",") + 1)); // strip the data: prefix
+    };
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+async function transcribeSpeech(blob: Blob, language = "en-US"): Promise<string> {
+  const key = atob(STT_KEY_ENC);
+  const content = await blobToBase64(blob);
+  const res = await fetch(`https://speech.googleapis.com/v1/speech:recognize?key=${key}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      config: { encoding: "WEBM_OPUS", languageCode: language, model: "default", enableAutomaticPunctuation: true },
+      audio: { content },
+    }),
+  });
+  if (!res.ok) throw new Error(`stt ${res.status}`);
+  const data = (await res.json()) as { results?: Array<{ alternatives?: Array<{ transcript?: string }> }> };
+  return (data.results ?? []).map((r) => r.alternatives?.[0]?.transcript ?? "").join(" ").trim();
+}
+
+type DictState = "idle" | "recording" | "thinking" | "error";
+/** Click to record, click to stop → transcribe → onText. Auto-stops on unmount. */
+function useDictation(onText: (text: string) => void) {
+  const [state, setState] = useState<DictState>("idle");
+  const recRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const onTextRef = useRef(onText);
+  onTextRef.current = onText;
+
+  const cleanupStream = () => {
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+  };
+
+  const stop = useCallback(() => {
+    if (recRef.current && recRef.current.state !== "inactive") recRef.current.stop();
+  }, []);
+
+  const start = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+      const rec = new MediaRecorder(stream, { mimeType: mime });
+      chunksRef.current = [];
+      rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
+      rec.onstop = async () => {
+        cleanupStream();
+        const blob = new Blob(chunksRef.current, { type: mime });
+        if (!blob.size) { setState("idle"); return; }
+        setState("thinking");
+        try {
+          const txt = await transcribeSpeech(blob);
+          setState("idle");
+          if (txt) onTextRef.current(txt);
+        } catch {
+          setState("error");
+          setTimeout(() => setState("idle"), 2400);
+        }
+      };
+      rec.start();
+      recRef.current = rec;
+      setState("recording");
+    } catch {
+      cleanupStream();
+      setState("error");
+      setTimeout(() => setState("idle"), 2400);
+    }
+  }, []);
+
+  const toggle = useCallback(() => {
+    setState((s) => {
+      if (s === "recording") { stop(); return s; }
+      if (s === "idle" || s === "error") { void start(); }
+      return s;
+    });
+  }, [start, stop]);
+
+  useEffect(() => () => { stop(); cleanupStream(); }, [stop]);
+
+  return { state, toggle };
+}
+
+const MicGlyph = () => (
+  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="5.5" y="1.5" width="5" height="8.5" rx="2.5" />
+    <path d="M3.5 7.5 A4.5 4.5 0 0 0 12.5 7.5 M8 12 L8 14.5 M5.5 14.5 L10.5 14.5" />
+  </svg>
+);
+
+// ─── The floating pill — Ares condensed to an always-on-top mic bar ──────────
+function PillBar({
+  daemon,
+  busy,
+  activity,
+  pinTop,
+  onTogglePin,
+  onExpand,
+  onSend,
+  onStop,
+  native,
+}: {
+  daemon: DaemonState;
+  busy: boolean;
+  activity: string;
+  pinTop: boolean;
+  onTogglePin: () => void;
+  onExpand: () => void;
+  onSend: (text: string) => void;
+  onStop: () => void;
+  native: boolean;
+}) {
+  const dictation = useDictation((t) => { if (t) onSend(t); });
+  const label =
+    dictation.state === "recording" ? "listening…" :
+    dictation.state === "thinking" ? "transcribing…" :
+    dictation.state === "error" ? "mic blocked" :
+    busy ? (activity || "working…") :
+    daemon === "running" ? "ready" : daemon;
+
+  const onDrag = (e: React.MouseEvent) => {
+    if (!native || e.button !== 0) return;
+    if ((e.target as HTMLElement).closest("button")) return;
+    void getCurrentWindow().startDragging().catch(() => null);
+  };
+
+  return (
+    <div className="pillBar" data-busy={busy ? "1" : "0"} onMouseDown={onDrag}>
+      <div className="pillMark" aria-hidden="true" />
+      <span className="pillStatus">
+        <i className="dot" data-state={busy ? "running" : daemon} />
+        <em>{label}</em>
+      </span>
+      <span className="pillGrow" />
+      <button className="pillMic" data-state={dictation.state} onClick={dictation.toggle} title={dictation.state === "recording" ? "stop & send" : "speak to Ares"}>
+        {dictation.state === "thinking" ? <i className="pillSpin" /> : <MicGlyph />}
+      </button>
+      {busy ? (
+        <button className="pillBtn" onClick={onStop} title="stop the turn">
+          <svg viewBox="0 0 16 16" fill="currentColor"><rect x="4" y="4" width="8" height="8" rx="1.5" /></svg>
+        </button>
+      ) : null}
+      <button className="pillBtn" data-on={pinTop ? "1" : "0"} onClick={onTogglePin} title={pinTop ? "always-on-top: ON" : "always-on-top: OFF"}>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M5 2 L11 2 L10 7 L13 10 L3 10 L6 7 Z M8 10 L8 14" />
+        </svg>
+      </button>
+      <button className="pillBtn" onClick={onExpand} title="expand Ares">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M9 2 L14 2 L14 7 M14 2 L8.5 7.5 M7 14 L2 14 L2 9 M2 14 L7.5 8.5" />
+        </svg>
+      </button>
+    </div>
+  );
+}
+
 // ─── Composer ───────────────────────────────────────────────────────────────
 // Owns its OWN text state so keystrokes never re-render the transcript. Sends,
 // or steers mid-turn (queue a message the daemon folds in at a safe boundary).
@@ -3714,6 +3996,11 @@ const Composer = React.memo(function Composer({
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Array<{ name: string; dataUrl: string }>>([]);
   const ref = useRef<HTMLTextAreaElement | null>(null);
+  // Dictation drops the transcript into the draft (appended), then focuses.
+  const dictation = useDictation((t) => {
+    setText((prev) => (prev.trim() ? prev.replace(/\s+$/, "") + " " : "") + t);
+    ref.current?.focus();
+  });
 
   const addFiles = (files: Iterable<File>) => {
     for (const file of files) {
@@ -3745,20 +4032,13 @@ const Composer = React.memo(function Composer({
   return (
     <div className="composer">
       {todos.length > 0 ? <TodoPanel todos={todos} /> : null}
-      <div className="chips">
-        <button className="chip" onClick={onModelChip} title="provider / model — click to hot-swap">
-          {model}
-        </button>
-        <button className="chip" onClick={onReasoningChip} title="reasoning effort — click to cycle">
-          reasoning · {reasoning}
-        </button>
-        {routedLanes.length > 0 ? (
-          <button className={autoRouting ? "chip routed" : "chip"} onClick={onRoutingChip} title={autoRouting ? "per-lane model routing is active" : "routing lanes are configured but manual model selection is active"}>
-            routing {autoRouting ? "·" : "ready ·"} {routedLanes.join(" / ")}
-          </button>
-        ) : null}
-        {busy && steerQueued > 0 ? <span className="chip steerChip">{steerQueued} steer queued</span> : null}
-      </div>
+      {/* Model / reasoning / routing live in the bottom HUD only — no duplicate
+         control strip over the input. Just a contextual steer indicator here. */}
+      {busy && steerQueued > 0 ? (
+        <div className="chips">
+          <span className="chip steerChip">{steerQueued} steer queued</span>
+        </div>
+      ) : null}
       {attachments.length > 0 ? (
         <div className="attachments">
           {attachments.map((a, idx) => (
@@ -3807,6 +4087,15 @@ const Composer = React.memo(function Composer({
             }
           }}
         />
+        <button
+          className="mic"
+          data-state={dictation.state}
+          onClick={dictation.toggle}
+          aria-label="dictate"
+          title={dictation.state === "recording" ? "stop & transcribe" : dictation.state === "error" ? "mic unavailable" : "speak to type"}
+        >
+          {dictation.state === "thinking" ? <i className="micSpin" /> : <MicGlyph />}
+        </button>
         {busy ? (
           <>
             {text.trim() ? (
@@ -4173,21 +4462,24 @@ const ItemView = React.memo(function ItemView({
   if (item.kind === "permission") {
     return (
       <div className="gate" data-decided={item.decided ? "1" : "0"}>
-        <div>
-          <strong>The Gate</strong>
-          <span>
-            {item.toolName} — {item.reason || "wants to act"}
+        <span className="gateIcon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z" />
+          </svg>
+        </span>
+        <div className="gateBody">
+          <strong>Approval needed</strong>
+          <span className="gateReason">
+            <b>{item.toolName}</b> · {item.reason || "wants to act"}
           </span>
         </div>
         {item.decided ? (
-          <em>{item.decided}</em>
+          <em className="gateDecided">{item.decided}</em>
         ) : (
           <div className="gateActions">
-            <button onClick={() => onPermission(item.id, "allow_once")}>Allow once</button>
-            <button onClick={() => onPermission(item.id, "allow_always")}>Always</button>
-            <button className="deny" onClick={() => onPermission(item.id, "deny")}>
-              Deny
-            </button>
+            <button className="gateAllow" onClick={() => onPermission(item.id, "allow_once")}>Allow</button>
+            <button className="gateAlways" onClick={() => onPermission(item.id, "allow_always")}>Always</button>
+            <button className="gateDeny" onClick={() => onPermission(item.id, "deny")}>Deny</button>
           </div>
         )}
       </div>
@@ -4302,37 +4594,50 @@ const RichContent = React.memo(function RichContent({ text }: { text: string }) 
 
 let mermaidReady: Promise<typeof import("mermaid").default> | null = null;
 function loadMermaid() {
-  mermaidReady ??= import("mermaid").then((m) => {
-    m.default.initialize({
-      startOnLoad: false,
-      securityLevel: "strict",
-      theme: "base",
-      themeVariables: {
-        background: "transparent",
-        primaryColor: "#1e1213",
-        primaryBorderColor: "#d6402e",
-        primaryTextColor: "#f0e3da",
-        lineColor: "#d6402e",
-        secondaryColor: "#160d0e",
-        tertiaryColor: "#120c0d",
-        fontFamily: "Cascadia Code, ui-monospace, monospace",
-        fontSize: "13px",
-      },
-    });
-    return m.default;
-  });
+  // Just resolve the module — initialization happens per-render so diagrams
+  // pick up the live war-band tokens (and re-tint when the theme changes).
+  mermaidReady ??= import("mermaid").then((m) => m.default);
   return mermaidReady;
+}
+
+/** Read the active theme's tokens off the shell so the diagram matches the room. */
+function mermaidThemeVars() {
+  const el = document.querySelector(".ares") ?? document.documentElement;
+  const cs = getComputedStyle(el);
+  const v = (name: string, fallback: string) => cs.getPropertyValue(name).trim() || fallback;
+  const accent = v("--accent", "#d6402e");
+  return {
+    background: "transparent",
+    primaryColor: v("--panel-2", "#1e1213"),
+    primaryBorderColor: accent,
+    primaryTextColor: v("--text", "#f0e3da"),
+    lineColor: accent,
+    secondaryColor: v("--panel", "#160d0e"),
+    tertiaryColor: v("--bg-raised", "#120c0d"),
+    fontFamily: "Cascadia Code, ui-monospace, monospace",
+    fontSize: "13px",
+  };
 }
 
 let mermaidSeq = 0;
 function MermaidDiagram({ code, complete }: { code: string; complete: boolean }) {
   const ref = useRef<HTMLDivElement | null>(null);
   const [err, setErr] = useState(false);
+  // Re-tint when the war-band changes — App dispatches "ares-theme" on switch.
+  const [themeTick, setThemeTick] = useState(0);
+  useEffect(() => {
+    const bump = () => setThemeTick((n) => n + 1);
+    window.addEventListener("ares-theme", bump);
+    return () => window.removeEventListener("ares-theme", bump);
+  }, []);
   useEffect(() => {
     if (!complete || !code.trim()) return;
     let alive = true;
     void loadMermaid().then(async (mermaid) => {
       try {
+        // Re-initialize with the live theme tokens right before rendering so the
+        // diagram always matches the active war-band.
+        mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "base", themeVariables: mermaidThemeVars() });
         const { svg } = await mermaid.render(`aresmmd${++mermaidSeq}`, code.trim());
         if (alive && ref.current) {
           ref.current.innerHTML = svg;
@@ -4345,7 +4650,7 @@ function MermaidDiagram({ code, complete }: { code: string; complete: boolean })
     return () => {
       alive = false;
     };
-  }, [code, complete]);
+  }, [code, complete, themeTick]);
   if (!complete) return <div className="mermaidBlock building">◆ diagram building…</div>;
   if (err)
     return (
@@ -4578,41 +4883,27 @@ function Boot() {
   const [logIdx, setLogIdx] = useState(0);
   const [exiting, setExiting] = useState(false);
   useEffect(() => {
-    const t = window.setInterval(() => setLogIdx((i) => Math.min(i + 1, BOOT_LOG.length - 1)), 300);
+    const t = window.setInterval(() => setLogIdx((i) => Math.min(i + 1, BOOT_LOG.length - 1)), 320);
     // Forge-bloom exit just before the parent unmounts — the splash blooms hot
     // and dissolves into the live shell instead of vanishing instantly.
-    const ex = window.setTimeout(() => setExiting(true), 1720);
+    const ex = window.setTimeout(() => setExiting(true), 1820);
     return () => { window.clearInterval(t); window.clearTimeout(ex); };
   }, []);
   return (
     <div className="boot" data-exit={exiting ? "1" : "0"}>
-      <div className="bootScan" aria-hidden="true" />
+      <div className="bootHero" aria-hidden="true" />
+      <div className="bootVignette" aria-hidden="true" />
       <div className="bootEmbers" aria-hidden="true" />
-      <svg className="bootEmblemSvg" viewBox="0 0 800 1000" fill="none" stroke="#d6402e" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-        <g className="draw d1" strokeWidth="2.5" strokeOpacity="0.55">
-          <circle cx="215" cy="600" r="205" />
-          <circle cx="215" cy="600" r="162" />
-          <circle cx="215" cy="600" r="34" />
-        </g>
-        <g className="draw d2" strokeWidth="3" strokeOpacity="0.8">
-          <path d="M150 952 L618 118" />
-          <path d="M618 118 C 596 154, 590 176, 596 206 C 616 186, 632 168, 640 138 C 638 126, 630 118, 618 118 Z" />
-        </g>
-        <g className="draw d3" transform="translate(168,118) scale(1.42)" strokeWidth="2.6">
-          <path d="M200 28 C 116 28 64 96 60 178 C 57 236 70 284 78 330 C 86 376 88 420 84 470 C 120 448 142 436 152 410 L 162 348 C 165 330 162 318 150 306 C 138 292 132 272 132 252 L 132 216" />
-          <path d="M200 28 C 284 28 336 96 340 178 C 343 236 330 284 322 330 C 314 376 312 420 316 470 C 280 448 258 436 248 410 L 238 348 C 235 330 238 318 250 306 C 262 292 268 272 268 252 L 268 216" />
-          <path d="M132 216 C 152 204 172 198 188 198 L 188 300 C 188 318 192 330 200 340 C 208 330 212 318 212 300 L 212 198 C 228 198 248 204 268 216" />
-        </g>
-      </svg>
-      <div className="bootTitle">ARES</div>
-      <div className="bootSub">THE BATTLE-TESTED AGENT</div>
-      <div className="bootLine" />
-      <div className="bootLog">
-        {BOOT_LOG.slice(0, logIdx + 1).map((line, i) => (
-          <span key={line} data-current={i === logIdx ? "1" : "0"}>
-            {line}
-          </span>
-        ))}
+      <div className="bootCore">
+        <div className="bootEmblem" aria-hidden="true">
+          <span className="bootRing bootRing1" />
+          <span className="bootRing bootRing2" />
+          <span className="bootSigil" />
+        </div>
+        <div className="bootWord">ARES</div>
+        <div className="bootSub">THE BATTLE-TESTED AGENT</div>
+        <div className="bootBar"><i style={{ width: `${((logIdx + 1) / BOOT_LOG.length) * 100}%` }} /></div>
+        <div className="bootStatus" key={logIdx}>{BOOT_LOG[logIdx]}</div>
       </div>
     </div>
   );
@@ -4708,16 +4999,17 @@ function ModelPicker({
             </div>
             {filtered
               .filter((m) => m.group === g)
-              .map((m) => (
-                <button key={m.id} className="modelRow" data-on={m.id === value ? "1" : "0"} onClick={() => choose(m.id)}>
+              .map((m, i) => (
+                <button key={m.id} className="modelRow" data-on={m.id === value ? "1" : "0"} style={{ ["--i" as string]: i }} onClick={() => choose(m.id)}>
                   <span className="modelIdentity">
                     <span className="modelId">{m.id}</span>
-                    {m.label && m.label !== m.id ? <span className="modelLabel">{m.label}</span> : null}
+                    <span className="modelTags">
+                      {m.label && m.label !== m.id ? <span className="modelLabel">{m.label}</span> : null}
+                      {m.capabilities?.slice(0, 3).map((cap) => <i key={cap}>{cap}</i>)}
+                    </span>
                   </span>
-                  <span className="modelMeta">
-                    {m.capabilities?.slice(0, 3).map((cap) => <i key={cap}>{cap}</i>)}
-                    {m.hint ? <span className="modelHint">{m.hint}</span> : null}
-                  </span>
+                  {m.hint ? <span className="modelHint">{m.hint}</span> : null}
+                  <span className="modelTick" aria-hidden="true" />
                 </button>
               ))}
           </React.Fragment>

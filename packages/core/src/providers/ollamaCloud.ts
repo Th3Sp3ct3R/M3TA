@@ -249,6 +249,11 @@ export class OllamaCloudPool {
           : undefined,
       stream: true,
       options: { num_ctx: ollamaNumCtx(), temperature: 0.2 },
+      // Reasoning dial → native /api/chat "think" flag. Without this, the
+      // fallback path silently dropped reasoning entirely (the /v1/messages
+      // compat path sends a thinking budget; this one sent nothing). Models that
+      // support thinking now actually reason on the native endpoint too.
+      ...(req.reasoningLevel ? { think: true } : {}),
       // Inject the system prompt as a leading system message — Ollama
       // doesn't have a separate `system` field at the chat-level API.
       ...(req.system

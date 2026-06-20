@@ -12,6 +12,7 @@
 
 import {
   type ContentBlock,
+  type ImageBlock,
   type Message,
   type StreamEvent,
   type TurnEvent,
@@ -222,28 +223,41 @@ function estimateTextTokens(text: string): number {
   return Math.ceil(text.length / CHARS_PER_TOKEN);
 }
 
+/** A base64 screenshot's REAL token cost tracks its encoded payload size, not a
+ *  flat tile estimate — a high-res ComputerUse/browser frame is hundreds of
+ *  thousands of tokens. Undercounting it (the old flat 1024) let the budgeter
+ *  ship a payload double the model's context window → "prompt too long" 400s
+ *  that compaction couldn't fix (the bulk was images, not summarizable text). */
+function estimateImageTokens(source: ImageBlock["source"]): number {
+  if (source.kind === "base64") return Math.max(IMAGE_TOKEN_ESTIMATE, Math.ceil(source.data.length / CHARS_PER_TOKEN));
+  return IMAGE_TOKEN_ESTIMATE; // url image — true size unknown, rough floor
+}
+
+function estimateBlockTokens(b: ContentBlock): number {
+  switch (b.type) {
+    case "text":
+    case "thinking":
+      return estimateTextTokens(b.text);
+    case "system_reminder":
+      return estimateTextTokens(b.text) + 8;
+    case "tool_result":
+      // tool_result content can be a string OR an array of text/image blocks
+      // (ComputerUse returns screenshots here) — size each block for real.
+      if (typeof b.content === "string") return estimateTextTokens(b.content);
+      if (Array.isArray(b.content)) return b.content.reduce((s, c) => s + estimateBlockTokens(c as ContentBlock), 0);
+      return estimateTextTokens(JSON.stringify(b.content));
+    case "tool_use":
+      return estimateTextTokens(b.name) + estimateTextTokens(JSON.stringify(b.input));
+    case "image":
+      return estimateImageTokens(b.source);
+    default:
+      return 0;
+  }
+}
+
 function estimateMessageTokens(m: Message): number {
   let t = 8; // per-message role/framing overhead
-  for (const b of m.content) {
-    switch (b.type) {
-      case "text":
-      case "thinking":
-        t += estimateTextTokens(b.text);
-        break;
-      case "system_reminder":
-        t += estimateTextTokens(b.text) + 8;
-        break;
-      case "tool_result":
-        t += estimateTextTokens(typeof b.content === "string" ? b.content : JSON.stringify(b.content));
-        break;
-      case "tool_use":
-        t += estimateTextTokens(b.name) + estimateTextTokens(JSON.stringify(b.input));
-        break;
-      case "image":
-        t += IMAGE_TOKEN_ESTIMATE;
-        break;
-    }
-  }
+  for (const b of m.content) t += estimateBlockTokens(b);
   return t;
 }
 
@@ -330,6 +344,28 @@ export function keepRecentImages(messages: readonly Message[], keepLast = 2): Me
     out.push(changed ? { ...m, content } : m);
   }
   return out.reverse();
+}
+
+/**
+ * Trim images until the outbound payload fits the budget. budgetMessages drops
+ * OLD whole messages, but the heaviest images are usually in the MOST RECENT
+ * turn (a fresh ComputerUse screenshot) which budgeting must keep — so two
+ * full-res frames alone can exceed the model's window. This drops images
+ * (newest-kept-count 2 → 1 → 0) until the real estimate fits, guaranteeing we
+ * never ship a payload over the limit even if it means sending zero screenshots.
+ */
+export function fitImagesToBudget(
+  messages: readonly Message[],
+  budgetTokens: number,
+  overheadTokens: number,
+): Message[] {
+  for (const keep of [2, 1, 0]) {
+    const trimmed = keepRecentImages(messages, keep);
+    if (budgetTokens <= 0) return trimmed;
+    const total = overheadTokens + trimmed.reduce((s, m) => s + estimateMessageTokens(m), 0);
+    if (total <= budgetTokens) return trimmed;
+  }
+  return keepRecentImages(messages, 0);
 }
 
 /**
@@ -438,6 +474,9 @@ export class QueryEngine {
   /** Per-turn abort controller — interrupt() stops the CURRENT turn without
    *  poisoning the session; the next turn gets a fresh controller. */
   private turnAbort: AbortController | null = null;
+  /** An interrupt that arrived before this turn's controller existed (during the
+   *  pre-stream preamble) — honored the instant the controller is created. */
+  private interruptPending = false;
   /**
    * Live estimate→real token ratio, calibrated from the usage every provider
    * returns. The char-based estimator over-counts code/JSON and under-counts
@@ -496,6 +535,10 @@ export class QueryEngine {
   /** Stop the in-flight turn (provider stream + running tools see the abort).
    *  Safe to call when idle — the next turn is unaffected. */
   interrupt(): void {
+    // Arm a pending flag too: a Stop pressed during the pre-stream preamble
+    // (recall / compaction model call) arrives before turnAbort exists — without
+    // this it would silently no-op and the turn would run to completion.
+    this.interruptPending = true;
     this.turnAbort?.abort();
   }
 
@@ -733,6 +776,14 @@ export class QueryEngine {
       throw new Error("streamTurn() requires a pending user message; call appendUserMessage() first");
     }
 
+    // Arm the per-turn abort controller IMMEDIATELY — before turn_start, the
+    // reminder yields, and (critically) the compaction model call below — so a
+    // Stop pressed during the preamble actually aborts instead of no-opping.
+    // Honor an interrupt that landed in the gap before this generator ran.
+    this.turnAbort = new AbortController();
+    if (this.interruptPending) this.turnAbort.abort();
+    this.interruptPending = false;
+
     // Inject pending system-reminders into the user message before yielding
     // turn_start. The turn_start event remains first for stable rollout/daemon
     // consumers, and reminder telemetry follows immediately after.
@@ -766,7 +817,7 @@ export class QueryEngine {
     // backstop, not a leash.
     const maxIters = this.cfg.maxTurns ?? 80;
     const gatherStallRounds = currentGatherStallRounds();
-    this.turnAbort = new AbortController();
+    // (turnAbort was already armed at the top of the turn — see above.)
     let ledgerAnnounced = false;
     let lastProgressIter = -1;
     let lastConvergenceIter = -Infinity;
@@ -792,6 +843,14 @@ export class QueryEngine {
     let ceilingNudged = false;
 
     for (let iter = 0; iter < maxIters; iter++) {
+      // Honor a Stop at every iteration boundary — independent of provider
+      // timing or whether a tool cooperated with its abort signal. Without this
+      // an interrupt during/after a non-cooperative tool wouldn't be felt until
+      // the next provider stream (many seconds), so Stop appeared dead.
+      if (this.liveSignal().aborted) {
+        yield { type: "turn_end", status: "interrupted", usage: totalUsage, durationMs: Date.now() - startedAt };
+        return;
+      }
       // ─── Stream one assistant turn from the provider ─────────────────
       const pendingToolUses: Array<{ id: string; name: string; input: unknown }> = [];
       const toolNameById = new Map<string, string>();
@@ -868,9 +927,11 @@ export class QueryEngine {
                 }
               }
             }
-            // Drop all but the last couple of screenshots so a vision-heavy
-            // browser/ComputerUse loop can't balloon one turn to millions of tokens.
-            const outboundMessages = keepRecentImages(budgeted.messages, 2);
+            // Drop screenshots until the payload actually fits the model window —
+            // budget-aware, so a vision-heavy ComputerUse/browser loop can't ship
+            // a prompt past the context limit (it keeps 2 recent frames, then 1,
+            // then 0 as needed). budgetMessages already trimmed old whole messages.
+            const outboundMessages = fitImagesToBudget(budgeted.messages, budgetAttempts[attempt], overheadTokens);
             const estPromptTokens =
               overheadTokens + outboundMessages.reduce((s, m) => s + estimateMessageTokens(m), 0);
             const stream = this.cfg.provider.stream({
