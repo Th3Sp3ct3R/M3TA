@@ -62,11 +62,13 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: tauri
-          args: --bundles appimage
+          args: --bundles appimage,deb
 
-      - name: Upload AppImage artifact
+      - name: Upload Linux artifacts (.AppImage + .deb)
         uses: actions/upload-artifact@v4
         with:
-          name: Ares-Linux-AppImage
-          path: tauri/src-tauri/target/release/bundle/appimage/*.AppImage
+          name: Ares-Linux
+          path: |
+            tauri/src-tauri/target/release/bundle/appimage/*.AppImage
+            tauri/src-tauri/target/release/bundle/deb/*.deb
           if-no-files-found: error
