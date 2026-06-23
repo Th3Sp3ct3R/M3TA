@@ -56,6 +56,10 @@ export interface PathPermissionStore {
 
 export interface CommandPermissionStore {
   decide(toolName: string, command: string): PermissionDecision | null;
+  /** Persist an "always allow this command" grant chosen at the prompt, so the
+   *  next session doesn't re-ask. Optional: hosts without a writable store omit
+   *  it and `allow_always` simply behaves like `allow_once` (the prior behavior). */
+  grant?(toolName: string, command: string, scope: PathGrantScope): Promise<void> | void;
 }
 
 export interface SubModelPool {
@@ -89,6 +93,8 @@ export interface Tool<I extends z.ZodTypeAny = z.ZodTypeAny, O = unknown> {
   checkPermissions(input: z.infer<I>, ctx: RichToolContext): Promise<PermissionDecision>;
   call(input: z.infer<I>, ctx: RichToolContext): Promise<ToolResult<O>>;
   activityDescription(input: z.infer<I>): string;
+  /** Command string for `allow_always` persistence (Bash/PowerShell); see ToolDef. */
+  commandFor?(input: z.infer<I>): string | undefined;
 }
 
 export interface ToolDef<I extends z.ZodTypeAny, O> {
@@ -109,6 +115,11 @@ export interface ToolDef<I extends z.ZodTypeAny, O> {
   checkPermissions?: (input: z.infer<I>, ctx: RichToolContext) => Promise<PermissionDecision>;
   call: (input: z.infer<I>, ctx: RichToolContext) => Promise<ToolResult<O>>;
   activityDescription: (input: z.infer<I>) => string;
+  /** For command tools (Bash/PowerShell): the command string from the input, so
+   *  the permission gate can persist an `allow_always` grant. Tools that aren't
+   *  command-shaped omit this — then `allow_always` is honored for the turn but,
+   *  as before, nothing is written. */
+  commandFor?: (input: z.infer<I>) => string | undefined;
 }
 
 export function buildTool<I extends z.ZodTypeAny, O>(def: ToolDef<I, O>): Tool<I, O> {
@@ -145,6 +156,7 @@ export function buildTool<I extends z.ZodTypeAny, O>(def: ToolDef<I, O>): Tool<I
     checkPermissions,
     call: def.call,
     activityDescription: def.activityDescription,
+    commandFor: def.commandFor,
   };
 }
 
@@ -253,6 +265,17 @@ export function adaptToolForEngine(
           const err = new Error(`permission denied: ${tool.schema.name}`);
           err.name = "PermissionDeniedError";
           throw err;
+        }
+        // Persist an explicit "always allow this command" so the next session
+        // doesn't re-ask. Path tools self-persist inside call() via
+        // resolveWorkspacePath; command tools (Bash/PowerShell) route through
+        // here. No-op when the host store is read-only or the tool isn't
+        // command-shaped — i.e. exactly the old behavior in those cases.
+        if (answer === "allow_always") {
+          const command = tool.commandFor?.(parsed);
+          if (command !== undefined) {
+            await rich.commandPermissions?.grant?.(tool.schema.name, command, "always");
+          }
         }
       }
       const result = await tool.call(parsed, rich);

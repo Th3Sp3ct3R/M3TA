@@ -1143,7 +1143,10 @@ interface StoredCommandPermissions {
 }
 
 class AresCommandPermissionStore implements CommandPermissionStore {
-  private constructor(private readonly rules: PermissionRule[]) {}
+  private constructor(
+    private readonly rules: PermissionRule[],
+    private readonly userGlobalPath: string,
+  ) {}
 
   static async load(context: CliRuntimeContext): Promise<AresCommandPermissionStore> {
     const files = [
@@ -1165,7 +1168,31 @@ class AresCommandPermissionStore implements CommandPermissionStore {
         // No command rules configured.
       }
     }
-    return new AresCommandPermissionStore(rules);
+    return new AresCommandPermissionStore(rules, files[0]);
+  }
+
+  /** Persist an "always allow this command" grant chosen at the prompt. Without
+   *  this, picking "allow always" on a Bash/PowerShell command behaved exactly
+   *  like "allow once" — the store was read-only, so the next session re-asked. */
+  async grant(toolName: string, command: string, scope: PathGrantScope): Promise<void> {
+    if (scope !== "always") return;
+    const pattern = `${toolName}(${command})`;
+    if (this.rules.some((r) => r.pattern === pattern && r.effect === "allow")) return;
+    // Effective immediately this session…
+    this.rules.push({ pattern, effect: "allow", source: "user-global" });
+    // …and written to the user-global store so the next session won't re-ask.
+    let stored: StoredCommandPermissions = { rules: [] };
+    try {
+      stored = JSON.parse(await readFile(this.userGlobalPath, "utf8")) as StoredCommandPermissions;
+    } catch {
+      // First grant — the file doesn't exist yet.
+    }
+    const existing = stored.rules ?? [];
+    if (!existing.some((r) => r.pattern === pattern && r.effect === "allow")) {
+      stored.rules = [...existing, { pattern, effect: "allow" }];
+      await mkdir(path.dirname(this.userGlobalPath), { recursive: true });
+      await writeFile(this.userGlobalPath, JSON.stringify(stored, null, 2) + "\n", "utf8");
+    }
   }
 
   decide(toolName: string, command: string) {

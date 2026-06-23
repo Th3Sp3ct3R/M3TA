@@ -42,6 +42,7 @@ export const PowerShellTool = buildTool({
   watchdogTimeoutMs: 0,
   inputZod: inputSchema,
   activityDescription: (i) => describeShellActivity(i.command, i.run_in_background === true),
+  commandFor: (i) => i.command,
   async checkPermissions(i, ctx) {
     const configured = ctx.commandPermissions?.decide("PowerShell", i.command);
     if (configured && configured.kind !== "allow") return configured;
