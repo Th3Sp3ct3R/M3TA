@@ -14,6 +14,7 @@ const SECRET_FIELDS = [
   "tavilyKey",
   "deepSeekKey",
   "ollamaApiKey",
+  "customApiKey",
   "telegramBotToken",
 ] as const;
 
@@ -35,7 +36,7 @@ async function encryptSecretFields(settings: UiSettings): Promise<UiSettings> {
 
 export interface UiSettings {
   theme?: ThemeName;
-  lastProvider?: "openai" | "ollama" | "mock" | "openrouter" | "anthropic" | "deepseek";
+  lastProvider?: "openai" | "ollama" | "mock" | "openrouter" | "anthropic" | "deepseek" | "custom";
   lastOpenAIModel?: string;
   lastOllamaModel?: string;
   favoriteOllamaModels?: string[];
@@ -65,6 +66,14 @@ export interface UiSettings {
   lastDeepSeekModel?: string;
   /** Ollama Cloud API key for direct ollama.com catalog and model access. */
   ollamaApiKey?: string;
+  /** Custom OpenAI-compatible provider — base URL ending in the API root, e.g.
+   *  https://api.together.xyz/v1 or http://localhost:1234/v1 (LM Studio). Ares
+   *  hits {base}/chat/completions for chat and {base}/models for discovery. */
+  customBaseUrl?: string;
+  /** Custom provider API key — Bearer auth against customBaseUrl (encrypted). */
+  customApiKey?: string;
+  /** Last model id selected on the custom provider (from /models discovery). */
+  lastCustomModel?: string;
   /** Advanced engine knobs surfaced in the desktop Advanced tab. */
   engine?: EngineConfig;
   /** Skills the owner has disabled (by name). Absent = all enabled. */

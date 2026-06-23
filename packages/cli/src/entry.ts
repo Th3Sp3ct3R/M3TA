@@ -451,6 +451,8 @@ interface DaemonInputCommand {
   key?: string;
   model?: string;
   provider?: string;
+  /** Custom OpenAI-compatible provider base URL (provider_key with provider="custom"). */
+  baseUrl?: string;
   config?: unknown;
   name?: string;
   enabled?: boolean;
@@ -704,7 +706,7 @@ interface DaemonModelOption {
   capabilities?: string[];
 }
 
-const TERMINAL_PROVIDERS = ["ollama", "openai", "anthropic", "deepseek", "openrouter", "mock"] as const;
+const TERMINAL_PROVIDERS = ["ollama", "openai", "anthropic", "deepseek", "openrouter", "custom", "mock"] as const;
 type TerminalProviderId = (typeof TERMINAL_PROVIDERS)[number];
 const ROUTE_LANES = ["chat", "coding", "research", "tool-use"] as const;
 
@@ -1011,6 +1013,26 @@ async function selectProvider(flags: Map<string, string>): Promise<ProviderSelec
       provider: new OpenRouterProvider({ apiKey: settings.openRouterKey ?? "", model }),
       model,
       source: explicit ? "explicit:openrouter" : "settings:openrouter",
+    };
+  }
+
+  if (preferred === "custom") {
+    // Universal OpenAI-compatible provider: the owner points Ares at ANY base URL
+    // (Together, Groq, Fireworks, a self-hosted vLLM, LM Studio, a gateway…) plus
+    // a key, and model discovery hits {base}/models. Reuses the OpenAI-compatible
+    // OpenRouter client — same /chat/completions wire shape. Empty key/url yields
+    // a clear no_auth error the UI surfaces. baseUrl should end at the API root
+    // (…/v1); the trailing slash is stripped so paths don't double up.
+    const model = requestedModel ?? settings.lastCustomModel ?? "";
+    const baseUrl = (settings.customBaseUrl || process.env.ARES_CUSTOM_BASE_URL || "").trim().replace(/\/+$/, "");
+    return {
+      provider: new OpenRouterProvider({
+        apiKey: settings.customApiKey || process.env.ARES_CUSTOM_API_KEY || "",
+        baseUrl: baseUrl || undefined,
+        model,
+      }),
+      model,
+      source: explicit ? "explicit:custom" : "settings:custom",
     };
   }
 
@@ -3670,11 +3692,17 @@ async function daemonCommand(args: ParsedArgs): Promise<number> {
           if (model) patch.lastOllamaModel = model;
           if (key) process.env.OLLAMA_API_KEY = key;
           else delete process.env.OLLAMA_API_KEY;
+        } else if (provider === "custom") {
+          // Universal OpenAI-compatible provider: key + base URL (+ optional model).
+          patch.customApiKey = key;
+          const baseUrl = typeof command.baseUrl === "string" ? command.baseUrl.trim() : "";
+          if (baseUrl) patch.customBaseUrl = baseUrl;
+          if (model) patch.lastCustomModel = model;
         } else if (provider === "brave") {
           patch.braveKey = key;
           if (key) process.env.ARES_BRAVE_API_KEY = key; // live immediately, no restart
         } else {
-          process.stdout.write(JSON.stringify({ type: "daemon_error", error: `provider_key: unsupported provider "${provider}" (openrouter | deepseek | anthropic | ollama | brave)` }) + "\n");
+          process.stdout.write(JSON.stringify({ type: "daemon_error", error: `provider_key: unsupported provider "${provider}" (openrouter | deepseek | anthropic | ollama | custom | brave)` }) + "\n");
           continue;
         }
         await updateUiSettings(patch);
