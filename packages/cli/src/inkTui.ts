@@ -512,16 +512,13 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
   void frameTick;
 
   const layout = useMemo(() => {
-    const screenWidth = Math.max(64, columns - 2);
+    // Clean single-stream (the approved mockup) — the conversation is the page,
+    // no side rail / status panel. Header + stream + input + status bar.
+    const screenWidth = Math.max(60, columns - 2);
     const screenHeight = Math.max(18, rows - 1);
-    const showRail = screenWidth >= 92;
-    const showStatus = screenWidth >= 118;
-    const railWidth = showRail ? 20 : 0;
-    const statusWidth = showStatus ? 28 : 0;
-    const gutter = (showRail ? 1 : 0) + (showStatus ? 1 : 0);
-    const mainWidth = Math.max(42, screenWidth - railWidth - statusWidth - gutter);
-    const mainHeight = Math.max(7, screenHeight - 13);
-    return { showRail, showStatus, railWidth, statusWidth, mainWidth, mainHeight, screenWidth, screenHeight };
+    const mainWidth = screenWidth;
+    const mainHeight = Math.max(7, screenHeight - 11);
+    return { mainWidth, mainHeight, screenWidth, screenHeight };
   }, [columns, rows]);
 
   const visibleLogRows = Math.max(5, layout.mainHeight - 3);
@@ -824,36 +821,19 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
     Box,
     { flexDirection: "column", width: layout.screenWidth, height: layout.screenHeight },
     h(Header, { snapshot, stats, theme, width: layout.screenWidth }),
-    h(
-      Box,
-      { flexDirection: "row", width: layout.screenWidth, height: layout.mainHeight },
-      layout.showRail
-        ? h(ToolRail, { theme, activeTool, width: layout.railWidth })
-        : null,
-      h(LogPanel, {
-        theme,
-        lines: visibleLines,
-        totalLines: displayLines.length,
-        start,
-        scrollOffset,
-        width: layout.mainWidth,
-        height: layout.mainHeight,
-      }),
-      layout.showStatus
-        ? h(StatusPanel, {
-            theme,
-            snapshot,
-            stats,
-            todos,
-            activeTool,
-            width: layout.statusWidth,
-          })
-        : null,
-    ),
-    !layout.showStatus && todos.length > 0 ? h(TodosStrip, { theme, todos }) : null,
+    h(LogPanel, {
+      theme,
+      lines: visibleLines,
+      totalLines: displayLines.length,
+      start,
+      scrollOffset,
+      width: layout.screenWidth,
+      height: layout.mainHeight,
+    }),
+    todos.length > 0 ? h(TodosStrip, { theme, todos }) : null,
     pulses.length > 0 ? h(EvolutionPulses, { theme, pulses, width: layout.screenWidth }) : null,
     paletteOpen ? h(CommandPalette, { theme, query: input, selected: paletteSel, width: layout.screenWidth }) : null,
-    h(InputDeck, { theme, snapshot, busy, input, width: layout.screenWidth }),
+    h(InputDeck, { theme, snapshot, busy, activeTool, input, width: layout.screenWidth }),
     h(Footer, { theme, snapshot, stats, width: layout.screenWidth }),
   );
 }
@@ -938,24 +918,18 @@ function LogPanel({
   width: number;
   height: number;
 }) {
-  const range = totalLines > 0 ? `${start + 1}-${start + lines.length} / ${totalLines}` : "idle";
+  // Clean full-bleed conversation stream — no panel chrome. A subtle scroll
+  // indicator appears only when the user has scrolled up.
   return h(
     Box,
-    {
-      flexDirection: "column",
-      width,
-      height,
-      flexShrink: 1,
-      borderStyle: theme.borderStyle,
-      borderColor: theme.panel,
-      paddingX: 1,
-    },
-    h(
-      Box,
-      { justifyContent: "space-between" },
-      h(Text, { bold: true, color: theme.accent }, "OUTPUT / LOGS"),
-      h(Text, { color: scrollOffset > 0 ? theme.warn : theme.dim }, scrollOffset > 0 ? `${range} scrolled` : range),
-    ),
+    { flexDirection: "column", width, height, flexShrink: 1, paddingX: 1 },
+    scrollOffset > 0
+      ? h(
+          Box,
+          { justifyContent: "flex-end" },
+          h(Text, { color: theme.warn }, `▴ ${start + 1}-${start + lines.length}/${totalLines} · End ↓`),
+        )
+      : null,
     lines.length === 0
       ? h(EmptyState, { theme })
       : lines.map((line) => h(LogText, { key: line.id, line, theme })),
@@ -1017,12 +991,14 @@ function InputDeck({
   theme,
   snapshot,
   busy,
+  activeTool,
   input,
   width,
 }: {
   theme: DeckTheme;
   snapshot: InkChatSnapshot;
   busy: boolean;
+  activeTool: string | null;
   input: string;
   width: number;
 }) {
@@ -1042,7 +1018,7 @@ function InputDeck({
     h(
       Box,
       { justifyContent: "space-between" },
-      h(Text, { color: busy ? theme.warn : theme.accent, bold: true }, busy ? "▲ FORGING" : "▲ READY"),
+      h(Text, { color: busy ? theme.warn : theme.accent, bold: true }, busy ? `▲ FORGING${activeTool ? ` · ${activeTool}` : ""}` : "▲ READY"),
       h(Text, { color: theme.dim }, "enter send · ⌃P palette · pgup/pgdn scroll · ! bypass · ⌃L clear"),
     ),
     h(

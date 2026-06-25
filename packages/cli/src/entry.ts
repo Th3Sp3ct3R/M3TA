@@ -2988,9 +2988,15 @@ function resumeMessageLimit(): number | undefined {
   return Math.max(8, Math.floor(parsed));
 }
 
+const GOD_OF_WAR_THEMES = new Set(["rage", "bronze", "crimson", "steel", "nightfall", "verdant"]);
 async function loadSavedTheme(): Promise<void> {
   const settings = await loadUiSettings();
-  if (settings.theme) setTheme(settings.theme);
+  // Unify with the desktop, which only has god-of-war themes. A persisted
+  // legacy terminal-only theme (amber/cyberpunk/graphite/…) maps to the rage
+  // default so everyone gets the redesigned face; an explicit god-of-war pick
+  // is honored.
+  if (settings.theme && GOD_OF_WAR_THEMES.has(settings.theme)) setTheme(settings.theme);
+  else setTheme("rage");
 }
 
 async function saveTheme(name: string): Promise<void> {
