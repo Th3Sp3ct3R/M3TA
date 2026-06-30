@@ -59,6 +59,10 @@ interface PendingReminder {
   source: "verifier";
 }
 
+/** Marks the "verify still running" reminder so settle() never stacks dupes
+ *  and the end-gate can recognize the unsettled-verdict case. */
+const UNSETTLED_REMINDER_PREFIX = "Verification still running:";
+
 export class ContinuousVerifier {
   private readonly workspace: string;
   private readonly debounceMs: number;
@@ -106,8 +110,9 @@ export class ContinuousVerifier {
    * C1 — settle: flush the debounce immediately and wait for every scheduled
    * verify run to finish (bounded). Lets the engine's end-of-turn gate ask
    * "is anything still red?" instead of letting a turn finish before the
-   * verdict lands. Never throws; on timeout it simply returns (the reminder,
-   * if any, surfaces next drain).
+   * verdict lands. Never throws; on timeout it does NOT return empty-handed —
+   * it pushes an UNRESOLVED-style reminder so the end-gate stays honest (the
+   * turn can't be reported "done" while a verify run is still in flight).
    */
   async settle(timeoutMs = 10_000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
@@ -125,18 +130,38 @@ export class ContinuousVerifier {
       await Promise.race([this.fireRun().catch(() => undefined), untilDeadline()]);
     }
     // Runs can chain (a fireRun may have been queued while one was active),
-    // so loop until quiet or out of time.
+    // so loop until quiet or out of time. Returning at the deadline while work
+    // is still pending would let drainReminders() come back empty and the turn
+    // end "completed" with checks unfinished — so every timeout exit funnels
+    // through pushUnsettledReminder() instead of a bare return.
     while (Date.now() < deadline) {
       const inFlight = this.inFlight;
-      if (!inFlight && this.pendingFiles.size === 0) return;
+      if (!inFlight && this.pendingFiles.size === 0) return; // fully settled — clean exit
       if (inFlight) {
         const remaining = deadline - Date.now();
-        if (remaining <= 0) return;
+        if (remaining <= 0) return this.pushUnsettledReminder();
         await Promise.race([inFlight.done, new Promise((r) => setTimeout(r, remaining))]);
       } else if (this.pendingFiles.size > 0) {
         await Promise.race([this.fireRun().catch(() => undefined), untilDeadline()]);
       }
     }
+    // Fell out of the loop because the deadline passed. If anything is still
+    // running or queued, the verdict hasn't landed — surface that, don't
+    // silently let the turn finish.
+    if (this.inFlight || this.pendingFiles.size > 0) this.pushUnsettledReminder();
+  }
+
+  /**
+   * Push a reminder noting verification is still running so the end-of-turn
+   * gate refuses to report "done" before the verdict lands. Only one such
+   * reminder is queued at a time (a settle() timeout shouldn't stack dupes).
+   */
+  private pushUnsettledReminder(): void {
+    if (this.pendingReminders.some((r) => r.text.startsWith(UNSETTLED_REMINDER_PREFIX))) return;
+    this.pendingReminders.push({
+      text: `${UNSETTLED_REMINDER_PREFIX} the continuous verifier is still running checks for your recent edits and has not returned a verdict yet. Do NOT claim the task is done or complete — wait for the verify results (they'll surface on the next turn) and address any failures first.`,
+      source: "verifier",
+    });
   }
 
   /** True when reminders are waiting to be drained. */

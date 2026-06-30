@@ -20,10 +20,11 @@ import type {
   Usage,
   StopReason,
 } from "@ares/protocol";
-import { thinkingBudgetTokens } from "@ares/protocol";
+import { thinkingBudgetTokens, reasoningEnabled } from "@ares/protocol";
 import type { Provider, ProviderRequest } from "../queryEngine.js";
 import { createStallGuard, stallErrorEvent } from "./stallGuard.js";
 import { parseRetryAfterMs } from "./retryAfter.js";
+import { sanitizeToolPairs, coerceToolArgs, TOOL_ARGS_ERROR_KEY } from "./_toolPairs.js";
 
 export type SlotName = "reasoner" | "apply" | "summarize";
 
@@ -250,11 +251,14 @@ export class OllamaCloudPool {
           : undefined,
       stream: true,
       options: { num_ctx: ollamaNumCtx(), temperature: 0.2 },
-      // Reasoning dial → native /api/chat "think" flag. Without this, the
-      // fallback path silently dropped reasoning entirely (the /v1/messages
-      // compat path sends a thinking budget; this one sent nothing). Models that
-      // support thinking now actually reason on the native endpoint too.
-      ...(req.reasoningLevel ? { think: true } : {}),
+      // Reasoning dial → native /api/chat "think" field. Ollama's documented think
+      // enum is low|medium|high (plus a boolean) — NOT "max" — so clamp max→high
+      // (mirrors openAIReasoningEffort) to avoid a 400 on models that validate it,
+      // while still letting the owner's dial bite here. Gate on reasoningEnabled so
+      // "off"/undefined omit think entirely (a present field re-enables thinking).
+      ...(reasoningEnabled(req.reasoningLevel)
+        ? { think: req.reasoningLevel === "max" ? "high" : req.reasoningLevel }
+        : {}),
       // Inject the system prompt as a leading system message — Ollama
       // doesn't have a separate `system` field at the chat-level API.
       ...(req.system
@@ -374,7 +378,20 @@ export class OllamaCloudPool {
             const id = tc.id ?? `call_${toolCalls.length + 1}`;
             const name = tc.function?.name ?? "";
             const argRaw = tc.function?.arguments;
-            const input = typeof argRaw === "string" ? safeJson(argRaw) : argRaw ?? {};
+            // Native /api/chat may hand back args as a JSON string or an already-
+            // parsed object. For strings, route through coerceToolArgs so a
+            // malformed/truncated payload becomes a correctable tool_use_error the
+            // model can fix — never throw here (inside the SSE generator).
+            let input: Record<string, unknown> | unknown;
+            if (typeof argRaw === "string") {
+              try {
+                input = coerceToolArgs(argRaw, name || "tool");
+              } catch (err) {
+                input = { [TOOL_ARGS_ERROR_KEY]: err instanceof Error ? err.message : String(err) };
+              }
+            } else {
+              input = argRaw ?? {};
+            }
             yield { type: "tool_use_start", id, name };
             const json = JSON.stringify(input);
             yield { type: "tool_use_input_delta", id, deltaJson: json };
@@ -649,11 +666,15 @@ export class OllamaCloudPool {
           case "content_block_stop": {
             const block = blocks.get(evt.index!);
             if (!block || block.type !== "tool_use" || !block.toolId) continue;
-            let input: unknown;
+            // coerceToolArgs THROWS on malformed/truncated JSON; we're inside the
+            // SSE generator, so we MUST catch and stash the correctable message
+            // under TOOL_ARGS_ERROR_KEY — throwing here would fail the whole turn
+            // as provider_throw instead of letting the engine re-prompt the model.
+            let input: Record<string, unknown>;
             try {
-              input = block.partialJson ? JSON.parse(block.partialJson) : {};
-            } catch {
-              input = { __unparseable_args__: block.partialJson };
+              input = coerceToolArgs(block.partialJson, block.toolName ?? "tool");
+            } catch (err) {
+              input = { [TOOL_ARGS_ERROR_KEY]: err instanceof Error ? err.message : String(err) };
             }
             yield { type: "tool_use_input_done", id: block.toolId, input };
             continue;
@@ -701,11 +722,11 @@ export class OllamaCloudPool {
       } else if (block.type === "thinking" && block.thinking) {
         content.push({ type: "thinking", text: block.thinking });
       } else if (block.type === "tool_use" && block.toolId && block.toolName) {
-        let input: unknown;
+        let input: Record<string, unknown>;
         try {
-          input = block.partialJson ? JSON.parse(block.partialJson) : {};
-        } catch {
-          input = { __unparseable_args__: block.partialJson };
+          input = coerceToolArgs(block.partialJson, block.toolName);
+        } catch (err) {
+          input = { [TOOL_ARGS_ERROR_KEY]: err instanceof Error ? err.message : String(err) };
         }
         content.push({ type: "tool_use", id: block.toolId, name: block.toolName, input });
       }
@@ -766,11 +787,14 @@ function buildAnthropicMessagesBody(
   withCacheControl: boolean,
 ): Record<string, unknown> {
   const outputAllowance = req.maxOutputTokens ?? 8192;
+  // Drop orphaned tool_use/tool_result pairs before mapping — otherwise the
+  // Anthropic-compat endpoint 400s on a tool_result whose tool_use was dropped
+  // (compaction, interrupted turn, provider switch). Mirrors anthropic.ts.
   const body: Record<string, unknown> = {
     model,
     max_tokens: outputAllowance,
     stream: true,
-    messages: req.messages
+    messages: sanitizeToolPairs(req.messages)
       .filter((m) => m.role !== "system")
       .map((m) => ({
         role: m.role,
@@ -780,8 +804,11 @@ function buildAnthropicMessagesBody(
 
   // Reasoning dial → extended thinking. Anthropic requires max_tokens to exceed
   // the thinking budget, so grow the ceiling to leave room for the visible reply.
-  if (req.reasoningLevel) {
-    const budget = thinkingBudgetTokens(req.reasoningLevel);
+  // Gate on reasoningEnabled: "off" must send NO thinking block (a present block,
+  // even with a 0 budget, turns thinking back on / 400s on adaptive-only models).
+  const level = req.reasoningLevel;
+  if (level !== undefined && reasoningEnabled(level)) {
+    const budget = thinkingBudgetTokens(level);
     body.thinking = { type: "enabled", budget_tokens: budget };
     body.max_tokens = budget + outputAllowance;
   }
@@ -813,6 +840,16 @@ function ollamaNumCtx(): number {
 function toAnthropicContentBlock(block: ContentBlock): Record<string, unknown> {
   if (block.type === "system_reminder") {
     return { type: "text", text: `<system-reminder>${block.text}</system-reminder>` };
+  }
+  if (block.type === "thinking") {
+    // Ares's ThinkingBlock carries the reasoning under `text`, but the Anthropic
+    // wire shape names the field `thinking`. The old catch-all fallthrough passed
+    // it as {type:"thinking", text:"..."}, which the compat endpoint rejects /
+    // ignores. Map text -> thinking explicitly. Note: Ollama-generated thinking has
+    // no signature, so this mirrors anthropic.ts's *deepseek* branch (lenient
+    // compat) — NOT the strict Anthropic dialect, which drops unsigned thinking.
+    // Safe because Ollama's /v1/messages compat layer doesn't enforce signatures.
+    return { type: "thinking", thinking: block.text };
   }
   if (block.type === "image") {
     if (block.source.kind === "url") {
@@ -906,14 +943,6 @@ function toOllamaMessages(messages: readonly Message[]): OllamaMessage[] {
   }
 
   return out;
-}
-
-function safeJson(s: string): unknown {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return { __unparseable_args__: s };
-  }
 }
 
 interface OllamaChunk {

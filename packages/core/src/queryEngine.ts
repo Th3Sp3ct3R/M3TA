@@ -156,8 +156,11 @@ export interface QueryEngineConfig {
    * (no tool calls in its last message). Return reminders (e.g. settled
    * verifier failures on files this turn touched) and the engine injects them
    * and CONTINUES the loop instead of ending — the model cannot claim "done"
-   * while its own edits are red. Fires at most twice per turn, then the turn
-   * ends regardless (never an infinite repair loop at the engine level).
+   * while its own edits are red. Pushes a NEW objection up to END_GATE_HARDCAP
+   * (6) times per turn as long as the model keeps making progress; once it's
+   * stuck re-claiming done against the SAME red checks (or hits that cap) the
+   * turn ends honestly — surfacing the failures as UNRESOLVED, never an infinite
+   * repair loop at the engine level.
    */
   confirmTurnEnd?(): Promise<Array<{ text: string; source: "verifier" | "hook" }>>;
   requestPermission?(request: ToolPermissionRequest): Promise<PermissionPromptDecision>;
@@ -188,9 +191,11 @@ export interface QueryEngineConfig {
    * the way Claude Code/Codex compact: a real model-written summary of what was
    * built, the current state, key files, and what's next. Without it, the
    * engine falls back to the deterministic ledger (lossy bullet list). The host
-   * wires this to a cheap sub-model via sideQuery.
+   * wires this to a cheap sub-model via sideQuery. The optional `signal` is the
+   * turn's live abort signal — a Stop during compaction must abort the sub-model
+   * mid-summary, not run it to completion before the turn can end.
    */
-  summarizeSpan?(messages: readonly Message[]): Promise<string>;
+  summarizeSpan?(messages: readonly Message[], signal?: AbortSignal): Promise<string>;
   /**
    * Token threshold that triggers smart compaction (before the hard
    * contextBudgetTokens cap). Defaults to 80% of contextBudgetTokens.
@@ -265,6 +270,18 @@ function estimateMessageTokens(m: Message): number {
  *  function_call_output with no preceding call if it led the kept window. */
 function leadsWithToolResult(m: Message): boolean {
   return m.role === "user" && m.content[0]?.type === "tool_result";
+}
+
+/** True when an assistant message carries nothing the user/model can act on —
+ *  no non-whitespace text, no thinking, no tool calls. An end_turn with this is
+ *  the "typing then nothing" silent-success path the engine must not bless. */
+function messageHasNoVisibleOutput(m: Message): boolean {
+  for (const b of m.content) {
+    if (b.type === "tool_use") return false;
+    if (b.type === "thinking" && b.text.trim()) return false;
+    if (b.type === "text" && b.text.trim()) return false;
+  }
+  return true;
 }
 
 /**
@@ -379,7 +396,11 @@ export function collectTrimmedFilePaths(dropped: readonly Message[]): string[] {
     for (const block of message.content) {
       if (block.type !== "tool_use") continue;
       const input = block.input as Record<string, unknown> | null;
-      for (const key of ["file_path", "path", "notebook_path"]) {
+      // Include the `file` alias: tool_use blocks are stored RAW (normalization
+      // to file_path happens only at execution time), so a Read/Edit/Write that
+      // came in as { file: ... } would otherwise leave the touched file off the
+      // invalidation set and the re-read guard would block its recovery read.
+      for (const key of ["file_path", "path", "notebook_path", "file"]) {
         const value = input?.[key];
         if (typeof value === "string" && value.trim()) files.add(value.trim());
       }
@@ -408,7 +429,9 @@ export function buildContextLedger(dropped: readonly Message[]): string {
       } else if (block.type === "tool_use") {
         toolCounts.set(block.name, (toolCounts.get(block.name) ?? 0) + 1);
         const input = block.input as Record<string, unknown> | null;
-        for (const key of ["file_path", "path", "notebook_path"]) {
+        // `file` alias too — see collectTrimmedFilePaths; raw tool_use inputs
+        // can carry the un-normalized key, so the ledger must list those files.
+        for (const key of ["file_path", "path", "notebook_path", "file"]) {
           const value = input?.[key];
           if (typeof value === "string" && value.trim() && files.size < 24) files.add(value.trim());
         }
@@ -513,7 +536,12 @@ export class QueryEngine {
    * self-bounding tools); otherwise the engine default. Computed once and stored
    * in history, so the wire prefix stays prompt-cache-stable across turns.
    */
-  private async capToolResultText(output: unknown, toolUseId: string, schema: ToolSchema): Promise<string> {
+  private async capToolResultText(
+    output: unknown,
+    toolUseId: string,
+    schema: ToolSchema,
+    onSpillFailure?: (warning: string) => void,
+  ): Promise<string> {
     const full = stringifyToolOutput(output);
     const budget = resolveToolResultBudget(schema);
     if (budget === 0 || full.length <= budget) return full;
@@ -525,9 +553,14 @@ export class QueryEngine {
       const previewChars = Math.min(budget, 2_000);
       const omitted = full.length - previewChars;
       return `${full.slice(0, previewChars)}\n\n[tool result truncated for context: ${omitted} of ${full.length} chars omitted. FULL output saved to ${file} — Read that file (use offset/limit to page) for the rest.]`;
-    } catch {
-      // Spill failed (read-only fs, etc.) — fall back to the prior lossy truncation
-      // so the turn never dies on a bookkeeping error.
+    } catch (err) {
+      // Spill failed (read-only fs, disk full, etc.) — fall back to the prior
+      // lossy truncation so the turn never dies on a bookkeeping error, but do
+      // NOT swallow it silently: surface a warning so the model knows the full
+      // output was dropped (not spilled to a Readable file) and can't trust the
+      // "saved to <file>" affordance it would otherwise expect.
+      const detail = err instanceof Error ? err.message : String(err);
+      onSpillFailure?.(`tool result too large to spill to disk (${detail}) — output was truncated and the full text is NOT recoverable; re-run with a narrower scope if you need the rest`);
       return stringifyModelToolOutput(output);
     }
   }
@@ -678,6 +711,7 @@ export class QueryEngine {
 
     let cleared = 0;
     let savedChars = 0;
+    const clearedIds = new Set<string>();
     for (const m of this.messages) {
       for (const b of m.content) {
         if (
@@ -689,11 +723,33 @@ export class QueryEngine {
         ) {
           savedChars += b.content.length;
           b.content = MICROCOMPACT_PLACEHOLDER;
+          clearedIds.add(b.tool_use_id);
           cleared++;
         }
       }
     }
     if (cleared === 0) return null;
+
+    // The cleared Read/etc. bodies are GONE from the model's view — but their
+    // read stamps survive. Without invalidating them, a recovery whole-file Read
+    // trips the re-read guard and is told "its full contents are above / already
+    // in context" — a flat LIE (the body is now the placeholder), and the model
+    // edits blind. Heavy compaction avoids this via onHistoryTrimmed; microcompact
+    // is a newer rung that bypassed it. Hand the host the tool_use blocks whose
+    // output we cleared so it invalidates exactly those files' stamps.
+    if (this.cfg.onHistoryTrimmed) {
+      const clearedToolUses: Message[] = this.messages
+        .filter((m) => m.role === "assistant")
+        .map((m) => ({ ...m, content: m.content.filter((b) => b.type === "tool_use" && clearedIds.has(b.id)) }))
+        .filter((m) => m.content.length > 0);
+      if (clearedToolUses.length > 0) {
+        try {
+          this.cfg.onHistoryTrimmed(clearedToolUses);
+        } catch {
+          // host bookkeeping never kills a turn
+        }
+      }
+    }
     return {
       type: "system_reminder_injected",
       text: `microcompacted ${cleared} old tool output(s) (~${Math.round(savedChars / CHARS_PER_TOKEN)} tokens freed) to defer heavy compaction`,
@@ -719,13 +775,14 @@ export class QueryEngine {
     if (split <= 0) return null;
 
     const older = this.messages.slice(0, split);
-    const recent = this.messages.slice(split);
 
     let summary = "";
     let method: "summary" | "ledger" = "summary";
     if (this.cfg.summarizeSpan) {
       try {
-        summary = (await this.cfg.summarizeSpan(older)).trim();
+        // Thread the turn's live signal so a Stop during compaction aborts the
+        // summarizer sub-model instead of letting it run to completion.
+        summary = (await this.cfg.summarizeSpan(older, this.liveSignal())).trim();
       } catch {
         summary = "";
       }
@@ -750,11 +807,11 @@ export class QueryEngine {
       createdAt: new Date().toISOString(),
     };
 
-    // Persistently rewrite history to [recap, ...recent]. The pending user
-    // message is the last element of `recent`, untouched. Read stamps for files
-    // in the summarized span are invalidated so recovery re-reads pass.
+    // Persistently rewrite history to [recap, ...recent]. splice removes the
+    // summarized span in place and prepends the recap, leaving the recent tail
+    // (including the untouched pending user message) intact. Read stamps for
+    // files in the summarized span are invalidated so recovery re-reads pass.
     this.messages.splice(0, split, recap);
-    void recent;
     try {
       this.cfg.onHistoryTrimmed?.(older);
     } catch {
@@ -846,6 +903,10 @@ export class QueryEngine {
     const seenGatherSigs = new Set<string>();
     // C3 — times we've auto-continued after the model hit its output-token cap.
     let maxTokensContinues = 0;
+    // "typing then nothing" guard — times we've nudged the model after it ended
+    // the turn with end_turn but EMPTY content (no text, no tool calls). Capped
+    // at one retry so a model that genuinely has nothing to say still ends.
+    let emptyTurnNudges = 0;
     // Loop precision (L-phase): catch spinning the failure-breaker misses —
     // identical SUCCESSFUL calls, A/B/A/B oscillation, and an absolute per-turn
     // tool-call ceiling. All fresh per turn, so lifecycle is automatic.
@@ -1073,6 +1134,24 @@ export class QueryEngine {
 
       this.messages.push(assistantMessage);
 
+      // Reconcile the final message's tool_use blocks against what actually
+      // streamed a tool_use_input_done. A provider can assemble a tool_use into
+      // assistantMessage (from a content_block_start) yet never emit input_done —
+      // e.g. the stream closed cleanly AFTER the block opened but BEFORE it
+      // finished (a truncated-but-not-errored upstream, common on flaky links).
+      // Such a call would never execute and never get a tool_result: on the next
+      // request it's an orphan the model THINKS it ran. Add each to the run set
+      // marked "truncated" so it gets a paired, correctable is_error instead —
+      // the model re-issues it rather than believing it silently succeeded.
+      const streamedToolIds = new Set(pendingToolUses.map((u) => u.id));
+      const truncatedToolIds = new Set<string>();
+      for (const block of assistantMessage.content) {
+        if (block.type === "tool_use" && !streamedToolIds.has(block.id)) {
+          truncatedToolIds.add(block.id);
+          pendingToolUses.push({ id: block.id, name: block.name, input: block.input });
+        }
+      }
+
       // ─── Tool execution phase ────────────────────────────────────────
       if (pendingToolUses.length === 0) {
         // C3 — the model was cut off at its output-token ceiling mid-message
@@ -1092,6 +1171,30 @@ export class QueryEngine {
           yield { type: "system_reminder_injected", text: "output truncated at token cap — continuing", source: "instructions" };
           continue;
         }
+        // "Typing then nothing" guard: a valid message_done with end_turn but
+        // EMPTY content (no text, no thinking, no tool calls) is the silent-success
+        // path — the model produced literally nothing yet the turn ends "completed".
+        // Nudge it once to actually produce output; if it stalls again, fall through
+        // so the turn still ends instead of looping.
+        if (
+          stopReason === "end_turn" &&
+          messageHasNoVisibleOutput(assistantMessage) &&
+          emptyTurnNudges < 1 &&
+          !this.liveSignal().aborted
+        ) {
+          emptyTurnNudges++;
+          this.messages.push({
+            id: cryptoId(),
+            role: "user",
+            content: [{
+              type: "system_reminder",
+              text: "You ended the turn without producing any output — no text and no tool calls. If the task is done, say so and summarize what you did; otherwise continue the work now.",
+            }],
+            createdAt: new Date().toISOString(),
+          });
+          yield { type: "system_reminder_injected", text: "empty assistant turn — nudging for output", source: "instructions" };
+          continue;
+        }
         // C1 end-of-turn gate: before accepting "done", give verification a
         // chance to object. The old logic fired at most twice then SILENTLY
         // accepted "done" even if checks were still red — which let the agent
@@ -1104,8 +1207,17 @@ export class QueryEngine {
           let gateReminders: Array<{ text: string; source: "verifier" | "hook" }> = [];
           try {
             gateReminders = await this.cfg.confirmTurnEnd();
-          } catch {
-            gateReminders = [];
+          } catch (err) {
+            // FAIL CLOSED: a verifier that itself crashed (spawn failure, parse
+            // error, settle() timeout rejection) must NOT silently bless the turn
+            // as "completed" — that's the exact false-victory the gate exists to
+            // prevent. Inject an UNRESOLVED objection so the model cannot claim
+            // done over checks that never actually ran, and re-runs them.
+            const detail = err instanceof Error ? err.message : String(err);
+            gateReminders = [{
+              text: `verification could not run: ${detail} — do not claim the task is complete; re-run the checks (build/test/typecheck) and confirm they pass before finishing.`,
+              source: "verifier",
+            }];
           }
           if (gateReminders.length > 0) {
             const sig = gateReminders.map((r) => r.text).join("");
@@ -1126,7 +1238,10 @@ export class QueryEngine {
             }
             // Stuck or capped: do NOT loop forever, but do NOT bless it as done.
             // Surface every unresolved failure so the turn ends with the red
-            // checks visible, not a clean "completed" over a broken result.
+            // checks visible, not a clean "completed" over a broken result. The
+            // turn STATUS stays "completed" (the loop terminated without hanging)
+            // — escalation off the surfaced UNRESOLVED reminders is the harness's
+            // job; see the C1-gate-honesty contract test.
             for (const r of gateReminders) {
               yield {
                 type: "system_reminder_injected",
@@ -1135,6 +1250,17 @@ export class QueryEngine {
               };
             }
           }
+        }
+        // If we got here still capped at the output-token limit (the 3 auto-
+        // continues at C3 were exhausted), the assistant's message is literally
+        // truncated mid-stream. Don't let it read as a clean finish — say so, so
+        // neither the model nor the user treats a chopped-off answer as complete.
+        if (stopReason === "max_tokens" && !this.liveSignal().aborted) {
+          yield {
+            type: "system_reminder_injected",
+            text: "Output is STILL truncated at the token cap after 3 continuations — this answer is INCOMPLETE, not a finished result.",
+            source: "instructions",
+          };
         }
         yield {
           type: "turn_end",
@@ -1148,11 +1274,33 @@ export class QueryEngine {
       const resultByToolUseId = new Map<string, ToolResultBlock>();
       const runnable: Array<{ id: string; name: string; input: unknown; tool: EngineTool }> = [];
       for (const use of pendingToolUses) {
+        // A tool_use that reached history but never finished streaming its
+        // arguments (see reconciliation above): its args are partial, so do NOT
+        // execute it — surface a correctable is_error so the model re-issues it.
+        if (truncatedToolIds.has(use.id)) {
+          const msg = `<tool_use_error>tool call '${use.name}' was truncated before its arguments finished streaming — re-issue it.</tool_use_error>`;
+          yield { type: "tool_error", id: use.id, error: msg, durationMs: 0 };
+          resultByToolUseId.set(use.id, { type: "tool_result", tool_use_id: use.id, content: msg, is_error: true });
+          continue;
+        }
         const tool = resolveEngineTool(this.cfg.tools, use.name);
         if (!tool) {
           const msg = `unknown tool: ${use.name}`;
           yield { type: "tool_error", id: use.id, error: msg, durationMs: 0 };
           resultByToolUseId.set(use.id, { type: "tool_result", tool_use_id: use.id, content: msg, is_error: true });
+          continue;
+        }
+
+        // Malformed/truncated tool-call arguments: providers can't throw inside
+        // their SSE stream (it fails the whole turn as provider_throw), so they
+        // stash the correctable error under a sentinel key. Surface it here as a
+        // per-tool is_error — exactly like the unknown-tool branch — so the model
+        // re-emits valid JSON, instead of letting parseToolInputLenient strip the
+        // key and report an opaque "<field>: Required".
+        const argErr = toolArgsError(use.input);
+        if (argErr) {
+          yield { type: "tool_error", id: use.id, error: argErr, durationMs: 0 };
+          resultByToolUseId.set(use.id, { type: "tool_result", tool_use_id: use.id, content: argErr, is_error: true });
           continue;
         }
 
@@ -1344,8 +1492,25 @@ export class QueryEngine {
       }
       if (totalToolCalls >= ceiling) {
         // The tool_result for this round is already pushed above (no orphan
-        // tool_use), so end GRACEFULLY (completed) — NOT the failed
-        // max_turns_exceeded backstop. Partial work is preserved.
+        // tool_use). End the turn — but do NOT blindly bless it "completed":
+        // this exit lives in the tool branch and never reaches the end-gate, so
+        // a turn that burned its whole budget on FAILING calls would otherwise be
+        // reported as a clean success (false victory). If the final round was
+        // nothing but errors, end "failed" and say so; otherwise end gracefully
+        // with partial work preserved.
+        const roundAllErrored =
+          pendingToolUses.length > 0 && pendingToolUses.every((u) => resultByToolUseId.get(u.id)?.is_error === true);
+        yield {
+          type: "system_reminder_injected",
+          text: roundAllErrored
+            ? `Hit the tool-call ceiling (${totalToolCalls}/${ceiling}) with the final round entirely failing — turn ends UNRESOLVED, the work is NOT complete.`
+            : `Hit the tool-call ceiling (${totalToolCalls}/${ceiling}) — turn ends with work possibly incomplete; partial results are preserved.`,
+          source: "instructions",
+        };
+        // Status stays "completed" (the loop terminated without hanging) — the
+        // honesty is carried by the UNRESOLVED reminder above, consistent with
+        // the C1 end-gate contract (status reflects loop-termination; work-quality
+        // failures are surfaced via reminders, not the status field).
         yield {
           type: "turn_end",
           status: "completed",
@@ -1472,6 +1637,9 @@ export class QueryEngine {
 
     const t0 = Date.now();
     try {
+      // Holds the live watchdog control for THIS call so the permission prompt
+      // can pause the clock (set below once withWatchdog invokes run()).
+      let watchdog: WatchdogControl = NOOP_WATCHDOG;
       const ctx: ToolCallContext = {
         workspace: this.cfg.workspace,
         signal: this.liveSignal(),
@@ -1487,9 +1655,18 @@ export class QueryEngine {
                 reason: request.reason,
                 suggestion: request.suggestion,
               });
-              const decision = await this.cfg.requestPermission!(requestWithId);
-              emit({ type: "permission_response", id, decision });
-              return decision;
+              // The human approval wait must NOT count against the tool watchdog
+              // — the tool hasn't run yet, it's only waiting for a click. Pause
+              // the clock across the prompt; the FULL deadline re-arms once the
+              // decision lands, so the tool gets its real execution budget.
+              watchdog.pause();
+              try {
+                const decision = await this.cfg.requestPermission!(requestWithId);
+                emit({ type: "permission_response", id, decision });
+                return decision;
+              } finally {
+                watchdog.resume();
+              }
             }
           : undefined,
         emitProgress: (data) => emit({ type: "tool_progress", id: use.id, data }),
@@ -1501,7 +1678,10 @@ export class QueryEngine {
       const result = await withWatchdog(
         watchdogTimeoutMsFor(use.tool.schema),
         this.liveSignal(),
-        (signal) => use.tool.call(use.input, { ...ctx, signal }),
+        (signal, control) => {
+          watchdog = control;
+          return use.tool.call(use.input, { ...ctx, signal });
+        },
       );
       const durationMs = Date.now() - t0;
       emit({
@@ -1516,15 +1696,26 @@ export class QueryEngine {
         emit({ type: "todo_updated", todos: result.output.todos });
       }
       if (this.cfg.hookManager) {
-        await this.cfg.hookManager.run({
-          event: "PostToolUse",
-          toolName: use.name,
-          input: use.input,
-          output: result.output,
-          workspace: this.cfg.workspace,
-        });
+        // Guard the success-path hook the same way the catch-path one is: a
+        // throwing PostToolUse hook must NOT fall through to the catch and
+        // overwrite a tool that already SUCCEEDED (tool_end was emitted above)
+        // with an is_error — that would lie to the model and risk re-running a
+        // committed Write/Edit/Bash.
+        try {
+          await this.cfg.hookManager.run({
+            event: "PostToolUse",
+            toolName: use.name,
+            input: use.input,
+            output: result.output,
+            workspace: this.cfg.workspace,
+          });
+        } catch {
+          // a hook failure can never invalidate a successful tool result
+        }
       }
-      const modelText = await this.capToolResultText(result.output, use.id, use.tool.schema);
+      const modelText = await this.capToolResultText(result.output, use.id, use.tool.schema, (warning) =>
+        emit({ type: "system_reminder_injected", text: `${use.name}: ${warning}`, source: "instructions" }),
+      );
       const resultContent: ToolResultBlock["content"] =
         result.images && result.images.length > 0
           ? [
@@ -1561,13 +1752,21 @@ export class QueryEngine {
             : String(err);
       emit({ type: "tool_error", id: use.id, error: message, durationMs });
       if (this.cfg.hookManager) {
-        await this.cfg.hookManager.run({
-          event: "PostToolUse",
-          toolName: use.name,
-          input: use.input,
-          output: { error: message },
-          workspace: this.cfg.workspace,
-        });
+        // The PostToolUse hook runs in the catch path: a throw here would mask
+        // the ORIGINAL tool error (the thing the model actually needs to see)
+        // with an unrelated hook failure. Isolate it — the tool's own error is
+        // already captured and returned below regardless.
+        try {
+          await this.cfg.hookManager.run({
+            event: "PostToolUse",
+            toolName: use.name,
+            input: use.input,
+            output: { error: message },
+            workspace: this.cfg.workspace,
+          });
+        } catch {
+          // hook bookkeeping never overrides the real tool error
+        }
       }
       return {
         toolUseId: use.id,
@@ -1676,29 +1875,54 @@ function watchdogTimeoutMsFor(schema: ToolSchema): number {
  * watchdog timer fires the child abort, and run() races an abort-reject. The
  * timer is unref'd — a pure backstop that never holds the event loop open.
  */
+/** Lets a tool exclude a stretch from the watchdog clock — used for the human
+ *  permission-prompt wait, which must NOT count as the tool timing out. */
+interface WatchdogControl {
+  /** Stop the deadline (e.g. while awaiting a permission click). */
+  pause(): void;
+  /** Re-arm the FULL deadline — the tool's real execution budget starts now. */
+  resume(): void;
+}
+
+const NOOP_WATCHDOG: WatchdogControl = { pause() {}, resume() {} };
+
 async function withWatchdog<T>(
   timeoutMs: number,
   parentSignal: AbortSignal,
-  run: (signal: AbortSignal) => Promise<T>,
+  run: (signal: AbortSignal, control: WatchdogControl) => Promise<T>,
 ): Promise<T> {
-  if (timeoutMs <= 0) return run(parentSignal);
+  if (timeoutMs <= 0) return run(parentSignal, NOOP_WATCHDOG);
   const ctrl = new AbortController();
   const merged = AbortSignal.any([parentSignal, ctrl.signal]);
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectWatchdog: ((e: Error) => void) | undefined;
+  // NOT unref'd on purpose: while the tool is in flight the watchdog is ACTIVE
+  // work (it must keep the loop alive to fire on a tool that hangs with no other
+  // I/O pending — the exact case it exists for). The finally clears it the
+  // instant the tool settles, so it never holds the process open after.
+  const fire = () => {
+    // Reject FIRST so Promise.race settles with the tagged ToolWatchdogError;
+    // THEN abort so the (now-abandoned) tool's own signal/fetch tears down.
+    rejectWatchdog?.(new ToolWatchdogError(timeoutMs));
+    ctrl.abort();
+  };
+  const control: WatchdogControl = {
+    pause() {
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+    },
+    resume() {
+      if (timer === undefined && !ctrl.signal.aborted) timer = setTimeout(fire, timeoutMs);
+    },
+  };
   const watchdog = new Promise<never>((_, reject) => {
-    // NOT unref'd on purpose: while the tool is in flight the watchdog is ACTIVE
-    // work (it must keep the loop alive to fire on a tool that hangs with no
-    // other I/O pending — the exact case it exists for). The finally clears it
-    // the instant the tool settles, so it never holds the process open after.
-    timer = setTimeout(() => {
-      // Reject FIRST so Promise.race settles with the tagged ToolWatchdogError;
-      // THEN abort so the (now-abandoned) tool's own signal/fetch tears down.
-      reject(new ToolWatchdogError(timeoutMs));
-      ctrl.abort();
-    }, timeoutMs);
+    rejectWatchdog = reject;
   });
+  timer = setTimeout(fire, timeoutMs);
   try {
-    return await Promise.race([run(merged), watchdog]);
+    return await Promise.race([run(merged, control), watchdog]);
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -1799,6 +2023,21 @@ function canonicalToolKey(name: string): string {
  * its strict schema parser, so malformed model output fails loudly rather than
  * being guessed into a destructive action.
  */
+/** Sentinel key providers stash an unparseable-args error under (see
+ *  providers/_toolPairs.ts coerceToolArgs). Kept as a string literal here so the
+ *  engine stays provider-agnostic. */
+const TOOL_ARGS_ERROR_KEY = "__tool_use_error__";
+
+/** If a tool_use's input is a stashed unparseable-args error, return its
+ *  (already <tool_use_error>-enveloped) message; otherwise null. */
+function toolArgsError(input: unknown): string | null {
+  if (input && typeof input === "object" && !Array.isArray(input)) {
+    const v = (input as Record<string, unknown>)[TOOL_ARGS_ERROR_KEY];
+    if (typeof v === "string") return v;
+  }
+  return null;
+}
+
 function normalizeToolInput(toolName: string, input: unknown): unknown {
   if (!input || typeof input !== "object" || Array.isArray(input)) return input;
   const next = { ...(input as Record<string, unknown>) };
@@ -1827,6 +2066,21 @@ function normalizeToolInput(toolName: string, input: unknown): unknown {
       break;
     case "Grep":
       copy("pattern", "query", "search");
+      // Native ripgrep / Claude-Code flag names the model is heavily trained on.
+      // Alias them to Ares's schema fields so the lenient parser doesn't silently
+      // STRIP them — a dropped `-i` turns a case-insensitive search case-SENSITIVE
+      // with no signal, and the model reasons on a quietly-wrong (often empty)
+      // result. (Unknown source keys are stripped after this copy; the value is
+      // preserved on the aliased target.)
+      copy("case_insensitive", "-i", "i", "ignore_case");
+      copy("context_after", "-A", "after_context");
+      copy("context_before", "-B", "before_context");
+      copy("max_results", "head_limit", "limit", "max_count");
+      // -C means "N lines of context on BOTH sides"; copy() only fills one target.
+      if (next["-C"] !== undefined) {
+        if (next["context_before"] === undefined) next["context_before"] = next["-C"];
+        if (next["context_after"] === undefined) next["context_after"] = next["-C"];
+      }
       break;
     case "Glob":
       copy("pattern", "query", "glob");

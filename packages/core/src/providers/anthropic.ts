@@ -31,10 +31,11 @@ import type {
   StreamEvent,
   Usage,
 } from "@ares/protocol";
-import { thinkingBudgetTokens } from "@ares/protocol";
+import { reasoningEnabled, thinkingBudgetTokens } from "@ares/protocol";
 import type { Provider, ProviderRequest } from "../queryEngine.js";
 import { createStallGuard, stallErrorEvent, type StallGuard } from "./stallGuard.js";
 import { parseRetryAfterMs } from "./retryAfter.js";
+import { coerceToolArgs, sanitizeToolPairs, TOOL_ARGS_ERROR_KEY } from "./_toolPairs.js";
 import {
   resolveAnthropicAccessToken,
   ANTHROPIC_OAUTH_BETA,
@@ -50,6 +51,8 @@ export const DEFAULT_ANTHROPIC_MODEL = "claude-fable-5";
 
 /** Model generations that take {type:"adaptive"} thinking (no token budgets). */
 export function usesAdaptiveThinking(model: string): boolean {
+  // Substring match: any model id CONTAINING "fable" routes to the adaptive
+  // branch (covers fable-class ids); no capability lookup.
   return /fable|claude-fable/i.test(model);
 }
 
@@ -312,7 +315,11 @@ export class AnthropicProvider implements Provider {
             if (typeof evt.index !== "number") continue;
             const block = blocks.get(evt.index);
             if (!block || block.kind !== "tool_use" || !block.toolId) continue;
-            yield { type: "tool_use_input_done", id: block.toolId, input: parseToolInput(block.partialJson) };
+            yield {
+              type: "tool_use_input_done",
+              id: block.toolId,
+              input: parseToolInput(block.partialJson, block.toolName ?? ""),
+            };
             continue;
           }
 
@@ -329,12 +336,21 @@ export class AnthropicProvider implements Provider {
 
           case "error": {
             const kind = evt.error?.type ?? "stream_error";
+            // An in-stream rate_limit_error is the same condition as an HTTP 429
+            // (which the !response.ok path retries) — it just arrives after the
+            // stream opened. Mark it retriable so an arrival-time technicality
+            // doesn't fail a turn the 429 path would have retried. (No Retry-After
+            // is carried on the SSE error frame, so the engine's transient
+            // backoff governs the wait.)
             yield {
               type: "error",
               error: {
                 code: kind,
                 message: evt.error?.message ?? "Anthropic stream error",
-                retriable: kind === "overloaded_error" || kind === "api_error",
+                retriable:
+                  kind === "overloaded_error" ||
+                  kind === "api_error" ||
+                  kind === "rate_limit_error",
               },
             };
             cancel();
@@ -369,7 +385,7 @@ export class AnthropicProvider implements Provider {
           type: "tool_use",
           id: block.toolId,
           name: block.toolName ?? "",
-          input: parseToolInput(block.partialJson),
+          input: parseToolInput(block.partialJson, block.toolName ?? ""),
         });
       }
     }
@@ -386,39 +402,8 @@ export class AnthropicProvider implements Provider {
 
 // ─── Request building ───────────────────────────────────────────────────
 
-/**
- * Drop orphaned tool blocks before sending to Anthropic. The API 400s on a
- * tool_result whose tool_use was dropped (compaction, an interrupted turn, or a
- * mid-conversation provider switch) — "unexpected tool_use_id ... Each
- * tool_result block must have a corresponding tool_use block". Convert orphans to
- * plain text so the model keeps the context without an invalid request.
- */
-function sanitizeToolPairs(messages: readonly Message[]): Message[] {
-  const useIds = new Set<string>();
-  const resultIds = new Set<string>();
-  for (const m of messages) {
-    for (const b of m.content) {
-      if (b.type === "tool_use") useIds.add(b.id);
-      else if (b.type === "tool_result") resultIds.add(b.tool_use_id);
-    }
-  }
-  return messages.map((m) => {
-    const content = m.content.flatMap((b): ContentBlock[] => {
-      if (b.type === "tool_use" && !resultIds.has(b.id)) {
-        return [{ type: "text", text: `[earlier ${b.name} tool call — result not retained]` }];
-      }
-      if (b.type === "tool_result" && !useIds.has(b.tool_use_id)) {
-        const text =
-          typeof b.content === "string"
-            ? b.content
-            : b.content.map((x) => (x.type === "text" ? x.text : "[image]")).join("\n");
-        return [{ type: "text", text: `[earlier tool result]\n${text}` }];
-      }
-      return [b];
-    });
-    return { ...m, content };
-  });
-}
+// sanitizeToolPairs lives in ./_toolPairs.js — shared with the deepseek dialect
+// and ollama's Anthropic-compat path so a fix can't miss a sibling.
 
 function buildMessagesBody(
   req: ProviderRequest,
@@ -446,12 +431,17 @@ function buildMessagesBody(
   // budget_tokens in favor of adaptive thinking and 400 on the enabled+budget
   // shape; older models still take explicit budgets (and require max_tokens to
   // exceed the budget, so grow the ceiling to leave room for visible output).
-  if (req.reasoningLevel) {
+  // reasoningEnabled() (not bare truthiness) so "off" sends NO thinking block on
+  // any branch — presence of the field, even enabled with a 0 budget, turns
+  // thinking back on / 400s the adaptive-only models.
+  if (reasoningEnabled(req.reasoningLevel)) {
     if (isDeepseek) {
       // DeepSeek ignores budget_tokens; enable thinking and do NOT inflate
       // max_tokens (the budget branch would grow the ceiling for nothing).
       body.thinking = { type: "enabled" };
     } else if (usesAdaptiveThinking(req.model)) {
+      // Fable-class models are intentionally adaptive — the API picks the depth,
+      // so the dial collapses to on/off here (the level isn't threaded in).
       body.thinking = { type: "adaptive" };
     } else {
       const budget = thinkingBudgetTokens(req.reasoningLevel);
@@ -565,12 +555,18 @@ function freshBlock(kind: BlockState["kind"]): BlockState {
   return { kind, text: "", thinking: "", signature: "", partialJson: "" };
 }
 
-function parseToolInput(partialJson: string): unknown {
-  if (!partialJson) return {};
+function parseToolInput(partialJson: string, toolName: string): unknown {
+  // coerceToolArgs throws a correctable <tool_use_error> on malformed/truncated
+  // JSON. We CAN'T let that throw escape the SSE generator — it would fail the
+  // whole turn as a non-correctable provider_throw. Stash the message under the
+  // sentinel key instead; the engine re-throws it per-tool so the model sees an
+  // is_error tool_result naming the tool and learns its JSON was unparseable
+  // (the old {__unparseable_args__} sentinel was stripped by zod → opaque
+  // "<field>: Required").
   try {
-    return JSON.parse(partialJson);
-  } catch {
-    return { __unparseable_args__: partialJson };
+    return coerceToolArgs(partialJson, toolName);
+  } catch (err) {
+    return { [TOOL_ARGS_ERROR_KEY]: err instanceof Error ? err.message : String(err) };
   }
 }
 

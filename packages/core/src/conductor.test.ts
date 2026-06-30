@@ -876,7 +876,10 @@ function mockWorktrees() {
   const make = async (label: string) => ({
     dir: `/wt/${label}`,
     changedFiles: async () => filesByLabel[label] ?? [],
-    applyTo: async (_ws: string) => { applied.push(label); },
+    applyTo: async (_ws: string) => {
+      applied.push(label);
+      return { applied: filesByLabel[label] ?? [], failed: [] as { rel: string; err: string }[] };
+    },
     cleanup: async () => { cleaned.push(label); },
   });
   return { make, applied, cleaned, filesByLabel };

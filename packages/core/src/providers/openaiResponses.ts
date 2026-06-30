@@ -25,11 +25,13 @@ import type {
   StopReason,
   ContentBlock,
 } from "@ares/protocol";
-import { openAIReasoningEffort } from "@ares/protocol";
+import { openAIReasoningEffort, reasoningEnabled } from "@ares/protocol";
 import type { Provider, ProviderRequest } from "../queryEngine.js";
 import { loadAuthToken, type AuthToken } from "./openaiAuth.js";
 import { parseRetryAfterMs } from "./retryAfter.js";
 import { buildPromptCacheKey } from "../promptCache.js";
+import { createStallGuard, stallErrorEvent, type StallGuard } from "./stallGuard.js";
+import { coerceToolArgs, sanitizeToolPairs, TOOL_ARGS_ERROR_KEY } from "./_toolPairs.js";
 
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 
@@ -81,15 +83,24 @@ export class OpenAIResponsesProvider implements Provider {
     };
     if (auth.accountId) headers["ChatGPT-Account-ID"] = auth.accountId;
 
+    // Stall watchdog: abort the fetch when no bytes arrive for the stall
+    // window so a hung Codex connection becomes a retriable error, not a freeze.
+    const guard = createStallGuard(req.signal);
     let response: Response;
     try {
       response = await this.fetchImpl(url, {
         method: "POST",
         headers,
         body: JSON.stringify(body),
-        signal: req.signal,
+        signal: guard.signal,
       });
     } catch (err) {
+      guard.dispose();
+      if (guard.stalled()) {
+        yield stallErrorEvent();
+        return;
+      }
+      if (req.signal?.aborted || isAbortError(err)) return;
       yield {
         type: "error",
         error: {
@@ -100,6 +111,7 @@ export class OpenAIResponsesProvider implements Provider {
       };
       return;
     }
+    guard.reset();
 
     if (!response.ok) {
       const text = await response.text().catch(() => "");
@@ -123,10 +135,14 @@ export class OpenAIResponsesProvider implements Provider {
       return;
     }
 
-    yield* this.parseSSE(response.body);
+    yield* this.parseSSE(response.body, req.signal, guard);
   }
 
-  private async *parseSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<StreamEvent> {
+  private async *parseSSE(
+    body: ReadableStream<Uint8Array>,
+    signal: AbortSignal | undefined,
+    guard?: StallGuard,
+  ): AsyncGenerator<StreamEvent> {
     const decoder = new TextDecoder("utf8");
     const reader = body.getReader();
     let buffer = "";
@@ -134,13 +150,43 @@ export class OpenAIResponsesProvider implements Provider {
     // Accumulation state for the in-flight message
     const textParts: string[] = [];
     const thinkingParts: string[] = [];
-    const toolUseByItemId = new Map<string, { callId: string; name: string; argsText: string; completed: boolean }>();
+    const toolUseByItemId = new Map<string, ToolUseEntry>();
     let usage: Usage = { inputTokens: 0, outputTokens: 0 };
     let stopReason: StopReason = "end_turn";
     let messageId = "";
 
+    const cancel = (): void => {
+      void reader.cancel().catch(() => {});
+    };
+
     while (true) {
-      const { done, value } = await reader.read();
+      if (signal?.aborted) {
+        cancel();
+        guard?.dispose();
+        return;
+      }
+      let done: boolean;
+      let value: Uint8Array | undefined;
+      try {
+        ({ done, value } = await reader.read());
+      } catch (err) {
+        guard?.dispose();
+        if (guard?.stalled()) {
+          yield stallErrorEvent();
+          return;
+        }
+        if (signal?.aborted || isAbortError(err)) return;
+        yield {
+          type: "error",
+          error: {
+            code: "stream_read_error",
+            message: err instanceof Error ? err.message : String(err),
+            retriable: true,
+          },
+        };
+        return;
+      }
+      guard?.reset();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
@@ -175,7 +221,24 @@ export class OpenAIResponsesProvider implements Provider {
             if (item?.type === "function_call") {
               const itemId = item.id ?? item.call_id ?? `call_${toolUseByItemId.size}`;
               const callId = item.call_id ?? itemId;
-              toolUseByItemId.set(itemId, { callId, name: item.name ?? "", argsText: "", completed: false });
+              // Reuse an entry a prior args event lazily created under any of
+              // these ids (so accumulated argsText survives) instead of clobbering
+              // it; fill in the real callId/name now that .added carries them.
+              const existing =
+                (item.id ? toolUseByItemId.get(item.id) : undefined) ??
+                (item.call_id ? toolUseByItemId.get(item.call_id) : undefined) ??
+                toolUseByItemId.get(itemId);
+              const entry: ToolUseEntry = existing ?? { callId, name: "", argsText: "", completed: false };
+              entry.callId = callId;
+              if (item.name) entry.name = item.name;
+              // Register the SAME entry under every id a later args event might
+              // carry: item.id, item.call_id, and the synthetic fallback. Some
+              // backends omit item.id here but stamp a real item_id on the
+              // function_call_arguments.* events — keying by all three makes the
+              // delta/done lookup resolve regardless of which id arrives.
+              if (item.id) toolUseByItemId.set(item.id, entry);
+              if (item.call_id) toolUseByItemId.set(item.call_id, entry);
+              toolUseByItemId.set(itemId, entry);
               yield { type: "tool_use_start", id: callId, name: item.name ?? "" };
             }
             continue;
@@ -193,26 +256,52 @@ export class OpenAIResponsesProvider implements Provider {
           case "response.function_call_arguments.delta": {
             const itemId = evt.item_id ?? evt.id ?? "";
             const delta = evt.delta ?? "";
-            const entry = toolUseByItemId.get(itemId);
-            if (entry && delta) {
-              entry.argsText += delta;
-              yield { type: "tool_use_input_delta", id: entry.callId, deltaJson: delta };
-            }
+            if (!delta) continue;
+            // Lazily create if output_item.added never registered this id (args
+            // arriving before/without the added event) so the chunk is
+            // accumulated, not silently dropped.
+            const entry = getOrCreateToolEntry(toolUseByItemId, itemId);
+            entry.argsText += delta;
+            yield { type: "tool_use_input_delta", id: entry.callId, deltaJson: delta };
             continue;
           }
 
           case "response.function_call_arguments.done": {
             const itemId = evt.item_id ?? evt.id ?? "";
+            // Lazily create for the same reason as .delta: a backend that skips
+            // output_item.added still gets its args finalized rather than dropped.
+            const entry = getOrCreateToolEntry(toolUseByItemId, itemId);
+            if (entry.completed) continue;
+            entry.completed = true;
+            // evt.arguments carries the complete args on .done for backends that
+            // never streamed deltas; prefer it when our accumulator is empty.
+            const argsText = entry.argsText || evt.arguments || "";
+            entry.argsText = argsText;
+            yield {
+              type: "tool_use_input_done",
+              id: entry.callId,
+              input: parseToolInput(argsText, entry.name),
+            };
+            continue;
+          }
+
+          case "response.output_item.done": {
+            // Finalize a function_call whose args.done never fired (some backends
+            // signal completion only via output_item.done). Without this the call
+            // never gets a tool_use_input_done → the engine never executes it.
+            const item = evt.item;
+            if (item?.type !== "function_call") continue;
+            const itemId = item.id ?? item.call_id ?? "";
             const entry = toolUseByItemId.get(itemId);
             if (!entry || entry.completed) continue;
             entry.completed = true;
-            let input: unknown;
-            try {
-              input = entry.argsText ? JSON.parse(entry.argsText) : {};
-            } catch {
-              input = { __unparseable_args__: entry.argsText };
-            }
-            yield { type: "tool_use_input_done", id: entry.callId, input };
+            const argsText = entry.argsText || item.arguments || "";
+            entry.argsText = argsText;
+            yield {
+              type: "tool_use_input_done",
+              id: entry.callId,
+              input: parseToolInput(argsText, entry.name),
+            };
             continue;
           }
 
@@ -224,6 +313,7 @@ export class OpenAIResponsesProvider implements Provider {
           }
 
           case "error": {
+            guard?.dispose();
             yield {
               type: "error",
               error: {
@@ -242,6 +332,8 @@ export class OpenAIResponsesProvider implements Provider {
       }
     }
 
+    guard?.dispose();
+
     // Build the final assistant Message.
     const content: ContentBlock[] = [];
     if (thinkingParts.length > 0) {
@@ -250,14 +342,30 @@ export class OpenAIResponsesProvider implements Provider {
     if (textParts.length > 0) {
       content.push({ type: "text", text: textParts.join("") });
     }
+    // One entry is registered under multiple keys (item.id / call_id / synthetic
+    // fallback), so dedupe by entry identity before emitting tool_use blocks.
+    const seenEntries = new Set<ToolUseEntry>();
     for (const entry of toolUseByItemId.values()) {
-      let input: unknown;
-      try {
-        input = entry.argsText ? JSON.parse(entry.argsText) : {};
-      } catch {
-        input = { __unparseable_args__: entry.argsText };
+      if (seenEntries.has(entry)) continue;
+      seenEntries.add(entry);
+      // Backstop: an entry that never reached completed===true (no args.done and
+      // no output_item.done) would otherwise ship as a tool_use the engine never
+      // ran an input_done for — a silently-dropped orphan. Emit a synthesized
+      // input_done so a partial call surfaces as a correctable per-tool is_error.
+      if (!entry.completed) {
+        entry.completed = true;
+        yield {
+          type: "tool_use_input_done",
+          id: entry.callId,
+          input: parseToolInput(entry.argsText, entry.name),
+        };
       }
-      content.push({ type: "tool_use", id: entry.callId, name: entry.name, input });
+      content.push({
+        type: "tool_use",
+        id: entry.callId,
+        name: entry.name,
+        input: parseToolInput(entry.argsText, entry.name),
+      });
     }
 
     const message: Message = {
@@ -274,10 +382,15 @@ export class OpenAIResponsesProvider implements Provider {
 
 function buildRequestBody(req: ProviderRequest): Record<string, unknown> {
   const cache = buildPromptCacheKey(req);
+  const level = req.reasoningLevel;
   return {
     model: req.model,
     instructions: req.system,
-    input: req.messages.flatMap(toResponsesInputItems),
+    // sanitizeToolPairs first: a function_call_output whose function_call was
+    // dropped (compaction / interrupted turn / provider switch) is an orphan
+    // the Codex backend 400s on. It folds orphans to plain text, same as the
+    // Anthropic path.
+    input: sanitizeToolPairs(req.messages).flatMap(toResponsesInputItems),
     store: false,
     prompt_cache_key: cache.key,
     tools: req.tools.map((t) => ({
@@ -287,8 +400,50 @@ function buildRequestBody(req: ProviderRequest): Record<string, unknown> {
       parameters: t.input_schema,
     })),
     stream: true,
-    ...(req.reasoningLevel ? { reasoning: { effort: openAIReasoningEffort(req.reasoningLevel) } } : {}),
+    // Gate on reasoningEnabled() (not bare truthiness) so "off" sends NO
+    // reasoning field at all. "max" collapsing to "high" is handled inside
+    // openAIReasoningEffort()/reasoning.ts already.
+    ...(reasoningEnabled(level)
+      ? { reasoning: { effort: openAIReasoningEffort(level ?? "off") } }
+      : {}),
   };
+}
+
+// coerceToolArgs throws a correctable <tool_use_error> on malformed/truncated
+// JSON. We CAN'T let that throw escape the SSE generator — it would fail the
+// whole turn as a non-correctable provider_throw. Stash the message under the
+// sentinel key instead; the engine re-throws it per-tool so the model sees an
+// is_error tool_result naming the tool and learns its JSON was unparseable.
+function parseToolInput(argsText: string, toolName: string): unknown {
+  try {
+    return coerceToolArgs(argsText, toolName);
+  } catch (err) {
+    return { [TOOL_ARGS_ERROR_KEY]: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+interface ToolUseEntry {
+  callId: string;
+  name: string;
+  argsText: string;
+  completed: boolean;
+}
+
+// Resolve the tool entry for an args event, creating one if output_item.added
+// never registered it (args arriving before/without the added event). The
+// synthetic callId reuses itemId so the engine still has a stable tool id to
+// pair the result against.
+function getOrCreateToolEntry(map: Map<string, ToolUseEntry>, itemId: string): ToolUseEntry {
+  let entry = map.get(itemId);
+  if (!entry) {
+    entry = { callId: itemId || `call_${map.size}`, name: "", argsText: "", completed: false };
+    map.set(itemId, entry);
+  }
+  return entry;
+}
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === "AbortError";
 }
 
 function toResponsesInputItems(m: Message): Record<string, unknown>[] {
@@ -298,13 +453,34 @@ function toResponsesInputItems(m: Message): Record<string, unknown>[] {
   // input message.
   const items: Record<string, unknown>[] = [];
   const messageContent: Record<string, unknown>[] = [];
+  // Images carried inside a tool_result can't ride the function_call_output
+  // (its `output` is a plain string — JSON.stringify'ing an array dumps the
+  // base64 as literal text and blinds the model). Collect them here and emit
+  // them through the Responses input_image channel in a trailing user message.
+  const toolResultImages: Record<string, unknown>[] = [];
 
   for (const b of m.content) {
     if (b.type === "tool_result") {
+      let output: string;
+      if (typeof b.content === "string") {
+        output = b.content;
+      } else {
+        // Keep text as text; route images to the input_image channel below.
+        const texts: string[] = [];
+        for (const inner of b.content) {
+          if (inner.type === "text") {
+            texts.push(inner.text);
+          } else if (inner.type === "image") {
+            toolResultImages.push(toResponsesImage(inner));
+            texts.push("[image returned to the model below]");
+          }
+        }
+        output = texts.join("\n");
+      }
       items.push({
         type: "function_call_output",
         call_id: b.tool_use_id,
-        output: typeof b.content === "string" ? b.content : JSON.stringify(b.content),
+        output,
       });
     } else if (b.type === "text") {
       messageContent.push({
@@ -330,6 +506,17 @@ function toResponsesInputItems(m: Message): Record<string, unknown>[] {
       type: "message",
       role: m.role === "assistant" ? "assistant" : m.role === "system" ? "system" : "user",
       content: messageContent,
+    });
+  }
+
+  // Tool-result images ride the input_image channel in a user message AFTER
+  // the function_call_output items (an output must immediately follow its
+  // call; the image is conceptually the user handing the result back).
+  if (toolResultImages.length > 0) {
+    items.push({
+      type: "message",
+      role: "user",
+      content: toolResultImages,
     });
   }
 
@@ -402,11 +589,14 @@ function parseSSEEvent(raw: string): ParsedSSE | null {
 
 interface ResponsesEvent {
   type: string;
-  item?: { type?: string; id?: string; call_id?: string; name?: string };
+  item?: { type?: string; id?: string; call_id?: string; name?: string; arguments?: string };
   item_id?: string;
   id?: string;
   delta?: string;
   text?: string;
+  // Complete args string some backends put on .done / output_item.done instead
+  // of streaming deltas.
+  arguments?: string;
   response?: {
     id?: string;
     status?: "completed" | "incomplete" | "failed" | "in_progress";

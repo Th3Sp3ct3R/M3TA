@@ -17,10 +17,11 @@ import type {
   StopReason,
   ContentBlock,
 } from "@ares/protocol";
-import { openAIReasoningEffort } from "@ares/protocol";
+import { openAIReasoningEffort, reasoningEnabled } from "@ares/protocol";
 import type { Provider, ProviderRequest } from "../queryEngine.js";
 import { createStallGuard, stallErrorEvent, type StallGuard } from "./stallGuard.js";
 import { parseRetryAfterMs } from "./retryAfter.js";
+import { coerceToolArgs, TOOL_ARGS_ERROR_KEY } from "./_toolPairs.js";
 
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 export const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
@@ -135,8 +136,16 @@ export class OpenRouterProvider implements Provider {
     const textParts: string[] = [];
     const thinkingParts: string[] = [];
     const reasoningDetails: unknown[] = [];
-    // tool calls accumulated by their streaming index
-    const tools = new Map<number, { id: string; name: string; argsText: string; started: boolean }>();
+    // Tool calls accumulated under a STABLE key. Upstreams that stream parallel
+    // tool_calls sometimes omit `index` on the deltas; keying by `index ?? 0`
+    // then collapses every concurrent call onto bucket 0 (second clobbers first,
+    // args concatenate into one corrupt blob). Prefer the call id, fall back to
+    // the wire index, and only as a last resort a monotonic counter — so a
+    // single normal call still accumulates correctly and parallel calls stay
+    // separate even when the upstream is sloppy about index/id.
+    const tools = new Map<string, { id: string; name: string; argsText: string; started: boolean }>();
+    const indexToKey = new Map<number, string>();
+    let anonToolSeq = 0;
     let usage: Usage = { inputTokens: 0, outputTokens: 0 };
     let stopReason: StopReason = "end_turn";
 
@@ -180,11 +189,37 @@ export class OpenRouterProvider implements Provider {
       }
       if (delta?.tool_calls) {
         for (const tc of delta.tool_calls) {
-          const idx = tc.index ?? 0;
-          let entry = tools.get(idx);
+          // Resolve a stable accumulation key. id wins (globally unique across
+          // parallel calls); otherwise the wire index (mapped to whatever key it
+          // first resolved to, so an id arriving later reuses the same entry);
+          // otherwise a per-stream counter so id-less, index-less deltas don't
+          // all pile onto one bucket.
+          let key: string;
+          if (tc.id) {
+            key = `id:${tc.id}`;
+            // If an earlier index-only delta already opened this call under an
+            // `idx:` key, migrate that buffer to the id key so args don't split.
+            if (typeof tc.index === "number" && !tools.has(key)) {
+              const priorKey = indexToKey.get(tc.index);
+              if (priorKey && priorKey !== key) {
+                const prior = tools.get(priorKey);
+                if (prior) {
+                  tools.delete(priorKey);
+                  tools.set(key, prior);
+                }
+              }
+            }
+            if (typeof tc.index === "number") indexToKey.set(tc.index, key);
+          } else if (typeof tc.index === "number") {
+            key = indexToKey.get(tc.index) ?? `idx:${tc.index}`;
+            indexToKey.set(tc.index, key);
+          } else {
+            key = `anon:${anonToolSeq++}`;
+          }
+          let entry = tools.get(key);
           if (!entry) {
-            entry = { id: tc.id ?? `call_${idx}`, name: tc.function?.name ?? "", argsText: "", started: false };
-            tools.set(idx, entry);
+            entry = { id: tc.id ?? key, name: tc.function?.name ?? "", argsText: "", started: false };
+            tools.set(key, entry);
           }
           if (tc.id) entry.id = tc.id;
           if (tc.function?.name) entry.name = tc.function.name;
@@ -239,11 +274,16 @@ export class OpenRouterProvider implements Provider {
     const text = textParts.join("");
     if (text) content.push({ type: "text", text });
     for (const entry of [...tools.values()]) {
-      let input: unknown = {};
+      let input: Record<string, unknown>;
       try {
-        input = entry.argsText ? JSON.parse(entry.argsText) : {};
-      } catch {
-        input = { __unparseable_args__: entry.argsText };
+        // coerceToolArgs THROWS a <tool_use_error>-wrapped message on malformed
+        // or truncated JSON. We're inside the SSE generator, so we cannot let it
+        // propagate — that fails the whole turn as provider_throw. Stash the
+        // message under the sentinel key; the engine re-throws it per-tool into a
+        // correctable is_error tool_result the model can fix next turn.
+        input = coerceToolArgs(entry.argsText, entry.name);
+      } catch (err) {
+        input = { [TOOL_ARGS_ERROR_KEY]: err instanceof Error ? err.message : String(err) };
       }
       yield { type: "tool_use_input_done", id: entry.id, input };
       content.push({ type: "tool_use", id: entry.id, name: entry.name, input });
@@ -310,13 +350,14 @@ function buildChatBody(model: string, req: ProviderRequest, flavor: OpenAIChatFl
           })),
         }
       : {}),
-    ...(req.reasoningLevel
+    ...(reasoningEnabled(req.reasoningLevel)
       ? flavor === "deepseek"
         ? {
             thinking: { type: "enabled" },
             reasoning_effort: req.reasoningLevel === "max" ? "max" : "high",
           }
-        : { reasoning: { effort: openAIReasoningEffort(req.reasoningLevel) } }
+        : // reasoningEnabled() guarantees a defined, non-"off" level here.
+          { reasoning: { effort: openAIReasoningEffort(req.reasoningLevel!) } }
       : {}),
   };
 }

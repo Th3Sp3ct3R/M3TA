@@ -198,8 +198,11 @@ export interface Worktree {
   dir: string;
   /** Relative paths this leaf created/modified (e.g. `git status --porcelain`). */
   changedFiles(): Promise<string[]>;
-  /** Copy this worktree's changed files into the main workspace. */
-  applyTo(mainWorkspace: string): Promise<void>;
+  /** Copy this worktree's changed files into the main workspace. Returns a per-file
+   *  inventory — never throws on a single failed copy (EACCES/ENOSPC/locked) — so the
+   *  caller can report exactly what was written vs failed instead of half-merging the
+   *  workspace and letting the exception escape the phase (merge-honesty). */
+  applyTo(mainWorkspace: string): Promise<{ applied: string[]; failed: { rel: string; err: string }[] }>;
   /** Tear the worktree down. */
   cleanup(): Promise<void>;
 }
@@ -886,9 +889,21 @@ async function runWorktreePhase(
   // otherwise apply all. Always clean up the worktrees.
   let failureReason: string | undefined;
   try {
-    const changedByLeaf = await Promise.all(
-      worktrees.map((w) => (w ? w.changedFiles().catch(() => [] as string[]) : Promise.resolve([] as string[]))),
+    // Enumerate each present leaf's changes. A changedFiles() REJECTION must NOT be
+    // swallowed into [] — an empty list registers ZERO owned paths (invisible to the
+    // overlap check below) yet that leaf would STILL get applyTo'd, silently clobbering
+    // another leaf's identically-named file while the phase reports 'completed'. Fail
+    // CLOSED: capture rejections and, if any present leaf could not be enumerated,
+    // merge NOTHING (merge-honesty — never overwrite what we couldn't account for).
+    const enumerated = await Promise.allSettled(
+      worktrees.map((w) => (w ? w.changedFiles() : Promise.resolve([] as string[]))),
     );
+    const enumFailed: number[] = [];
+    const changedByLeaf: string[][] = enumerated.map((r, i) => {
+      if (r.status === "fulfilled") return r.value;
+      if (worktrees[i]) enumFailed.push(i);
+      return [];
+    });
     const owner = new Map<string, number>();
     const conflicts: string[] = [];
     changedByLeaf.forEach((files, i) => {
@@ -897,12 +912,37 @@ async function runWorktreePhase(
         else owner.set(f, i);
       }
     });
-    if (conflicts.length > 0) {
+    if (enumFailed.length > 0) {
+      // Could not list one or more worktrees' changes — refuse to merge anything
+      // rather than apply a partial, unaccountable set over the real workspace.
+      failureReason =
+        `could not enumerate worktree changes — refusing to merge: ${enumFailed.length} build ` +
+        `agent(s) (index ${enumFailed.slice(0, 6).join(", ")}) failed to list their changed files, ` +
+        `so cross-leaf overlap could not be checked. Nothing was merged into the workspace.`;
+    } else if (conflicts.length > 0) {
       failureReason =
         `worktree merge conflict — ${conflicts.length} file(s) were written by more than one parallel build ` +
         `agent: ${[...new Set(conflicts)].slice(0, 6).join(", ")}. Make build agents FILE-DISJOINT (each owns different files).`;
     } else {
-      for (const w of worktrees) if (w) await w.applyTo(deps.workspace);
+      // Every present leaf enumerated cleanly AND there is no overlap — apply. applyTo
+      // never throws now (per-file inventory); accumulate so a mid-loop EACCES/ENOSPC/
+      // locked failure yields an HONEST inventory of written-vs-failed instead of a
+      // half-merged workspace whose exception escapes the phase.
+      const allApplied: string[] = [];
+      const allFailed: { rel: string; err: string }[] = [];
+      for (const w of worktrees) {
+        if (!w) continue;
+        const res = await w.applyTo(deps.workspace);
+        allApplied.push(...res.applied);
+        allFailed.push(...res.failed);
+      }
+      if (allFailed.length > 0) {
+        failureReason =
+          `worktree merge PARTIAL — ${allApplied.length} file(s) written, ${allFailed.length} FAILED to copy ` +
+          `into the workspace. Failed: ${allFailed.slice(0, 6).map((f) => `${f.rel} (${f.err})`).join(", ")}. ` +
+          `Written: ${allApplied.slice(0, 6).join(", ")}${allApplied.length > 6 ? ", …" : ""}. ` +
+          `The workspace is half-merged — reconcile before relying on it.`;
+      }
     }
   } finally {
     await Promise.allSettled(worktrees.map((w) => (w ? w.cleanup() : Promise.resolve())));
