@@ -38,6 +38,38 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.12.1",
+    date: "June 2026",
+    title: "Sharper hands",
+    tagline: "A fast follow-up: skills that don't false-alarm, eyes for your images, and fewer needless prompts.",
+    highlights: [
+      {
+        icon: "🛠️",
+        title: "Skills that finish",
+        tag: "Safer",
+        blurb: "A skill that takes a while — generating an image or a video — is no longer cut off and reported as failed while it's still working. It runs to completion and reports the real result.",
+      },
+      {
+        icon: "🖼️",
+        title: "Ares can see your images",
+        tag: "New",
+        blurb: "Ares can now actually view image files — judge a render it made, read a screenshot, inspect a diagram — instead of choking on raw data.",
+      },
+      {
+        icon: "🔓",
+        title: "Fewer needless prompts",
+        tag: "Polished",
+        blurb: "Harmless commands like listing or formatting a table of files no longer trip a false “this can delete data” warning, so you approve less and move faster.",
+      },
+      {
+        icon: "🧩",
+        title: "Self-built skills work first try",
+        tag: "Polished",
+        blurb: "When Ares forges a new skill for itself, it scaffolds a correct, ready-to-run template — far fewer false starts when it extends its own abilities.",
+      },
+    ],
+  },
+  {
     version: "0.12.0",
     date: "June 2026",
     title: "Does what it says",
