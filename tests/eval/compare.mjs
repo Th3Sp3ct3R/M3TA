@@ -1,17 +1,17 @@
-// The scoreboard — Ares vs Claude Code on identical tasks, one table, plus a
-// trend line appended to ~/.ares/telemetry/eval-trend.jsonl so HELM (and the
-// nightly job) can chart whether the gap is closing.
+// The scoreboard — Ares's absolute score on the 50-task suite, plus a trend
+// line appended to ~/.ares/telemetry/eval-trend.jsonl so HELM (and the
+// nightly job) can chart the agent getting better. Ares needs NO other
+// coding agent installed: the default run is Ares-only, and the trend line
+// (today vs last week) is the number that matters.
 //
 // Usage:
-//   node tests/eval/compare.mjs                       # both sides, all tasks
-//   node tests/eval/compare.mjs --skip-cc             # Ares side only
-//   node tests/eval/compare.mjs --skip-ares           # CC side only
-//   node tests/eval/compare.mjs --task <id>           # one task, both sides
-//   node tests/eval/compare.mjs --provider anthropic  # Ares provider (default)
+//   node tests/eval/compare.mjs                       # Ares, all tasks
+//   node tests/eval/compare.mjs --provider openrouter # pick the provider
+//   node tests/eval/compare.mjs --task <id>           # one task
+//   node tests/eval/compare.mjs --with-cc             # optional one-time
+//        baseline vs a logged-in Claude Code CLI (never required)
 //
-// Ares side needs an Anthropic key (env or Ares settings); CC side needs a
-// logged-in `claude` CLI. Both cost real money/quota — the suite is sized for
-// single-digit dollars.
+// The Ares side needs a working provider key (env or Ares settings).
 
 import { appendFile, mkdir } from "node:fs/promises";
 import path from "node:path";
@@ -31,17 +31,18 @@ if (tasks.length === 0) {
   process.exit(2);
 }
 
-console.log(`Comparing on ${tasks.length} task(s) — Ares(${provider}) vs Claude Code…`);
+const withCc = flag("--with-cc");
+console.log(`Scoring ${tasks.length} task(s) — Ares via ${provider}${withCc ? " + optional Claude Code baseline" : ""}…`);
 
 let ares = null;
 let cc = null;
 if (!flag("--skip-ares")) {
-  console.log(`\n[1/2] Ares engine via ${provider}…`);
+  console.log(`\n[ares] engine via ${provider}…`);
   ares = await runEval({ tasks, providerName: provider });
   console.log(`      ${ares.passed}/${ares.taskCount} in ${(ares.totalDurationMs / 1000).toFixed(1)}s`);
 }
-if (!flag("--skip-cc")) {
-  console.log(`\n[2/2] Claude Code headless…`);
+if (withCc) {
+  console.log(`\n[baseline] Claude Code headless…`);
   cc = await runCcEval({ tasks });
   console.log(`      ${cc.passed}/${cc.taskCount} in ${(cc.totalDurationMs / 1000).toFixed(1)}s`);
 }
