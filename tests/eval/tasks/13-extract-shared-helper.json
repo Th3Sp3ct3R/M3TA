@@ -1,0 +1,36 @@
+{
+  "id": "extract-shared-helper",
+  "title": "Extract a duplicated helper into util.mjs",
+  "prompt": "Two modules duplicate the same inline clamp helper. Create util.mjs exporting clamp(v, lo, hi), and rewrite a.mjs and b.mjs to import { clamp } from './util.mjs' instead of defining it inline. Current a.mjs:\nexport function clampA(n) {\n  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));\n  return clamp(n, 0, 10);\n}\n\nCurrent b.mjs:\nexport function clampB(n) {\n  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));\n  return clamp(n, 0, 100);\n}\n",
+  "seedFiles": {
+    "a.mjs": "export function clampA(n) {\n  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));\n  return clamp(n, 0, 10);\n}\n",
+    "b.mjs": "export function clampB(n) {\n  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));\n  return clamp(n, 0, 100);\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"Promise.all([import('./a.mjs'),import('./b.mjs'),import('./util.mjs')]).then(([a,b,u])=>{if(a.clampA(99)!==10)throw new Error('a');if(b.clampB(99)!==99)throw new Error('b');if(u.clamp(5,0,3)!==3)throw new Error('u');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "util.mjs",
+        "content": "export const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));\n"
+      }
+    },
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "a.mjs",
+        "content": "import { clamp } from './util.mjs';\nexport function clampA(n) {\n  return clamp(n, 0, 10);\n}\n"
+      }
+    },
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "b.mjs",
+        "content": "import { clamp } from './util.mjs';\nexport function clampB(n) {\n  return clamp(n, 0, 100);\n}\n"
+      }
+    }
+  ]
+}

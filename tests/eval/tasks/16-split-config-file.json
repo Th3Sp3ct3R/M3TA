@@ -1,0 +1,28 @@
+{
+  "id": "split-config-file",
+  "title": "Split config.json into db.json and api.json",
+  "prompt": "config.json currently contains:\n{\n  \"db\": {\n    \"host\": \"localhost\",\n    \"port\": 5432\n  },\n  \"api\": {\n    \"url\": \"https://api.example.com\",\n    \"timeout\": 30\n  }\n}\n\nCreate db.json containing ONLY the db object ({\"host\":...,\"port\":...}) and api.json containing ONLY the api object. Leave config.json unchanged.",
+  "seedFiles": {
+    "config.json": "{\n  \"db\": {\n    \"host\": \"localhost\",\n    \"port\": 5432\n  },\n  \"api\": {\n    \"url\": \"https://api.example.com\",\n    \"timeout\": 30\n  }\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"const f=require('fs');const db=JSON.parse(f.readFileSync('db.json','utf8'));const api=JSON.parse(f.readFileSync('api.json','utf8'));if(db.port!==5432||db.host!=='localhost')throw new Error('db');if(api.timeout!==30)throw new Error('api');const c=JSON.parse(f.readFileSync('config.json','utf8'));if(!c.db||!c.api)throw new Error('config changed');console.log('ok')\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "db.json",
+        "content": "{\n  \"host\": \"localhost\",\n  \"port\": 5432\n}\n"
+      }
+    },
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "api.json",
+        "content": "{\n  \"url\": \"https://api.example.com\",\n  \"timeout\": 30\n}\n"
+      }
+    }
+  ]
+}

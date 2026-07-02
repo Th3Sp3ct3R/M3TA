@@ -1,0 +1,22 @@
+{
+  "id": "fix-slice-off-by-one",
+  "title": "Fix off-by-one in lastN",
+  "prompt": "lastN([1,2,3,4], 2) should return [3,4] but returns [4]. Fix the slice. lastN.mjs:\nexport function lastN(arr, n) {\n  return arr.slice(-n + 1);\n}\n",
+  "seedFiles": {
+    "lastN.mjs": "export function lastN(arr, n) {\n  return arr.slice(-n + 1);\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./lastN.mjs').then(m=>{const r=m.lastN([1,2,3,4],2);if(r.length!==2||r[0]!==3||r[1]!==4)throw new Error(JSON.stringify(r));console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "lastN.mjs",
+        "old_string": "arr.slice(-n + 1)",
+        "new_string": "arr.slice(-n)"
+      }
+    }
+  ]
+}

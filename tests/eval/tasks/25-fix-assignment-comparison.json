@@ -1,0 +1,22 @@
+{
+  "id": "fix-assignment-comparison",
+  "title": "Fix = used where === was meant",
+  "prompt": "isAdmin returns true for every role because of an assignment in the condition. Fix it so only 'admin' passes. access.mjs:\nexport function isAdmin(role) {\n  if ((role = 'admin')) {\n    return true;\n  }\n  return false;\n}\n",
+  "seedFiles": {
+    "access.mjs": "export function isAdmin(role) {\n  if ((role = 'admin')) {\n    return true;\n  }\n  return false;\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./access.mjs').then(m=>{if(m.isAdmin('user')!==false)throw new Error('user');if(m.isAdmin('admin')!==true)throw new Error('admin');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "access.mjs",
+        "old_string": "if ((role = 'admin'))",
+        "new_string": "if (role === 'admin')"
+      }
+    }
+  ]
+}

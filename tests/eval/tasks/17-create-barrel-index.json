@@ -1,0 +1,22 @@
+{
+  "id": "create-barrel-index",
+  "title": "Create a barrel index for lib/",
+  "prompt": "The directory lib/ has one.mjs (exports one()) and two.mjs (exports two()). Create lib/index.mjs that re-exports both so import('./lib/index.mjs') exposes one and two.",
+  "seedFiles": {
+    "lib/one.mjs": "export function one() {\n  return 1;\n}\n",
+    "lib/two.mjs": "export function two() {\n  return 2;\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./lib/index.mjs').then(m=>{if(m.one()!==1||m.two()!==2)throw new Error('barrel');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "lib/index.mjs",
+        "content": "export { one } from './one.mjs';\nexport { two } from './two.mjs';\n"
+      }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "implement-deep-merge",
+  "title": "Implement deepMerge",
+  "prompt": "Create merge.mjs exporting deepMerge(a, b): plain objects merge recursively (b wins on conflicts), arrays and non-objects are REPLACED by b's value, and neither input is mutated.",
+  "seedFiles": {},
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./merge.mjs').then(m=>{const a={x:{y:1,z:2},list:[1,2],keep:'a'};const b={x:{y:9},list:[3]};const r=m.deepMerge(a,b);if(r.x.y!==9||r.x.z!==2||r.keep!=='a')throw new Error('merge');if(r.list.join(',')!=='3')throw new Error('array replace');if(a.x.y!==1)throw new Error('mutated');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "merge.mjs",
+        "content": "function isPlainObject(v) {\n  return v !== null && typeof v === 'object' && !Array.isArray(v);\n}\n\nexport function deepMerge(a, b) {\n  if (!isPlainObject(a) || !isPlainObject(b)) return b;\n  const out = { ...a };\n  for (const [k, v] of Object.entries(b)) {\n    out[k] = isPlainObject(out[k]) && isPlainObject(v) ? deepMerge(out[k], v) : v;\n  }\n  return out;\n}\n"
+      }
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "id": "fix-swallowed-rejection",
+  "title": "Stop swallowing the rejection",
+  "prompt": "run() silently swallows inner()'s error. Change it so the caller sees the original Error('boom') rejection. run.mjs:\nasync function inner() {\n  throw new Error('boom');\n}\n\nexport async function run() {\n  return inner().catch(() => {});\n}\n",
+  "seedFiles": {
+    "run.mjs": "async function inner() {\n  throw new Error('boom');\n}\n\nexport async function run() {\n  return inner().catch(() => {});\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./run.mjs').then(m=>m.run().then(()=>{throw new Error('did not reject')},e=>{if(e.message!=='boom')throw new Error('wrong error');console.log('ok')}))\""
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "run.mjs",
+        "old_string": "  return inner().catch(() => {});",
+        "new_string": "  return inner();"
+      }
+    }
+  ]
+}

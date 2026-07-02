@@ -1,0 +1,22 @@
+{
+  "id": "fix-mutating-sort",
+  "title": "sortedCopy must not mutate its input",
+  "prompt": "sortedCopy mutates the caller's array. Fix it to sort a copy. sorted.mjs:\nexport function sortedCopy(arr) {\n  return arr.sort((a, b) => a - b);\n}\n",
+  "seedFiles": {
+    "sorted.mjs": "export function sortedCopy(arr) {\n  return arr.sort((a, b) => a - b);\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./sorted.mjs').then(m=>{const a=[3,1,2];const r=m.sortedCopy(a);if(r.join(',')!=='1,2,3')throw new Error('sort');if(a.join(',')!=='3,1,2')throw new Error('mutated input');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "sorted.mjs",
+        "old_string": "return arr.sort((a, b) => a - b);",
+        "new_string": "return [...arr].sort((a, b) => a - b);"
+      }
+    }
+  ]
+}

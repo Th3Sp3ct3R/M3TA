@@ -1,0 +1,23 @@
+{
+  "id": "edit-preserve-comments",
+  "title": "Bump RATE_LIMIT without touching any comment",
+  "prompt": "Change RATE_LIMIT from 100 to 250 in limits.mjs. Every comment (including the trailing one) and all other lines must remain byte-identical. Current file:\n// Rate limiting for the public API.\n// NOTE: ops asked us to keep this conservative until Q3.\nexport const RATE_LIMIT = 100; // requests/minute\n\n// Wire retry budget — see incident 2024-11.\nexport const RETRY_BUDGET = 4;\n",
+  "seedFiles": {
+    "limits.mjs": "// Rate limiting for the public API.\n// NOTE: ops asked us to keep this conservative until Q3.\nexport const RATE_LIMIT = 100; // requests/minute\n\n// Wire retry budget — see incident 2024-11.\nexport const RETRY_BUDGET = 4;\n"
+  },
+  "grade": {
+    "type": "fileEquals",
+    "path": "limits.mjs",
+    "value": "// Rate limiting for the public API.\n// NOTE: ops asked us to keep this conservative until Q3.\nexport const RATE_LIMIT = 250; // requests/minute\n\n// Wire retry budget — see incident 2024-11.\nexport const RETRY_BUDGET = 4;\n"
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "limits.mjs",
+        "old_string": "export const RATE_LIMIT = 100; // requests/minute",
+        "new_string": "export const RATE_LIMIT = 250; // requests/minute"
+      }
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "id": "fix-crlf-split",
+  "title": "Make countLines CRLF-safe",
+  "prompt": "countLines miscounts Windows text: splitting 'a\\r\\nb\\r\\nc' on '\\n' leaves \\r on the pieces. Make it line-ending agnostic so countLines('a\\r\\nb\\r\\nc') === 3 and countLines('x\\ny\\n') === 2 (blank trailing piece ignored, and a piece that is just \\r must not count). lines.mjs:\nexport function countLines(text) {\n  return text.split('\\n').filter((l) => l.length > 0).length;\n}\n",
+  "seedFiles": {
+    "lines.mjs": "export function countLines(text) {\n  return text.split('\\n').filter((l) => l.length > 0).length;\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./lines.mjs').then(m=>{if(m.countLines('a\\r\\nb\\r\\nc')!==3)throw new Error('crlf');if(m.countLines('x\\ny\\n')!==2)throw new Error('lf');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "lines.mjs",
+        "old_string": "text.split('\\n')",
+        "new_string": "text.split(/\\r?\\n/)"
+      }
+    }
+  ]
+}

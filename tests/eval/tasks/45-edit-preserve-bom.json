@@ -1,0 +1,23 @@
+{
+  "id": "edit-preserve-bom",
+  "title": "Edit a BOM-prefixed file without dropping the BOM",
+  "prompt": "settings.ini starts with a UTF-8 BOM character and contains name=alpha. Change alpha to beta. The BOM and the trailing newline must survive byte-for-byte.",
+  "seedFiles": {
+    "settings.ini": "﻿name=alpha\n"
+  },
+  "grade": {
+    "type": "fileEquals",
+    "path": "settings.ini",
+    "value": "﻿name=beta\n"
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "settings.ini",
+        "old_string": "name=alpha",
+        "new_string": "name=beta"
+      }
+    }
+  ]
+}

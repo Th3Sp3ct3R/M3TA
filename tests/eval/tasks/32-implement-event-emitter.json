@@ -1,0 +1,19 @@
+{
+  "id": "implement-event-emitter",
+  "title": "Implement a tiny event emitter",
+  "prompt": "Create emitter.mjs exporting class Emitter with on(name, fn) (returns an unsubscribe function), off(name, fn), and emit(name, ...args) which calls listeners in order and returns how many were called.",
+  "seedFiles": {},
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./emitter.mjs').then(m=>{const e=new m.Emitter();let got=[];const un=e.on('x',(v)=>got.push(v));e.on('x',(v)=>got.push(v*10));if(e.emit('x',2)!==2)throw new Error('count');un();if(e.emit('x',3)!==1)throw new Error('unsub');if(got.join(',')!=='2,20,30')throw new Error(got.join(','));console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "emitter.mjs",
+        "content": "export class Emitter {\n  constructor() {\n    this.listeners = new Map();\n  }\n  on(name, fn) {\n    const list = this.listeners.get(name) ?? [];\n    list.push(fn);\n    this.listeners.set(name, list);\n    return () => this.off(name, fn);\n  }\n  off(name, fn) {\n    const list = this.listeners.get(name) ?? [];\n    const i = list.indexOf(fn);\n    if (i >= 0) list.splice(i, 1);\n  }\n  emit(name, ...args) {\n    const list = [...(this.listeners.get(name) ?? [])];\n    for (const fn of list) fn(...args);\n    return list.length;\n  }\n}\n"
+      }
+    }
+  ]
+}

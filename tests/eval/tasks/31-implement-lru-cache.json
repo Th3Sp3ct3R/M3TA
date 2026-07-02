@@ -1,0 +1,19 @@
+{
+  "id": "implement-lru-cache",
+  "title": "Implement an LRU cache",
+  "prompt": "Create lru.mjs exporting class LRU. new LRU(capacity); set(k, v); get(k) returns the value or undefined and refreshes recency; when capacity is exceeded the LEAST recently used key is evicted. A `size` getter returns the current count.",
+  "seedFiles": {},
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./lru.mjs').then(m=>{const c=new m.LRU(2);c.set('a',1);c.set('b',2);c.get('a');c.set('c',3);if(c.get('b')!==undefined)throw new Error('b not evicted');if(c.get('a')!==1||c.get('c')!==3)throw new Error('kept');if(c.size!==2)throw new Error('size');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "lru.mjs",
+        "content": "export class LRU {\n  constructor(capacity) {\n    this.capacity = capacity;\n    this.map = new Map();\n  }\n  get size() {\n    return this.map.size;\n  }\n  get(k) {\n    if (!this.map.has(k)) return undefined;\n    const v = this.map.get(k);\n    this.map.delete(k);\n    this.map.set(k, v);\n    return v;\n  }\n  set(k, v) {\n    if (this.map.has(k)) this.map.delete(k);\n    this.map.set(k, v);\n    if (this.map.size > this.capacity) {\n      this.map.delete(this.map.keys().next().value);\n    }\n  }\n}\n"
+      }
+    }
+  ]
+}

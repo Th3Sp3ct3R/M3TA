@@ -1,0 +1,19 @@
+{
+  "id": "implement-semver-compare",
+  "title": "Implement semver comparison",
+  "prompt": "Create semver.mjs exporting compare(a, b) for plain x.y.z versions: returns 1 if a>b, -1 if a<b, 0 if equal. Compare numerically per segment ('1.2.10' > '1.2.9').",
+  "seedFiles": {},
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./semver.mjs').then(m=>{if(m.compare('1.2.10','1.2.9')!==1)throw new Error('a');if(m.compare('1.0.0','1.0.1')!==-1)throw new Error('b');if(m.compare('2.0.0','2.0.0')!==0)throw new Error('c');if(m.compare('0.10.0','0.9.9')!==1)throw new Error('d');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "semver.mjs",
+        "content": "export function compare(a, b) {\n  const pa = a.split('.').map(Number);\n  const pb = b.split('.').map(Number);\n  for (let i = 0; i < 3; i++) {\n    if (pa[i] > pb[i]) return 1;\n    if (pa[i] < pb[i]) return -1;\n  }\n  return 0;\n}\n"
+      }
+    }
+  ]
+}

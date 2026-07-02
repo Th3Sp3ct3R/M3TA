@@ -1,0 +1,23 @@
+{
+  "id": "edit-preserve-crlf",
+  "title": "Edit a CRLF file without converting line endings",
+  "prompt": "hosts.txt uses Windows CRLF line endings and contains two lines: 'alpha' and 'beta'. Change beta to gamma. Both lines must keep their CRLF endings exactly.",
+  "seedFiles": {
+    "hosts.txt": "alpha\r\nbeta\r\n"
+  },
+  "grade": {
+    "type": "fileEquals",
+    "path": "hosts.txt",
+    "value": "alpha\r\ngamma\r\n"
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "hosts.txt",
+        "old_string": "beta",
+        "new_string": "gamma"
+      }
+    }
+  ]
+}

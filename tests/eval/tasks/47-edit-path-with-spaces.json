@@ -1,0 +1,23 @@
+{
+  "id": "edit-path-with-spaces",
+  "title": "Update a file whose path contains spaces",
+  "prompt": "The file 'my docs/data file.txt' contains v=1. Change it to v=2.",
+  "seedFiles": {
+    "my docs/data file.txt": "v=1\n"
+  },
+  "grade": {
+    "type": "fileEquals",
+    "path": "my docs/data file.txt",
+    "value": "v=2\n"
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "my docs/data file.txt",
+        "old_string": "v=1",
+        "new_string": "v=2"
+      }
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "id": "implement-csv-line-parser",
+  "title": "Parse one CSV line with quoted fields",
+  "prompt": "Create csv.mjs exporting parseLine(line): fields split on commas, but a field wrapped in double quotes may contain commas, and a doubled double-quote inside a quoted field is a literal quote. Example: parseLine('a,\"b,c\",plain') gives ['a','b,c','plain']. Do not modify grade.mjs — it is the checker.",
+  "seedFiles": {
+    "grade.mjs": "import { parseLine } from \"./csv.mjs\";\nconst r = parseLine('a,\"b,c\",plain');\nif (r.length !== 3 || r[0] !== \"a\" || r[1] !== \"b,c\" || r[2] !== \"plain\") throw new Error(JSON.stringify(r));\nconst q = parseLine('x,\"say \"\"hi\"\"\",z');\nif (q[1] !== 'say \"hi\"') throw new Error(JSON.stringify(q));\nconst p = parseLine(\"1,2,3\");\nif (p.join(\"|\") !== \"1|2|3\") throw new Error(\"plain\");\nconsole.log(\"ok\");\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node grade.mjs"
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "csv.mjs",
+        "content": "export function parseLine(line) {\n  const out = [];\n  let field = '';\n  let quoted = false;\n  for (let i = 0; i < line.length; i++) {\n    const ch = line[i];\n    if (quoted) {\n      if (ch === '\"') {\n        if (line[i + 1] === '\"') {\n          field += '\"';\n          i++;\n        } else {\n          quoted = false;\n        }\n      } else {\n        field += ch;\n      }\n    } else if (ch === '\"') {\n      quoted = true;\n    } else if (ch === ',') {\n      out.push(field);\n      field = '';\n    } else {\n      field += ch;\n    }\n  }\n  out.push(field);\n  return out;\n}\n"
+      }
+    }
+  ]
+}

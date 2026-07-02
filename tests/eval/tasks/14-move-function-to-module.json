@@ -1,0 +1,28 @@
+{
+  "id": "move-function-to-module",
+  "title": "Move mul() into its own module with a re-export",
+  "prompt": "math.mjs currently contains:\nexport function add(a, b) {\n  return a + b;\n}\n\nexport function mul(a, b) {\n  return a * b;\n}\n\nMove mul into a new file mul.mjs (as a named export) and make math.mjs re-export it (export { mul } from './mul.mjs') so existing importers keep working. add stays in math.mjs.",
+  "seedFiles": {
+    "math.mjs": "export function add(a, b) {\n  return a + b;\n}\n\nexport function mul(a, b) {\n  return a * b;\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"Promise.all([import('./math.mjs'),import('./mul.mjs')]).then(([m,x])=>{if(m.add(2,3)!==5)throw new Error('add');if(m.mul(2,3)!==6)throw new Error('reexport');if(x.mul(4,5)!==20)throw new Error('mul');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "mul.mjs",
+        "content": "export function mul(a, b) {\n  return a * b;\n}\n"
+      }
+    },
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "math.mjs",
+        "content": "export function add(a, b) {\n  return a + b;\n}\n\nexport { mul } from './mul.mjs';\n"
+      }
+    }
+  ]
+}

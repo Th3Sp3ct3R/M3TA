@@ -1,0 +1,45 @@
+name: Nightly eval
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # 07:00 UTC nightly
+  workflow_dispatch: {}
+
+jobs:
+  eval:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      # Harness integrity — mock must stay perfect (solved-by-construction).
+      - name: Mock harness check
+        run: node tests/eval/runner.mjs
+      # Real-model run — only when the secret is configured. This is the
+      # trend line that proves the agent is getting better, not just bigger.
+      - name: Real-provider eval
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        shell: bash
+        run: |
+          node tests/eval/runner.mjs --provider anthropic --json > eval-report.json
+          node -e '
+            const r = require("./eval-report.json");
+            const line = `${r.passed}/${r.taskCount} (${(r.successRate * 100).toFixed(1)}%) — ${r.totalInputTokens} in / ${r.totalOutputTokens} out tokens`;
+            console.log("score", line);
+            require("fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, "## Nightly eval\n\n" + line + "\n");
+          '
+      - name: Upload report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval-report.json
+          if-no-files-found: ignore

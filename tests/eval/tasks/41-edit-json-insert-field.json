@@ -1,0 +1,23 @@
+{
+  "id": "edit-json-insert-field",
+  "title": "Insert a JSON field without reordering anything",
+  "prompt": "Add \"level\": \"high\" immediately after the \"name\" entry in svc.json, keeping 2-space indentation and every other line exactly as-is. Current file:\n{\n  \"name\": \"svc\",\n  \"version\": \"1.4.0\",\n  \"features\": {\n    \"auth\": true,\n    \"metrics\": false\n  },\n  \"workers\": 2\n}\n",
+  "seedFiles": {
+    "svc.json": "{\n  \"name\": \"svc\",\n  \"version\": \"1.4.0\",\n  \"features\": {\n    \"auth\": true,\n    \"metrics\": false\n  },\n  \"workers\": 2\n}\n"
+  },
+  "grade": {
+    "type": "fileEquals",
+    "path": "svc.json",
+    "value": "{\n  \"name\": \"svc\",\n  \"level\": \"high\",\n  \"version\": \"1.4.0\",\n  \"features\": {\n    \"auth\": true,\n    \"metrics\": false\n  },\n  \"workers\": 2\n}\n"
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "svc.json",
+        "old_string": "  \"name\": \"svc\",\n",
+        "new_string": "  \"name\": \"svc\",\n  \"level\": \"high\",\n"
+      }
+    }
+  ]
+}

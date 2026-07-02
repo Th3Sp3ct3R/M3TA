@@ -1,0 +1,22 @@
+{
+  "id": "fix-foreach-await",
+  "title": "Fix async forEach that returns before awaits finish",
+  "prompt": "total() always returns 0 because forEach does not await its async callback. Fix it (e.g. a for..of loop) so total([{cost:1},{cost:2},{cost:3}]) resolves to 6. Current total.mjs:\nasync function price(item) {\n  return item.cost;\n}\n\nexport async function total(items) {\n  let sum = 0;\n  items.forEach(async (item) => {\n    sum += await price(item);\n  });\n  return sum;\n}\n",
+  "seedFiles": {
+    "total.mjs": "async function price(item) {\n  return item.cost;\n}\n\nexport async function total(items) {\n  let sum = 0;\n  items.forEach(async (item) => {\n    sum += await price(item);\n  });\n  return sum;\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./total.mjs').then(async m=>{const v=await m.total([{cost:1},{cost:2},{cost:3}]);if(v!==6)throw new Error('got '+v);console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "total.mjs",
+        "old_string": "  let sum = 0;\n  items.forEach(async (item) => {\n    sum += await price(item);\n  });\n  return sum;",
+        "new_string": "  let sum = 0;\n  for (const item of items) {\n    sum += await price(item);\n  }\n  return sum;"
+      }
+    }
+  ]
+}

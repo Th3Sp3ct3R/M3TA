@@ -1,0 +1,23 @@
+{
+  "id": "edit-indent-sensitive-yaml",
+  "title": "Change only the worker timeout in an indentation-sensitive file",
+  "prompt": "In config.yaml change the WORKER timeout from 30 to 60. The api timeout stays 30; indentation is significant and must be preserved exactly. Current file:\nservice:\n  api:\n    timeout: 30\n    retries: 2\n  worker:\n    timeout: 30\n    retries: 2\n",
+  "seedFiles": {
+    "config.yaml": "service:\n  api:\n    timeout: 30\n    retries: 2\n  worker:\n    timeout: 30\n    retries: 2\n"
+  },
+  "grade": {
+    "type": "fileEquals",
+    "path": "config.yaml",
+    "value": "service:\n  api:\n    timeout: 30\n    retries: 2\n  worker:\n    timeout: 60\n    retries: 2\n"
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "config.yaml",
+        "old_string": "  worker:\n    timeout: 30",
+        "new_string": "  worker:\n    timeout: 60"
+      }
+    }
+  ]
+}

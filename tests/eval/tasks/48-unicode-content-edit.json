@@ -1,0 +1,22 @@
+{
+  "id": "unicode-content-edit",
+  "title": "Append an emoji to a unicode string",
+  "prompt": "greet.mjs exports greet() returning 'héllo wörld'. Change it to return 'héllo wörld 🚀' (single space before the rocket). Current file:\nexport function greet() {\n  return 'héllo wörld';\n}\n",
+  "seedFiles": {
+    "greet.mjs": "export function greet() {\n  return 'héllo wörld';\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./greet.mjs').then(m=>{if(m.greet()!=='h\\u00e9llo w\\u00f6rld \\ud83d\\ude80')throw new Error(JSON.stringify(m.greet()));console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "greet.mjs",
+        "old_string": "return 'héllo wörld';",
+        "new_string": "return 'héllo wörld 🚀';"
+      }
+    }
+  ]
+}

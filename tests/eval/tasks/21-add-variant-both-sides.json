@@ -1,0 +1,29 @@
+{
+  "id": "add-variant-both-sides",
+  "title": "Add a 'bool' variant to parser AND printer",
+  "prompt": "Add a 'bool' kind: parse('true') / parse('false') must return { kind: 'bool', value: true|false }, and print({kind:'bool',value:true}) must return 'bool:true'. Update BOTH files. parser.mjs:\nexport function parse(raw) {\n  if (/^\\d+$/.test(raw)) return { kind: 'num', value: Number(raw) };\n  return { kind: 'str', value: raw };\n}\n\nprinter.mjs:\nexport function print(node) {\n  if (node.kind === 'num') return 'num:' + node.value;\n  if (node.kind === 'str') return 'str:' + node.value;\n  throw new Error('unknown kind ' + node.kind);\n}\n",
+  "seedFiles": {
+    "parser.mjs": "export function parse(raw) {\n  if (/^\\d+$/.test(raw)) return { kind: 'num', value: Number(raw) };\n  return { kind: 'str', value: raw };\n}\n",
+    "printer.mjs": "export function print(node) {\n  if (node.kind === 'num') return 'num:' + node.value;\n  if (node.kind === 'str') return 'str:' + node.value;\n  throw new Error('unknown kind ' + node.kind);\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"Promise.all([import('./parser.mjs'),import('./printer.mjs')]).then(([pa,pr])=>{const b=pa.parse('true');if(b.kind!=='bool'||b.value!==true)throw new Error('parse');if(pr.print(b)!=='bool:true')throw new Error('print');if(pa.parse('42').kind!=='num')throw new Error('num regressed');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "parser.mjs",
+        "content": "export function parse(raw) {\n  if (raw === 'true' || raw === 'false') return { kind: 'bool', value: raw === 'true' };\n  if (/^\\d+$/.test(raw)) return { kind: 'num', value: Number(raw) };\n  return { kind: 'str', value: raw };\n}\n"
+      }
+    },
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "printer.mjs",
+        "content": "export function print(node) {\n  if (node.kind === 'num') return 'num:' + node.value;\n  if (node.kind === 'str') return 'str:' + node.value;\n  if (node.kind === 'bool') return 'bool:' + node.value;\n  throw new Error('unknown kind ' + node.kind);\n}\n"
+      }
+    }
+  ]
+}

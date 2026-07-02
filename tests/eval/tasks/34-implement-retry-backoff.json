@@ -1,0 +1,19 @@
+{
+  "id": "implement-retry-backoff",
+  "title": "Implement retry with doubling backoff and injectable sleep",
+  "prompt": "Create retry.mjs exporting async retry(fn, { attempts = 3, baseMs = 100, sleep }). Call fn(); on rejection wait baseMs, then 2*baseMs, ... between attempts using the injectable sleep(ms). If all attempts fail, rethrow the last error.",
+  "seedFiles": {},
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./retry.mjs').then(async m=>{let n=0;const delays=[];const fn=async()=>{n++;if(n<3)throw new Error('nope');return 'yes'};const r=await m.retry(fn,{attempts:3,baseMs:100,sleep:async(ms)=>{delays.push(ms)}});if(r!=='yes'||n!==3)throw new Error('retry');if(delays.join(',')!=='100,200')throw new Error(delays.join(','));let threw=false;try{await m.retry(async()=>{throw new Error('always')},{attempts:2,baseMs:1,sleep:async()=>{}})}catch(e){threw=e.message==='always'}if(!threw)throw new Error('rethrow');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "retry.mjs",
+        "content": "export async function retry(fn, { attempts = 3, baseMs = 100, sleep } = {}) {\n  let lastErr;\n  for (let i = 0; i < attempts; i++) {\n    try {\n      return await fn();\n    } catch (err) {\n      lastErr = err;\n      if (i < attempts - 1) await sleep(baseMs * 2 ** i);\n    }\n  }\n  throw lastErr;\n}\n"
+      }
+    }
+  ]
+}

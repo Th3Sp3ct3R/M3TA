@@ -1,0 +1,28 @@
+{
+  "id": "wire-new-module",
+  "title": "Add a logger module and register it",
+  "prompt": "app.mjs contains a handlers registry:\nexport const handlers = {\n  ping: () => 'pong',\n};\n\nCreate logger.mjs exporting log(msg) that returns 'LOG: ' + msg, and register it in app.mjs as handlers.log (importing from './logger.mjs').",
+  "seedFiles": {
+    "app.mjs": "export const handlers = {\n  ping: () => 'pong',\n};\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./app.mjs').then(m=>{if(m.handlers.ping()!=='pong')throw new Error('ping');if(m.handlers.log('hi')!=='LOG: hi')throw new Error('log');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "logger.mjs",
+        "content": "export function log(msg) {\n  return 'LOG: ' + msg;\n}\n"
+      }
+    },
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "app.mjs",
+        "content": "import { log } from './logger.mjs';\n\nexport const handlers = {\n  ping: () => 'pong',\n  log,\n};\n"
+      }
+    }
+  ]
+}

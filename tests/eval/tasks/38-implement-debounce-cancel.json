@@ -1,0 +1,19 @@
+{
+  "id": "implement-debounce-cancel",
+  "title": "Implement debounce with cancel",
+  "prompt": "Create debounce.mjs exporting debounce(fn, ms): returns a debounced function; rapid calls collapse to one trailing invocation with the LAST arguments. The returned function has a .cancel() method that drops any pending call.",
+  "seedFiles": {},
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./debounce.mjs').then(m=>{let calls=[];const d=m.debounce((v)=>calls.push(v),25);d(1);d(2);d(3);setTimeout(()=>{if(calls.join(',')!=='3')throw new Error('trailing '+calls);const e=m.debounce((v)=>calls.push(v),25);e(9);e.cancel();setTimeout(()=>{if(calls.join(',')!=='3')throw new Error('cancel '+calls);console.log('ok')},60)},60)})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "debounce.mjs",
+        "content": "export function debounce(fn, ms) {\n  let timer = null;\n  const wrapped = (...args) => {\n    if (timer) clearTimeout(timer);\n    timer = setTimeout(() => {\n      timer = null;\n      fn(...args);\n    }, ms);\n  };\n  wrapped.cancel = () => {\n    if (timer) clearTimeout(timer);\n    timer = null;\n  };\n  return wrapped;\n}\n"
+      }
+    }
+  ]
+}

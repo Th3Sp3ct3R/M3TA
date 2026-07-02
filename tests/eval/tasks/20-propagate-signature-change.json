@@ -1,0 +1,29 @@
+{
+  "id": "propagate-signature-change",
+  "title": "Change area() to take an options object in both files",
+  "prompt": "Change area to take a single object { width, height } instead of two positional args, and update the caller. geometry.mjs:\nexport function area(w, h) {\n  return w * h;\n}\n\nreport.mjs:\nimport { area } from './geometry.mjs';\n\nexport function reportArea() {\n  return area(3, 4);\n}\n\nreportArea() must still return 12.",
+  "seedFiles": {
+    "geometry.mjs": "export function area(w, h) {\n  return w * h;\n}\n",
+    "report.mjs": "import { area } from './geometry.mjs';\n\nexport function reportArea() {\n  return area(3, 4);\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"Promise.all([import('./geometry.mjs'),import('./report.mjs')]).then(([g,r])=>{if(g.area({width:2,height:5})!==10)throw new Error('sig');if(r.reportArea()!==12)throw new Error('caller');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "geometry.mjs",
+        "content": "export function area({ width, height }) {\n  return width * height;\n}\n"
+      }
+    },
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "report.mjs",
+        "content": "import { area } from './geometry.mjs';\n\nexport function reportArea() {\n  return area({ width: 3, height: 4 });\n}\n"
+      }
+    }
+  ]
+}

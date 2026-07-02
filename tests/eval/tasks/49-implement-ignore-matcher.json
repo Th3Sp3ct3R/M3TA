@@ -1,0 +1,19 @@
+{
+  "id": "implement-ignore-matcher",
+  "title": "Implement a simplified .gitignore-style matcher",
+  "prompt": "Create ignore.mjs exporting matches(pattern, filePath) for forward-slash paths: '*' matches within one segment (no '/'), a '**/' prefix matches any leading directories (including none), a trailing '/' matches that directory and everything under it. Examples: matches('*.log','a.log') true; matches('*.log','sub/a.log') false; matches('**/*.log','sub/a.log') true; matches('**/*.log','a.log') true; matches('build/','build/x/y.js') true; matches('build/','builder/x.js') false.",
+  "seedFiles": {},
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./ignore.mjs').then(m=>{const c=[['*.log','a.log',true],['*.log','sub/a.log',false],['**/*.log','sub/a.log',true],['**/*.log','a/b/c.log',true],['**/*.log','a.log',true],['build/','build/x/y.js',true],['build/','builder/x.js',false]];for(const x of c){if(m.matches(x[0],x[1])!==x[2])throw new Error(x[0]+' vs '+x[1])}console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "ignore.mjs",
+        "content": "function segToRegex(pattern) {\n  const esc = pattern.replace(/[.+^${}()|[\\]\\\\]/g, '\\\\$&').replace(/\\*/g, '[^/]*');\n  return esc;\n}\n\nexport function matches(pattern, filePath) {\n  if (pattern.endsWith('/')) {\n    const dir = pattern.slice(0, -1);\n    return filePath === dir || filePath.startsWith(dir + '/');\n  }\n  let body = pattern;\n  let prefix = '';\n  if (body.startsWith('**/')) {\n    body = body.slice(3);\n    prefix = '(?:.*/)?';\n  }\n  const re = new RegExp('^' + prefix + segToRegex(body) + '$');\n  return re.test(filePath);\n}\n"
+      }
+    }
+  ]
+}

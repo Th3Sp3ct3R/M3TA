@@ -1,0 +1,36 @@
+{
+  "id": "dedupe-constants",
+  "title": "Move a duplicated constant into constants.mjs",
+  "prompt": "x.mjs and y.mjs both define const LIMIT = 10. Create constants.mjs exporting LIMIT and make both import it. x.mjs:\nconst LIMIT = 10;\n\nexport function underX(n) {\n  return n < LIMIT;\n}\n\ny.mjs:\nconst LIMIT = 10;\n\nexport function clampY(n) {\n  return Math.min(n, LIMIT);\n}\n",
+  "seedFiles": {
+    "x.mjs": "const LIMIT = 10;\n\nexport function underX(n) {\n  return n < LIMIT;\n}\n",
+    "y.mjs": "const LIMIT = 10;\n\nexport function clampY(n) {\n  return Math.min(n, LIMIT);\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"Promise.all([import('./x.mjs'),import('./y.mjs'),import('./constants.mjs')]).then(([x,y,c])=>{if(c.LIMIT!==10)throw new Error('const');if(x.underX(9)!==true||y.clampY(50)!==10)throw new Error('fns');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "constants.mjs",
+        "content": "export const LIMIT = 10;\n"
+      }
+    },
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "x.mjs",
+        "content": "import { LIMIT } from './constants.mjs';\n\nexport function underX(n) {\n  return n < LIMIT;\n}\n"
+      }
+    },
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "y.mjs",
+        "content": "import { LIMIT } from './constants.mjs';\n\nexport function clampY(n) {\n  return Math.min(n, LIMIT);\n}\n"
+      }
+    }
+  ]
+}

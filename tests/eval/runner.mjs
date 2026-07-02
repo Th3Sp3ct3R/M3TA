@@ -131,7 +131,7 @@ export function gradeTask(task, workspace) {
 // Workspace seeding
 // ---------------------------------------------------------------------------
 
-async function seedWorkspace(task) {
+export async function seedWorkspace(task) {
   const ws = await mkdtemp(path.join(tmpdir(), `ares-eval-${task.id}-`));
   for (const [rel, content] of Object.entries(task.seedFiles || {})) {
     const target = path.join(ws, rel);
@@ -208,12 +208,12 @@ const SYSTEM_PROMPT =
  * usage + tool-call stats. Works identically for the scripted mock provider
  * and any real Provider implementation.
  */
-export async function runAgentOnTask(task, provider, { model = "eval", workspace, maxTurns = 6 }) {
+export async function runAgentOnTask(task, provider, { model = "eval", workspace, maxTurns = 6, systemPrompt = SYSTEM_PROMPT }) {
   const engine = new QueryEngine(
     {
       provider,
       model,
-      systemPrompt: SYSTEM_PROMPT,
+      systemPrompt,
       tools: evalTools(workspace),
       workspace,
       maxTurns,
@@ -224,11 +224,18 @@ export async function runAgentOnTask(task, provider, { model = "eval", workspace
   engine.appendUserMessage(task.prompt);
 
   let toolCalls = 0;
+  let toolErrors = 0;
+  let stalls = 0;
   let lastUsage = { inputTokens: 0, outputTokens: 0 };
   let error = null;
   try {
     for await (const event of engine.streamTurn()) {
       if (event.type === "tool_end") toolCalls += 1;
+      if (event.type === "tool_error") toolErrors += 1;
+      if (event.type === "error") {
+        if (event.error?.code === "stream_stall" || event.error?.code === "reasoning_stall") stalls += 1;
+        else error = `${event.error?.code ?? "provider_error"}: ${event.error?.message ?? ""}`.slice(0, 200);
+      }
       if (event.type === "turn_end" && event.usage) lastUsage = event.usage;
     }
   } catch (e) {
@@ -236,8 +243,11 @@ export async function runAgentOnTask(task, provider, { model = "eval", workspace
   }
   return {
     toolCalls,
+    toolErrors,
+    stalls,
     inputTokens: lastUsage.inputTokens ?? 0,
     outputTokens: lastUsage.outputTokens ?? 0,
+    cacheReadTokens: lastUsage.cacheReadTokens ?? 0,
     error,
   };
 }
@@ -423,7 +433,9 @@ const SOLUTIONS = {
  * come back. Drives the real engine loop end-to-end.
  */
 export function makeScriptedProvider(task) {
-  const steps = SOLUTIONS[task.id] ?? [];
+  // Tasks may carry their own scripted solution (self-contained task files);
+  // the legacy SOLUTIONS map covers the original suite.
+  const steps = task.mockSolution ?? SOLUTIONS[task.id] ?? [];
   return {
     name: "scripted-mock",
     async *stream(req) {
@@ -465,8 +477,18 @@ async function resolveProvider(name, task) {
 
   const core = await import("../../packages/core/dist/index.js");
   if (name === "anthropic") {
-    const key = process.env.ANTHROPIC_API_KEY;
-    if (!key) throw new Error("ANTHROPIC_API_KEY is required for --provider anthropic");
+    let key = process.env.ANTHROPIC_API_KEY;
+    if (!key) {
+      // Fall back to the key the owner saved in Ares settings (decrypted the
+      // same way the product loads it) so `--provider anthropic` just works.
+      try {
+        const ui = await import("../../packages/cli/dist/uiSettings.js");
+        key = (await ui.loadUiSettings()).anthropicKey || undefined;
+      } catch {
+        // settings unavailable — fall through to the explicit error
+      }
+    }
+    if (!key) throw new Error("ANTHROPIC_API_KEY is required for --provider anthropic (or save a key in Ares settings)");
     const model = process.env.ARES_EVAL_MODEL || core.DEFAULT_ANTHROPIC_MODEL;
     return { provider: new core.AnthropicProvider({ apiKey: key }), model };
   }
@@ -475,7 +497,22 @@ async function resolveProvider(name, task) {
     if (!key) throw new Error("OPENAI_API_KEY is required for --provider openai");
     return { provider: new core.OpenAIResponsesProvider({ apiKey: key }), model: process.env.ARES_EVAL_MODEL || "gpt-4.1" };
   }
-  throw new Error(`unknown provider '${name}'. Known: mock, anthropic, openai`);
+  if (name === "openrouter") {
+    let key = process.env.OPENROUTER_API_KEY;
+    let settingsModel;
+    try {
+      const ui = await import("../../packages/cli/dist/uiSettings.js");
+      const settings = await ui.loadUiSettings();
+      key = key || settings.openRouterKey || undefined;
+      settingsModel = settings.lastOpenRouterModel;
+    } catch {
+      // settings unavailable — env only
+    }
+    if (!key) throw new Error("OPENROUTER_API_KEY is required for --provider openrouter (or save a key in Ares settings)");
+    const model = process.env.ARES_EVAL_MODEL || settingsModel || "anthropic/claude-sonnet-4.5";
+    return { provider: new core.OpenRouterProvider({ apiKey: key, model }), model };
+  }
+  throw new Error(`unknown provider '${name}'. Known: mock, anthropic, openai, openrouter`);
 }
 
 // ---------------------------------------------------------------------------
@@ -487,7 +524,7 @@ async function resolveProvider(name, task) {
  * `providerName` selects the model; for anything but "mock" a real key/network
  * is required.
  */
-export async function runEval({ tasks, providerName = "mock", keepWorkspaces = false } = {}) {
+export async function runEval({ tasks, providerName = "mock", keepWorkspaces = false, systemPrompt } = {}) {
   const allTasks = tasks ?? (await loadTasks());
   const results = [];
   const suiteStart = Date.now();
@@ -498,7 +535,7 @@ export async function runEval({ tasks, providerName = "mock", keepWorkspaces = f
     let run;
     try {
       const { provider, model } = await resolveProvider(providerName, task);
-      run = await runAgentOnTask(task, provider, { model, workspace });
+      run = await runAgentOnTask(task, provider, { model, workspace, ...(systemPrompt ? { systemPrompt } : {}) });
     } catch (e) {
       run = { toolCalls: 0, inputTokens: 0, outputTokens: 0, error: e.message };
     }

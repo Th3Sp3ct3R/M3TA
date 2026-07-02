@@ -1,0 +1,23 @@
+{
+  "id": "thread-option-through-layers",
+  "title": "Thread a verbose option through three layers",
+  "prompt": "Three layers: cli.mjs -> core.mjs -> worker.mjs. Make run({ verbose: true }) return 'verbose-on' and run({}) return 'done', by threading opts through and having work() check opts.verbose. cli.mjs:\nimport { core } from './core.mjs';\n\nexport function run(opts) {\n  return core(opts);\n}\n\ncore.mjs:\nimport { work } from './worker.mjs';\n\nexport function core(opts) {\n  return work(opts);\n}\n\nworker.mjs:\nexport function work(opts) {\n  return 'done';\n}\n",
+  "seedFiles": {
+    "cli.mjs": "import { core } from './core.mjs';\n\nexport function run(opts) {\n  return core(opts);\n}\n",
+    "core.mjs": "import { work } from './worker.mjs';\n\nexport function core(opts) {\n  return work(opts);\n}\n",
+    "worker.mjs": "export function work(opts) {\n  return 'done';\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./cli.mjs').then(m=>{if(m.run({verbose:true})!=='verbose-on')throw new Error('verbose');if(m.run({})!=='done')throw new Error('plain');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "worker.mjs",
+        "content": "export function work(opts) {\n  return opts && opts.verbose ? 'verbose-on' : 'done';\n}\n"
+      }
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "edit-second-similar-block",
+  "title": "Modify the second of two near-identical blocks",
+  "prompt": "In validators.mjs change ONLY validatePhone's final return to use the regex /^\\+?[0-9]{7,15}$/.test(input) instead of the length check. validateEmail must stay byte-identical. Current file:\nexport function validateEmail(input) {\n  if (typeof input !== 'string') {\n    return { ok: false, reason: 'not a string' };\n  }\n  return { ok: input.includes('@'), reason: 'checked' };\n}\n\nexport function validatePhone(input) {\n  if (typeof input !== 'string') {\n    return { ok: false, reason: 'not a string' };\n  }\n  return { ok: input.length >= 7, reason: 'checked' };\n}\n",
+  "seedFiles": {
+    "validators.mjs": "export function validateEmail(input) {\n  if (typeof input !== 'string') {\n    return { ok: false, reason: 'not a string' };\n  }\n  return { ok: input.includes('@'), reason: 'checked' };\n}\n\nexport function validatePhone(input) {\n  if (typeof input !== 'string') {\n    return { ok: false, reason: 'not a string' };\n  }\n  return { ok: input.length >= 7, reason: 'checked' };\n}\n"
+  },
+  "grade": {
+    "type": "fileEquals",
+    "path": "validators.mjs",
+    "value": "export function validateEmail(input) {\n  if (typeof input !== 'string') {\n    return { ok: false, reason: 'not a string' };\n  }\n  return { ok: input.includes('@'), reason: 'checked' };\n}\n\nexport function validatePhone(input) {\n  if (typeof input !== 'string') {\n    return { ok: false, reason: 'not a string' };\n  }\n  return { ok: /^\\+?[0-9]{7,15}$/.test(input), reason: 'checked' };\n}\n"
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "validators.mjs",
+        "old_string": "return { ok: input.length >= 7, reason: 'checked' };",
+        "new_string": "return { ok: /^\\+?[0-9]{7,15}$/.test(input), reason: 'checked' };"
+      }
+    }
+  ]
+}

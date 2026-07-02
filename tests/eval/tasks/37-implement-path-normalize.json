@@ -1,0 +1,19 @@
+{
+  "id": "implement-path-normalize",
+  "title": "Implement a POSIX-style path joiner/normalizer",
+  "prompt": "Create paths.mjs exporting joinPosix(...parts): join with '/', collapse duplicate slashes, resolve '.' and '..' segments ('a//b/../c' -> 'a/c'). Leading '..' segments that would escape the root are kept. Always forward slashes.",
+  "seedFiles": {},
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./paths.mjs').then(m=>{if(m.joinPosix('a//b','../c')!=='a/c')throw new Error('a');if(m.joinPosix('x','./y','z')!=='x/y/z')throw new Error('b');if(m.joinPosix('..','q')!=='../q')throw new Error('c');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "paths.mjs",
+        "content": "export function joinPosix(...parts) {\n  const segs = parts.join('/').split('/').filter((s) => s !== '' && s !== '.');\n  const out = [];\n  for (const seg of segs) {\n    if (seg === '..' && out.length > 0 && out[out.length - 1] !== '..') {\n      out.pop();\n    } else {\n      out.push(seg);\n    }\n  }\n  return out.join('/');\n}\n"
+      }
+    }
+  ]
+}

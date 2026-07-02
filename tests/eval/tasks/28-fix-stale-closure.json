@@ -1,0 +1,22 @@
+{
+  "id": "fix-stale-closure",
+  "title": "Fix the var-in-loop stale closure",
+  "prompt": "Every counter returns n because var is shared across iterations. Fix so makeCounters(3) yields counters returning 0, 1, 2. counters.mjs:\nexport function makeCounters(n) {\n  const fns = [];\n  for (var i = 0; i < n; i++) {\n    fns.push(() => i);\n  }\n  return fns;\n}\n",
+  "seedFiles": {
+    "counters.mjs": "export function makeCounters(n) {\n  const fns = [];\n  for (var i = 0; i < n; i++) {\n    fns.push(() => i);\n  }\n  return fns;\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./counters.mjs').then(m=>{const c=m.makeCounters(3);if(c[0]()!==0||c[1]()!==1||c[2]()!==2)throw new Error('closure');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "counters.mjs",
+        "old_string": "for (var i = 0; i < n; i++)",
+        "new_string": "for (let i = 0; i < n; i++)"
+      }
+    }
+  ]
+}

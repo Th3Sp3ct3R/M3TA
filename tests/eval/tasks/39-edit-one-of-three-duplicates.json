@@ -1,0 +1,23 @@
+{
+  "id": "edit-one-of-three-duplicates",
+  "title": "Change ONLY fetchUser's retries among three identical lines",
+  "prompt": "fetchers.mjs has three identical 'const retries = 3;' lines. Change ONLY the one inside fetchUser to 5. Every other byte must stay identical. Current file:\nexport function fetchUser() {\n  const retries = 3;\n  return { retries };\n}\n\nexport function fetchOrder() {\n  const retries = 3;\n  return { retries };\n}\n\nexport function fetchCart() {\n  const retries = 3;\n  return { retries };\n}\n",
+  "seedFiles": {
+    "fetchers.mjs": "export function fetchUser() {\n  const retries = 3;\n  return { retries };\n}\n\nexport function fetchOrder() {\n  const retries = 3;\n  return { retries };\n}\n\nexport function fetchCart() {\n  const retries = 3;\n  return { retries };\n}\n"
+  },
+  "grade": {
+    "type": "fileEquals",
+    "path": "fetchers.mjs",
+    "value": "export function fetchUser() {\n  const retries = 5;\n  return { retries };\n}\n\nexport function fetchOrder() {\n  const retries = 3;\n  return { retries };\n}\n\nexport function fetchCart() {\n  const retries = 3;\n  return { retries };\n}\n"
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "fetchers.mjs",
+        "old_string": "export function fetchUser() {\n  const retries = 3;",
+        "new_string": "export function fetchUser() {\n  const retries = 5;"
+      }
+    }
+  ]
+}

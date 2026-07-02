@@ -1,0 +1,22 @@
+{
+  "id": "fix-greedy-regex",
+  "title": "Fix the greedy tag regex",
+  "prompt": "extractTags('<a>x</a>') should return ['<a>', '</a>'] but the greedy .+ swallows everything into one match. Fix the regex. tags.mjs:\nexport function extractTags(html) {\n  const m = html.match(/<.+>/g);\n  return m ?? [];\n}\n",
+  "seedFiles": {
+    "tags.mjs": "export function extractTags(html) {\n  const m = html.match(/<.+>/g);\n  return m ?? [];\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"import('./tags.mjs').then(m=>{const r=m.extractTags('<a>x</a>');if(r.length!==2||r[0]!=='<a>'||r[1]!=='</a>')throw new Error(JSON.stringify(r));console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Edit",
+      "input": {
+        "file_path": "tags.mjs",
+        "old_string": "/<.+>/g",
+        "new_string": "/<[^>]+>/g"
+      }
+    }
+  ]
+}

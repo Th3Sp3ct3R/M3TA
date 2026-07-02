@@ -1,0 +1,29 @@
+{
+  "id": "rename-across-files",
+  "title": "Rename getCfg to loadConfig across modules",
+  "prompt": "Rename the function getCfg to loadConfig everywhere. config.mjs:\nexport function getCfg() {\n  return { retries: 3 };\n}\n\napp.mjs:\nimport { getCfg } from './config.mjs';\n\nexport function retries() {\n  return getCfg().retries;\n}\n\nAfter the change config.mjs must export loadConfig (and NOT getCfg), and app.mjs must keep working.",
+  "seedFiles": {
+    "config.mjs": "export function getCfg() {\n  return { retries: 3 };\n}\n",
+    "app.mjs": "import { getCfg } from './config.mjs';\n\nexport function retries() {\n  return getCfg().retries;\n}\n"
+  },
+  "grade": {
+    "type": "command",
+    "command": "node -e \"Promise.all([import('./config.mjs'),import('./app.mjs')]).then(([c,a])=>{if(typeof c.loadConfig!=='function')throw new Error('missing loadConfig');if(c.getCfg!==undefined)throw new Error('getCfg still exported');if(a.retries()!==3)throw new Error('app broken');console.log('ok')})\""
+  },
+  "mockSolution": [
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "config.mjs",
+        "content": "export function loadConfig() {\n  return { retries: 3 };\n}\n"
+      }
+    },
+    {
+      "name": "Write",
+      "input": {
+        "file_path": "app.mjs",
+        "content": "import { loadConfig } from './config.mjs';\n\nexport function retries() {\n  return loadConfig().retries;\n}\n"
+      }
+    }
+  ]
+}
