@@ -75,6 +75,29 @@ const LAUNCHER_THEMES: Record<ThemeName, LauncherTheme> = {
   oxide: { frame: "red", accent: "redBright", accent2: "yellowBright", accent3: "cyanBright", text: "white", dim: "gray", success: "greenBright", warn: "yellowBright", error: "redBright" },
 };
 
+type ProviderReadiness = "ready" | "needs-key" | "oauth";
+
+/** Can this provider actually run a turn right now? Surfaced on the picker so a
+ *  new user never selects a keyless provider and fails on their first message. */
+function providerReadiness(id: ProviderId, settings: UiSettings): ProviderReadiness {
+  switch (id) {
+    case "mock":
+      return "ready";
+    case "ollama":
+      return "ready"; // local Ollama needs no key; cloud key is optional
+    case "openai":
+      return "oauth"; // ChatGPT OAuth — press L to sign in
+    case "anthropic":
+      return settings.anthropicKey ? "ready" : "needs-key";
+    case "deepseek":
+      return settings.deepSeekKey ? "ready" : "needs-key";
+    case "openrouter":
+      return settings.openRouterKey ? "ready" : "needs-key";
+    default:
+      return "needs-key";
+  }
+}
+
 export async function runInkLauncher(options: LauncherOptions): Promise<LauncherAction> {
   let action: LauncherAction = { kind: "quit" };
   process.stdout.write("\u001b[2J\u001b[3J\u001b[H");
@@ -123,8 +146,14 @@ function AresLauncherApp({
   const previousPhase = useRef<LauncherPhase>("provider");
   const theme = LAUNCHER_THEMES[selectedTheme] ?? LAUNCHER_THEMES.rage;
   const currentProvider = PROVIDER_OPTIONS[Math.min(selectedProvider, PROVIDER_OPTIONS.length - 1)]?.id ?? "ollama";
-  const providerModels = useMemo(() => providerModelList(currentProvider, options.settings), [currentProvider, options.settings]);
-  const models = useMemo(() => reorderWithFavorites(ollamaModels(), favoriteOllama), [favoriteOllama]);
+  const [ollamaLiveTick, setOllamaLiveTick] = useState(0);
+  useEffect(() => {
+    void refreshLiveOllamaModels(options.settings).then((live) => {
+      if (live) setOllamaLiveTick((tick) => tick + 1); // force ollamaModels() re-derivation once live data lands
+    });
+  }, [options.settings]);
+  const providerModels = useMemo(() => providerModelList(currentProvider, options.settings), [currentProvider, options.settings, ollamaLiveTick]);
+  const models = useMemo(() => reorderWithFavorites(ollamaModels(), favoriteOllama), [favoriteOllama, ollamaLiveTick]);
   const selectedModel = models[Math.min(selectedOllama, Math.max(0, models.length - 1))] ?? models[0];
   const selectedOpenAIModel = providerModels[Math.min(selectedOpenAI, Math.max(0, providerModels.length - 1))] ?? defaultModelForProvider(currentProvider, options.settings);
   const maxVisibleModels = Math.max(8, rows - 15);
@@ -371,7 +400,7 @@ function AresLauncherApp({
     { flexDirection: "column", width: columns, height: rows, paddingX: 1 },
     h(LauncherHeader, { theme, phase, selectedTheme, workspace }),
     phase === "provider"
-      ? h(ProviderDeck, { theme, selectedProvider })
+      ? h(ProviderDeck, { theme, selectedProvider, settings: options.settings })
       : phase === "ollama"
         ? h(ModelDeck, {
             theme,
@@ -429,7 +458,9 @@ function LauncherHeader({
   );
 }
 
-function ProviderDeck({ theme, selectedProvider }: { theme: LauncherTheme; selectedProvider: number }) {
+function ProviderDeck({ theme, selectedProvider, settings }: { theme: LauncherTheme; selectedProvider: number; settings: UiSettings }) {
+  const selectedId = PROVIDER_OPTIONS[Math.min(selectedProvider, PROVIDER_OPTIONS.length - 1)]?.id ?? "ollama";
+  const selectedReady = providerReadiness(selectedId, settings);
   return h(
     Box,
     { flexDirection: "column", gap: 1 },
@@ -446,6 +477,7 @@ function ProviderDeck({ theme, selectedProvider }: { theme: LauncherTheme; selec
           body: card.body,
           footer: card.footer,
           active: selectedProvider === index,
+          readiness: providerReadiness(card.id, settings),
         }),
       ),
     ),
@@ -461,11 +493,25 @@ function ProviderDeck({ theme, selectedProvider }: { theme: LauncherTheme; selec
           body: card.body,
           footer: card.footer,
           active: selectedProvider === index + 3,
+          readiness: providerReadiness(card.id, settings),
         }),
       ),
     ),
+    // A live hint for the highlighted provider — tells a new user exactly what to
+    // do BEFORE they commit and hit an "unauthorized" wall on message one.
+    selectedReady === "needs-key"
+      ? h(Text, { color: theme.warn }, `⚠ ${selectedId} needs an API key. Start it, then run  /key ${selectedId} <paste>  — or pick a ready provider.`)
+      : selectedReady === "oauth"
+        ? h(Text, { color: theme.accent2 }, "OpenAI uses ChatGPT OAuth — press L to sign in if you haven't.")
+        : h(Text, { color: theme.success }, "✓ Ready to chat."),
     h(Text, { color: theme.dim }, "L login OpenAI OAuth | D doctor | H help | API keys: use /key inside chat"),
   );
+}
+
+function readinessBadge(readiness: ProviderReadiness, theme: LauncherTheme): { text: string; color: string } {
+  if (readiness === "ready") return { text: "✓ ready", color: theme.success };
+  if (readiness === "oauth") return { text: "⌁ OAuth", color: theme.accent2 };
+  return { text: "○ needs key", color: theme.warn };
 }
 
 function LauncherCard({
@@ -475,6 +521,7 @@ function LauncherCard({
   body,
   footer,
   active,
+  readiness,
 }: {
   theme: LauncherTheme;
   hotkey: string;
@@ -482,7 +529,9 @@ function LauncherCard({
   body: string;
   footer: string;
   active: boolean;
+  readiness: ProviderReadiness;
 }) {
+  const badge = readinessBadge(readiness, theme);
   return h(
     Box,
     {
@@ -495,7 +544,7 @@ function LauncherCard({
     },
     h(Box, { gap: 1 }, h(Text, { color: active ? theme.accent : theme.dim }, `[${hotkey}]`), h(Text, { color: active ? theme.accent : theme.text, bold: true }, title)),
     h(Text, { color: theme.text, wrap: "wrap" }, body),
-    h(Text, { color: theme.dim }, footer),
+    h(Box, { justifyContent: "space-between" }, h(Text, { color: theme.dim }, footer), h(Text, { color: badge.color, bold: true }, badge.text)),
   );
 }
 
@@ -639,8 +688,44 @@ interface LauncherModel {
   group: string;
 }
 
+// Live Ollama Cloud catalog, merged over the static OLLAMA_CLOUD_MODELS list
+// so renamed/retired aliases don't linger in the picker (mirrors entry.ts's
+// daemonModelCatalog byId-Map merge for the daemon/webview catalog path).
+// Best-effort: populated once in the background; ollamaModels() falls back to
+// the static list unchanged until the fetch resolves (or forever, on failure).
+let liveOllamaModels: LauncherModel[] | null = null;
+let liveOllamaFetchStarted = false;
+
+function refreshLiveOllamaModels(settings: UiSettings): Promise<LauncherModel[] | null> {
+  if (liveOllamaFetchStarted) return Promise.resolve(liveOllamaModels);
+  liveOllamaFetchStarted = true;
+  const apiKey = settings.ollamaApiKey || process.env.OLLAMA_API_KEY;
+  if (!apiKey) return Promise.resolve(null);
+  return fetch("https://ollama.com/api/tags", {
+    headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+  })
+    .then((response) => (response.ok ? response.json() : null))
+    .then((payload: { models?: Array<{ name?: string; model?: string; details?: { parameter_size?: string; family?: string } }> } | null) => {
+      if (!payload) return null;
+      const byId = new Map<string, LauncherModel>();
+      for (const model of ollamaModels()) byId.set(model.id, model);
+      for (const row of payload.models ?? []) {
+        const id = row.name ?? row.model;
+        if (!id) continue;
+        byId.set(id, {
+          id,
+          hint: [row.details?.parameter_size, row.details?.family].filter(Boolean).join(" · ") || "Ollama Cloud · live",
+          group: "live",
+        });
+      }
+      liveOllamaModels = [...byId.values()];
+      return liveOllamaModels;
+    })
+    .catch(() => null); // network failure — never block the picker, keep the static list
+}
+
 function ollamaModels(): LauncherModel[] {
-  const models = [...OLLAMA_CLOUD_MODELS].map((model) => ({
+  const base = liveOllamaModels ?? [...OLLAMA_CLOUD_MODELS].map((model) => ({
     id: model.id,
     hint: model.hint,
     group: groupForModel(model),
@@ -651,7 +736,7 @@ function ollamaModels(): LauncherModel[] {
     ["fast", 2],
     ["general", 3],
   ]);
-  return models.sort((a, b) => (order.get(a.group) ?? 9) - (order.get(b.group) ?? 9) || a.id.localeCompare(b.id));
+  return [...base].sort((a, b) => (order.get(a.group) ?? 9) - (order.get(b.group) ?? 9) || a.id.localeCompare(b.id));
 }
 
 function groupForModel(model: OllamaCloudModel): string {

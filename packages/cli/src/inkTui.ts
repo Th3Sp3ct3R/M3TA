@@ -2,6 +2,26 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Box, Text, render, useApp, useInput, useWindowSize } from "ink";
 import type { PermissionMode, Todo, TurnEvent, Usage } from "@ares/protocol";
 import { currentThemeName, type ThemeName } from "./terminalUi.js";
+import { renderMarkdown, type MdLine, type MdSpan, type MdTheme } from "./mdRender.js";
+import {
+  diffHeaderLabel,
+  diffLineSpans,
+  easeToward,
+  endsWithContinuation,
+  fleetGlyph,
+  fleetSummary,
+  foldFleetRows,
+  formatDuration,
+  groupDiffByFile,
+  motionEnabled,
+  normalizeInputChunk,
+  reduceFleet,
+  searchHistory,
+  shimmerSpans,
+  stripContinuation,
+  type DiffLineTheme,
+  type FleetState,
+} from "./tuiElite.js";
 import { onLifecycle, type LifecycleEvent } from "@ares/agent";
 
 // Weirdcore score popup. Every evolution event emits a gain { target, delta }.
@@ -43,13 +63,22 @@ export interface InkChatOptions {
 
 interface LogLine {
   id: number;
-  tone: "user" | "assistant" | "tool" | "error" | "notice" | "muted" | "diff-add" | "diff-del" | "diff-meta" | "verify";
+  tone: "user" | "assistant" | "tool" | "error" | "notice" | "muted" | "diff-add" | "diff-del" | "diff-meta" | "diff-file" | "verify";
   text: string;
   meta?: string;
   /** For tool lines: the outcome appended on tool_end (▸ Name … ✓ result). */
-  result?: { ok: boolean; text: string };
+  result?: { ok: boolean; text: string; durationMs?: number };
   /** A wrapped continuation of the line above — render without repeating the label. */
   cont?: boolean;
+  /** diff-file cards: hunk body lines shown while expanded. */
+  detail?: string[];
+  /** diff-file cards: expanded while the turn streams, collapsed on completion. */
+  expanded?: boolean;
+  /** diff-file cards: add/del counts for the colored header. */
+  adds?: number;
+  dels?: number;
+  /** tool lines: wall-clock start for the live elapsed readout. */
+  startedAt?: number;
 }
 
 interface RuntimeStats {
@@ -399,18 +428,9 @@ const DECK_THEMES: Record<ThemeName, DeckTheme> = {
   },
 };
 
-const TOOL_RAIL = [
-  "Read",
-  "Glob",
-  "Grep",
-  "Edit",
-  "Bash",
-  "PowerShell",
-  "Task",
-  "TodoWrite",
-  "WebFetch",
-  "CodeMode",
-];
+// Motion gate — non-TTY or ARES_NO_MOTION=1 renders static (no shimmer,
+// no spinner ticks, gauge jumps instead of easing).
+const MOTION = motionEnabled();
 
 // ⌃P command palette — the desktop has a command surface; the terminal didn't.
 const PALETTE: { cmd: string; desc: string }[] = [
@@ -473,8 +493,15 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
   const [busy, setBusy] = useState(false);
   const [todos, setTodos] = useState<Todo[]>([]);
   const [assistantDraft, setAssistantDraft] = useState("");
-  const [activeTool, setActiveTool] = useState<string | null>(null);
   const [scrollOffset, setScrollOffset] = useState(0);
+  // Ctrl+R reverse-search over history — live match preview in the composer.
+  const [rsOpen, setRsOpen] = useState(false);
+  const [rsQuery, setRsQuery] = useState("");
+  const [rsSkip, setRsSkip] = useState(0);
+  // Live Conductor fleet panel (fleet_activity riding tool_progress).
+  const [fleet, setFleet] = useState<FleetState | null>(null);
+  const fleetRef = useRef<FleetState | null>(null);
+  const fleetToolRef = useRef<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteSel, setPaletteSel] = useState(0);
   const [spin, setSpin] = useState(0);
@@ -528,15 +555,17 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
   void frameTick;
 
   // Fast spinner tick — runs ONLY while a turn is in flight, so idle is free.
+  // Also drives the shimmer band and live tool-elapsed readouts. Static when
+  // motion is disabled (non-TTY / ARES_NO_MOTION=1).
   useEffect(() => {
-    if (!busy) {
+    if (!busy || !MOTION) {
       setSpin(0);
       return;
     }
-    const id = setInterval(() => setSpin((s) => (s + 1) % SPINNER.length), 90);
+    const id = setInterval(() => setSpin((s) => (s + 1) % 3600), 90);
     return () => clearInterval(id);
   }, [busy]);
-  const frame = SPINNER[spin % SPINNER.length];
+  const frame = MOTION ? SPINNER[spin % SPINNER.length] : "…";
 
   // Load the model catalog for the picker's current provider (async, cancellable).
   useEffect(() => {
@@ -587,6 +616,13 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
   }, [scrollDown, scrollUp, visibleLogRows]);
 
   const append = useCallback((tone: LogLine["tone"], text: string, meta?: string) => {
+    // Assistant replies keep their full multi-line body in ONE LogLine so the
+    // markdown renderer sees fenced code blocks / lists whole. Every other tone
+    // stays split-per-line (tool flow, diffs, notices render one line each).
+    if (tone === "assistant") {
+      setLines((prev) => [...prev, { id: lineId.current++, tone, text, meta }].slice(-600));
+      return;
+    }
     const chunks = text.split(/\r?\n/).filter((line) => line.length > 0);
     setLines((prev) => {
       const next = [...prev];
@@ -611,17 +647,65 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
   const toolLineRef = useRef<number | null>(null);
   const appendToolLine = useCallback((name: string, desc: string) => {
     const id = lineId.current++;
-    setLines((prev) => [...prev, { id, tone: "tool" as const, text: desc, meta: name }].slice(-600));
+    setLines((prev) => [...prev, { id, tone: "tool" as const, text: desc, meta: name, startedAt: Date.now() }].slice(-600));
     toolLineRef.current = id;
   }, []);
-  const finishToolLine = useCallback((ok: boolean, text: string) => {
+  const finishToolLine = useCallback((ok: boolean, text: string, durationMs?: number) => {
     const id = toolLineRef.current;
     toolLineRef.current = null;
     if (id == null) {
       append(ok ? "tool" : "error", text, ok ? "ok" : "tool");
       return;
     }
-    setLines((prev) => prev.map((l) => (l.id === id ? { ...l, result: { ok, text } } : l)));
+    setLines((prev) => prev.map((l) => (l.id === id ? { ...l, startedAt: undefined, result: { ok, text, durationMs } } : l)));
+  }, [append]);
+
+  // Per-file diff cards: the newest file's hunk stays expanded while the turn
+  // streams; older cards (and everything on tool completion) collapse to the
+  // `▸ path (+adds −dels)` header line — scrollback stays minimal.
+  const appendDiffGrouped = useCallback((diff: string) => {
+    const groups = groupDiffByFile(diff);
+    if (groups.length === 0) return;
+    setLines((prev) => {
+      const next = prev.map((l) => (l.tone === "diff-file" && l.expanded ? { ...l, expanded: false } : l));
+      groups.forEach((g, i) => {
+        next.push({
+          id: lineId.current++,
+          tone: "diff-file" as const,
+          text: diffHeaderLabel(g),
+          meta: g.path,
+          adds: g.adds,
+          dels: g.dels,
+          detail: g.lines.slice(0, 40),
+          expanded: i === groups.length - 1,
+        });
+      });
+      return next.slice(-600);
+    });
+  }, []);
+  const collapseDiffCards = useCallback(() => {
+    setLines((prev) =>
+      prev.some((l) => l.tone === "diff-file" && l.expanded)
+        ? prev.map((l) => (l.tone === "diff-file" && l.expanded ? { ...l, expanded: false } : l))
+        : prev,
+    );
+  }, []);
+
+  // Fleet lifecycle: progress payloads build the live panel; when the owning
+  // Conductor tool call ends (or the turn does), collapse to a one-line summary.
+  const applyFleetProgress = useCallback((toolId: string, data: unknown) => {
+    fleetRef.current = reduceFleet(fleetRef.current, data);
+    fleetToolRef.current = toolId;
+    setFleet(fleetRef.current);
+  }, []);
+  const finalizeFleet = useCallback(() => {
+    const state = fleetRef.current;
+    fleetRef.current = null;
+    fleetToolRef.current = null;
+    if (state) {
+      append("notice", fleetSummary(state), "fleet");
+      setFleet(null);
+    }
   }, [append]);
 
   const handleEvent = useCallback(
@@ -638,31 +722,37 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
       }
       if (event.type === "tool_start") {
         flushAssistant();
-        setActiveTool(event.name);
         setActivity(event.name);
         appendToolLine(event.name, event.activityDescription);
         return;
       }
       if (event.type === "tool_end") {
-        setActiveTool(null);
         setActivity("responding");
         setStats((prev) => ({ ...prev, tools: prev.tools + 1 }));
-        finishToolLine(true, event.display ?? `${event.durationMs}ms`);
+        finishToolLine(true, event.display ?? "", event.durationMs);
+        collapseDiffCards();
+        if (fleetToolRef.current === event.id) finalizeFleet();
         return;
       }
       if (event.type === "tool_progress") {
+        const obj = event.data as Record<string, unknown> | null;
+        if (obj && typeof obj === "object" && obj.kind === "fleet_activity") {
+          applyFleetProgress(event.id, obj);
+          return;
+        }
         const text = progressText(event.data);
         if (text) append("muted", text, "progress");
         return;
       }
       if (event.type === "workspace_diff") {
-        appendDiff(event.diff, append);
+        appendDiffGrouped(event.diff);
         return;
       }
       if (event.type === "tool_error") {
-        setActiveTool(null);
         setStats((prev) => ({ ...prev, errors: prev.errors + 1 }));
-        finishToolLine(false, event.error);
+        finishToolLine(false, event.error, event.durationMs);
+        collapseDiffCards();
+        if (fleetToolRef.current === event.id) finalizeFleet();
         return;
       }
       if (event.type === "todo_updated") {
@@ -685,6 +775,8 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
       }
       if (event.type === "turn_end") {
         flushAssistant();
+        collapseDiffCards();
+        finalizeFleet();
         setStats((prev) => ({
           ...prev,
           turns: prev.turns + 1,
@@ -699,7 +791,7 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
         }));
       }
     },
-    [append, flushAssistant, appendToolLine, finishToolLine],
+    [append, flushAssistant, appendToolLine, finishToolLine, appendDiffGrouped, collapseDiffCards, applyFleetProgress, finalizeFleet],
   );
 
   const submit = useCallback(
@@ -742,7 +834,6 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
       } finally {
         flushAssistant();
         setBusy(false);
-        setActiveTool(null);
         setActivity(null);
       }
     },
@@ -750,6 +841,12 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
   );
 
   useInput((value, key) => {
+    // Explicit bracketed paste beats every other classifier — pasted text can
+    // contain "<" runs that would otherwise read as mouse fragments.
+    if (!busy && !paletteOpen && !mpOpen && !rsOpen && /\x1b?\[20[01]~/.test(value)) {
+      setInput((prev) => prev + normalizeInputChunk(value).text);
+      return;
+    }
     const mouseEvents = parseMouseEvents(value);
     if (mouseEvents.length > 0 || looksLikeMouseFragment(value)) {
       for (const event of mouseEvents) handleMouseEvent(event);
@@ -856,7 +953,7 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
       setScrollOffset(0);
       return;
     }
-    if (value === "!") {
+    if (!input && value === "!") {
       void submit("/danger");
       return;
     }
@@ -869,7 +966,60 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
       return;
     }
     if (busy) return;
+    // Ctrl+R reverse-search over history — live match preview; Ctrl+R again
+    // cycles older matches, enter accepts, esc cancels.
+    if (rsOpen) {
+      if (key.escape) {
+        setRsOpen(false);
+        return;
+      }
+      if (key.ctrl && value === "r") {
+        setRsSkip((s) => s + 1);
+        return;
+      }
+      if (key.return || key.tab) {
+        const match = searchHistory(history.current, rsQuery, rsSkip);
+        setRsOpen(false);
+        if (match) setInput(match.text);
+        return;
+      }
+      if (key.backspace || key.delete) {
+        setRsQuery((q) => q.slice(0, -1));
+        setRsSkip(0);
+        return;
+      }
+      if (value && !key.ctrl && !key.meta) {
+        setRsQuery((q) => q + value.replace(/[\r\n]/g, ""));
+        setRsSkip(0);
+      }
+      return;
+    }
+    if (key.ctrl && value === "r") {
+      setRsOpen(true);
+      setRsQuery("");
+      setRsSkip(0);
+      return;
+    }
+    // Bracketed paste / multi-line chunk — becomes ONE buffered multi-line
+    // input, verbatim. Never submits.
+    {
+      const chunk = normalizeInputChunk(value);
+      if (chunk.paste) {
+        setInput((prev) => prev + chunk.text);
+        return;
+      }
+    }
+    // Ctrl+J (raw \n) inserts a newline for multi-line composing.
+    if ((key.ctrl && value === "j") || value === "\n") {
+      setInput((prev) => prev + "\n");
+      return;
+    }
     if (key.return) {
+      // Trailing "\" continues onto the next line instead of submitting.
+      if (endsWithContinuation(input)) {
+        setInput(stripContinuation(input) + "\n");
+        return;
+      }
       void submit(input);
       return;
     }
@@ -931,10 +1081,23 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
       height: layout.mainHeight,
     }),
     todos.length > 0 ? h(TodosStrip, { theme, todos }) : null,
+    fleet && fleet.active ? h(FleetPanel, { theme, fleet, spinner: busy ? frame : "⚔", width: layout.screenWidth }) : null,
     pulses.length > 0 ? h(EvolutionPulses, { theme, pulses, width: layout.screenWidth }) : null,
     paletteOpen ? h(CommandPalette, { theme, query: input, selected: paletteSel, width: layout.screenWidth }) : null,
     mpOpen ? h(ModelPicker, { theme, providerIdx: mpProvider, models: mpModels, sel: mpSel, loading: mpLoading, width: layout.screenWidth }) : null,
-    h(InputDeck, { theme, snapshot, busy, activity, spinner: busy ? frame : "", input, stats, width: layout.screenWidth }),
+    h(StatusBar, { theme, snapshot, stats, busy, width: layout.screenWidth }),
+    h(InputDeck, {
+      theme,
+      snapshot,
+      busy,
+      activity,
+      spinner: busy ? frame : "",
+      tick: spin,
+      input,
+      rsearch: rsOpen ? { query: rsQuery, match: searchHistory(history.current, rsQuery, rsSkip)?.text ?? null } : null,
+      stats,
+      width: layout.screenWidth,
+    }),
   );
 }
 
@@ -960,31 +1123,6 @@ function Header({ snapshot, stats, theme, width }: { snapshot: InkChatSnapshot; 
       h(Text, { color: theme.dim }, "·"),
       h(Text, { color: theme.accent2 }, theme.title.toLowerCase()),
     ),
-  );
-}
-
-function ToolRail({ theme, activeTool, width }: { theme: DeckTheme; activeTool: string | null; width: number }) {
-  return h(
-    Box,
-    {
-      flexDirection: "column",
-      width,
-      height: "100%",
-      flexShrink: 0,
-      borderStyle: theme.borderStyle,
-      borderColor: theme.panel,
-      paddingX: 1,
-      marginRight: 1,
-    },
-    h(Text, { bold: true, color: theme.accent }, "TOOLS"),
-    ...TOOL_RAIL.map((tool) => {
-      const active = activeTool === tool;
-      return h(
-        Text,
-        { key: tool, color: active ? theme.warn : theme.text, bold: active, wrap: "truncate" },
-        `${active ? "▸" : " "} ${tool}`,
-      );
-    }),
   );
 }
 
@@ -1035,44 +1173,84 @@ function EmptyState({ theme }: { theme: DeckTheme }) {
   );
 }
 
-function StatusPanel({
+// Desktop-parity telemetry strip. Left: a live context-window fuel gauge (the
+// exe's headline meter) that shifts calm→amber→crimson as the window fills.
+// Right: tokens · cost · cache · elapsed · tools — the numbers the desktop shows.
+// Rendered as its own band above the composer so the readout is always visible,
+// not buried in a one-line status like before.
+function StatusBar({
   theme,
   snapshot,
   stats,
-  todos,
-  activeTool,
+  busy,
   width,
 }: {
   theme: DeckTheme;
   snapshot: InkChatSnapshot;
   stats: RuntimeStats;
-  todos: Todo[];
-  activeTool: string | null;
+  busy: boolean;
   width: number;
 }) {
+  const target = contextFillPercent(stats.usage, snapshot.model);
+  // The gauge eases toward its target instead of jumping — a short lerp loop
+  // that self-stops once settled. Plain fallback: snap straight to target.
+  const [eased, setEased] = useState(target);
+  useEffect(() => {
+    if (!MOTION) {
+      setEased(target);
+      return;
+    }
+    const id = setInterval(() => {
+      setEased((prev) => {
+        const next = easeToward(prev, target);
+        if (next === target) clearInterval(id);
+        return next;
+      });
+    }, 80);
+    return () => clearInterval(id);
+  }, [target]);
+  const fill = Math.round(eased);
+  const fc = fillColor(fill, theme);
+  const gaugeW = width < 70 ? 8 : 14;
+  const tokens = compactNumber(stats.usage.inputTokens + stats.usage.outputTokens);
+  const cost = formatCost(stats.usage);
+  const cache = cachePercent(stats.usage);
+  const elapsed = `${Math.round(stats.durationMs / 1000)}s`;
+  // Health dot: crimson while a turn is in flight, calm success when idle+clean,
+  // amber if the session has logged errors.
+  const dotColor = busy ? theme.warn : stats.errors > 0 ? theme.error : theme.success;
+  const sep = () => h(Text, { color: theme.dim }, "·");
   return h(
     Box,
-    {
-      flexDirection: "column",
-      width,
-      height: "100%",
-      flexShrink: 0,
-      borderStyle: theme.borderStyle,
-      borderColor: theme.frame,
-      paddingX: 1,
-      marginLeft: 1,
-    },
-    h(Text, { bold: true, color: theme.accent }, "STATUS"),
-    h(StatusRow, { theme, label: "STATE", value: activeTool ? "working" : "active", color: activeTool ? theme.warn : theme.success }),
-    h(StatusRow, { theme, label: "MODE", value: snapshot.mode, color: snapshot.mode === "plan" ? theme.warn : snapshot.mode === "bypass" ? theme.error : theme.success }),
-    h(ProgressMetric, { theme, label: "CONTEXT", value: Math.min(100, Math.round((stats.usage.inputTokens / 32000) * 100)) }),
-    h(StatusRow, { theme, label: "TOKENS", value: compactNumber(stats.usage.inputTokens + stats.usage.outputTokens), color: theme.accent3 }),
-    h(StatusRow, { theme, label: "ERRORS", value: String(stats.errors), color: stats.errors > 0 ? theme.error : theme.dim }),
-    h(Text, { color: theme.dim }, ""),
-    h(Text, { bold: true, color: theme.accent }, "TODOS"),
-    todos.length === 0
-      ? h(Text, { color: theme.dim }, "- none active")
-      : todos.slice(0, 7).map((todo) => h(TodoLine, { key: todo.id, todo, theme })),
+    { flexDirection: "column", width, marginTop: 1 },
+    h(Text, { color: theme.frame }, "─".repeat(Math.max(0, width - 2))),
+    h(
+      Box,
+      { width, justifyContent: "space-between", paddingX: 1 },
+      // Left cluster: context fuel gauge.
+      h(
+        Box,
+        { gap: 1, flexShrink: 1 },
+        h(Text, { color: dotColor, bold: true }, "●"),
+        h(Text, { color: theme.dim }, "ctx"),
+        h(Text, { color: fc }, fillBar(fill, gaugeW)),
+        h(Text, { color: fc, bold: true }, `${fill}%`),
+      ),
+      // Right cluster: the usage numbers the desktop surfaces.
+      h(
+        Box,
+        { gap: 1 },
+        h(Text, { color: theme.text }, `${tokens} tok`),
+        sep(),
+        h(Text, { color: cost === "$n/a" ? theme.dim : theme.success, bold: cost !== "$n/a" }, cost),
+        sep(),
+        h(Text, { color: theme.accent3 }, `${cache} cache`),
+        sep(),
+        h(Text, { color: theme.accent2 }, elapsed),
+        sep(),
+        h(Text, { color: theme.tool }, `${stats.tools}⚒`),
+      ),
+    ),
   );
 }
 
@@ -1082,7 +1260,9 @@ function InputDeck({
   busy,
   activity,
   spinner,
+  tick,
   input,
+  rsearch,
   stats,
   width,
 }: {
@@ -1091,32 +1271,73 @@ function InputDeck({
   busy: boolean;
   activity: string | null;
   spinner: string;
+  tick: number;
   input: string;
+  rsearch: { query: string; match: string | null } | null;
   stats: RuntimeStats;
   width: number;
 }) {
-  const tokens = compactNumber(stats.usage.inputTokens + stats.usage.outputTokens);
+  void stats;
   const plan = snapshot.mode === "plan";
-  const status = busy
-    ? `${spinner || "▲"} ${activity ?? "working"}`
-    : `${snapshot.mode} · ${tokens} · ⌃P`;
-  // No box. A single faint rule, the ❯ prompt, and a right-aligned status line.
+  const danger = snapshot.mode === "bypass";
+  const promptTag = plan ? "❯ [plan] " : danger ? "❯ [!] " : "❯ ";
+  const promptColor = danger ? theme.error : theme.accent;
+  // Multi-line composing: first row carries the prompt + status; continuation
+  // rows render behind a `… ` gutter (trailing "\" or ⌃J adds lines).
+  const inputLines = input.split("\n");
+  const first = inputLines[0] ?? "";
+  const rest = inputLines.slice(1);
+  const label = activity ?? "working";
+  // Streaming shimmer: a bright band sweeps the activity label while tokens
+  // stream; plain fallback renders static amber text.
+  const statusNode = busy
+    ? h(
+        Box,
+        null,
+        h(Text, { color: theme.accent3, bold: true }, `${spinner || "▲"} `),
+        ...(MOTION
+          ? shimmerSpans(label, tick).map((s, i) =>
+              h(Text, { key: i, color: s.hot ? theme.accent2 : theme.dim, bold: s.hot }, s.text),
+            )
+          : [h(Text, { key: 0, color: theme.warn }, label)]),
+      )
+    : h(Text, { color: theme.dim }, `${snapshot.mode} · ⌃P palette`);
   return h(
     Box,
-    { flexDirection: "column", width, marginTop: 1 },
-    h(Text, { color: theme.dim }, "─".repeat(Math.max(0, width - 2))),
+    { flexDirection: "column", width },
     h(
       Box,
       { justifyContent: "space-between", paddingX: 1 },
       h(
         Box,
         { flexShrink: 1 },
-        h(Text, { color: theme.accent, bold: true }, plan ? "❯ [plan] " : "❯ "),
-        h(Text, { color: input.length > 0 ? theme.text : theme.dim, wrap: "truncate" }, input.length > 0 ? input : "message ares"),
-        busy ? null : h(Text, { color: theme.accent, bold: true }, "▏"),
+        h(Text, { color: promptColor, bold: true }, promptTag),
+        h(Text, { color: input.length > 0 ? theme.text : theme.dim, wrap: "truncate" }, input.length > 0 ? first : "message ares"),
+        busy || rest.length > 0 ? null : h(Text, { color: theme.accent, bold: true }, "▏"),
       ),
-      h(Text, { color: busy ? theme.warn : theme.dim }, status),
+      statusNode,
     ),
+    ...rest.map((line, i) =>
+      h(
+        Box,
+        { key: i, paddingX: 1 },
+        h(Text, { color: theme.dim }, "… "),
+        h(Text, { color: theme.text, wrap: "truncate" }, line),
+        !busy && i === rest.length - 1 ? h(Text, { color: theme.accent, bold: true }, "▏") : null,
+      ),
+    ),
+    rsearch
+      ? h(
+          Box,
+          { paddingX: 1 },
+          h(Text, { color: theme.accent2, bold: true }, "(reverse-i-search) "),
+          h(Text, { color: theme.text }, `'${rsearch.query}'`),
+          h(Text, { color: theme.dim }, ": "),
+          rsearch.match
+            ? h(Text, { color: theme.accent, wrap: "truncate" }, rsearch.match)
+            : h(Text, { color: theme.dim, italic: true }, rsearch.query ? "no match" : "type to search · ⌃R next · enter accept"),
+        )
+      : null,
   );
 }
 
@@ -1208,75 +1429,13 @@ function CommandPalette({ theme, query, selected, width }: { theme: DeckTheme; q
   );
 }
 
-function Footer({ theme, snapshot, stats, width }: { theme: DeckTheme; snapshot: InkChatSnapshot; stats: RuntimeStats; width: number }) {
-  const cost = formatCost(stats.usage);
-  const elapsed = `${Math.round(stats.durationMs / 1000)}s`;
-  const cache = cachePercent(stats.usage);
-  return h(
-    Box,
-    { flexDirection: "column", width },
-    h(
-      Box,
-      { width, justifyContent: "space-between" },
-      h(
-        Box,
-        { gap: 1 },
-        h(Text, { color: theme.success, bold: true }, cost),
-        h(Text, { color: theme.dim }, "·"),
-        h(Text, { color: theme.accent2 }, elapsed),
-        h(Text, { color: theme.dim }, "·"),
-        h(Text, { color: theme.tool }, `${stats.tools} tools`),
-        h(Text, { color: theme.dim }, "·"),
-        h(Text, { color: theme.success }, `${cache} cached`),
-      ),
-      h(
-        Box,
-        { gap: 1 },
-        h(Text, { color: theme.accent }, `◈ ${theme.title.toLowerCase()}`),
-        h(Text, { color: theme.dim }, "·"),
-        h(Text, { color: theme.dim }, `${compactModel(snapshot.provider, 16)} · ckpt ${stats.checkpoints}`),
-      ),
-    ),
-    h(
-      Text,
-      { color: theme.dim, wrap: "truncate" },
-      "⌃P palette  ·  /help  /model  /theme  /plan  /code  /danger  /sessions  /doctor  /exit",
-    ),
-  );
-}
-
-function Chip({ theme, label, value, color }: { theme: DeckTheme; label: string; value: string; color: string }) {
-  return h(
-    Box,
-    { borderStyle: "single", borderColor: color, paddingX: 1 },
-    h(Text, { color: theme.dim }, `${label} `),
-    h(Text, { color, bold: true }, value),
-  );
-}
-
-function StatusRow({ theme, label, value, color }: { theme: DeckTheme; label: string; value: string; color: string }) {
-  return h(
-    Box,
-    { justifyContent: "space-between" },
-    h(Text, { color: theme.dim }, label),
-    h(Text, { color, wrap: "truncate" }, value),
-  );
-}
-
-function ProgressMetric({ theme, label, value }: { theme: DeckTheme; label: string; value: number }) {
-  return h(
-    Box,
-    { flexDirection: "column", marginY: 1 },
-    h(StatusRow, { theme, label, value: `${value}%`, color: theme.accent2 }),
-    h(Text, { color: theme.accent2 }, `[${bar(value, 14)}]`),
-  );
-}
-
 function LogText({ line, theme, spinner }: { line: LogLine; theme: DeckTheme; spinner: string }) {
   // Tool flow: indented, dim — "  ↳ bash  npm test … (spinner) → ✓ result".
   if (line.tone === "tool") {
     const name = line.meta ?? "tool";
     const r = line.result;
+    // Running: animated spinner + live elapsed. Done: one ✓/✗ line + duration.
+    const elapsed = line.startedAt != null ? formatDuration(Date.now() - line.startedAt) : "";
     return h(
       Box,
       { justifyContent: "space-between" },
@@ -1288,8 +1447,42 @@ function LogText({ line, theme, spinner }: { line: LogLine; theme: DeckTheme; sp
         h(Text, { color: theme.dim, wrap: "truncate" }, line.text),
       ),
       r
-        ? h(Text, { color: r.ok ? theme.success : theme.error }, ` ${r.ok ? "✓" : "✗"}${r.text ? ` ${truncateTail(r.text, 26)}` : ""}`)
-        : h(Text, { color: theme.accent3, bold: true }, ` ${spinner || "…"}`),
+        ? h(
+            Text,
+            { color: r.ok ? theme.success : theme.error },
+            ` ${r.ok ? "✓" : "✗"}${r.durationMs != null ? ` ${formatDuration(r.durationMs)}` : ""}${r.text ? ` · ${truncateTail(r.text, 26)}` : ""}`,
+          )
+        : h(Text, { color: theme.accent3, bold: true }, ` ${spinner || "…"}${elapsed ? ` ${elapsed}` : ""}`),
+    );
+  }
+  // Per-file diff card: `▸ path (+adds −dels)` header; the newest card keeps
+  // its hunk expanded (syntax-colored) while the turn streams, then collapses.
+  if (line.tone === "diff-file") {
+    const header = h(
+      Box,
+      null,
+      h(Text, { color: theme.dim }, `  ${line.expanded ? "▾ " : "▸ "}`),
+      h(Text, { color: theme.accent2, bold: true }, line.meta ?? "(diff)"),
+      h(Text, { color: theme.dim }, " ("),
+      h(Text, { color: theme.success }, `+${line.adds ?? 0}`),
+      h(Text, { color: theme.dim }, " "),
+      h(Text, { color: theme.error }, `−${line.dels ?? 0}`),
+      h(Text, { color: theme.dim }, ")"),
+    );
+    if (!line.expanded || !line.detail || line.detail.length === 0) return header;
+    const dt = diffThemeFrom(theme);
+    return h(
+      Box,
+      { flexDirection: "column" },
+      header,
+      ...line.detail.map((row, i) =>
+        h(
+          Text,
+          { key: i, wrap: "truncate" },
+          h(Text, { color: theme.dim }, "    "),
+          ...diffLineSpans(row, dt).map((span, j) => h(Text, spanProps(span, theme.dim, j), span.text)),
+        ),
+      ),
     );
   }
   // Verifier objections — amber, indented, never dressed up as success.
@@ -1307,17 +1500,98 @@ function LogText({ line, theme, spinner }: { line: LogLine; theme: DeckTheme; sp
   }
   if (line.tone === "assistant") {
     const streaming = line.meta === "stream" && spinner;
+    // Rich markdown: headings, bold/italic, inline code, fenced code blocks with
+    // syntax tinting, lists, quotes, links. Pure renderer → styled line data.
+    const md = renderMarkdown(line.text, mdThemeFrom(theme));
     return h(
       Box,
-      null,
-      h(Text, { color: theme.assistant, wrap: "truncate" }, line.text),
-      streaming ? h(Text, { color: theme.accent3, bold: true }, ` ${spinner}`) : null,
+      { flexDirection: "column" },
+      ...md.map((mdLine, idx) =>
+        h(MdLineView, {
+          key: idx,
+          line: mdLine,
+          fallback: theme.assistant,
+          // Spinner rides the last rendered line while streaming.
+          spinner: streaming && idx === md.length - 1 ? spinner : "",
+          spinnerColor: theme.accent3,
+        }),
+      ),
     );
   }
   // verifier-success / notice / error / muted / diff — subtle, indented.
   const color = toneColor(line.tone, theme);
   const prefix = line.cont ? "  " : line.tone === "error" ? "  ✗ " : line.tone === "notice" ? "  " : "  ";
   return h(Text, { color, wrap: "truncate" }, `${prefix}${line.text}`);
+}
+
+// Map the TUI's DeckTheme onto the renderer's structural MdTheme.
+function mdThemeFrom(theme: DeckTheme): MdTheme {
+  return {
+    text: theme.assistant,
+    dim: theme.dim,
+    accent: theme.accent,
+    accent2: theme.accent2,
+    accent3: theme.accent3,
+    success: theme.success,
+    warn: theme.warn,
+    error: theme.error,
+  };
+}
+
+// Map the TUI's DeckTheme onto the diff renderer's structural DiffLineTheme.
+function diffThemeFrom(theme: DeckTheme): DiffLineTheme {
+  return { add: theme.success, del: theme.error, meta: theme.accent2, dim: theme.dim, text: theme.text };
+}
+
+// Render one MdLine: a row of styled spans, plus an optional trailing spinner.
+// Code/heading lines keep their leading structure; prose truncates to width to
+// preserve the old single-stream behavior (the outer panel controls width).
+function MdLineView({
+  line,
+  fallback,
+  spinner,
+  spinnerColor,
+}: {
+  line: MdLine;
+  fallback: string;
+  spinner: string;
+  spinnerColor: string;
+}) {
+  if (line.kind === "blank" && line.spans.length === 0) {
+    // Preserve blank lines for paragraph spacing, but keep the spinner visible.
+    return h(
+      Box,
+      null,
+      h(Text, {}, " "),
+      spinner ? h(Text, { color: spinnerColor, bold: true }, spinner) : null,
+    );
+  }
+  // Code blocks are indented and allowed to wrap (they read better wrapped than
+  // chopped); prose truncates so a long line never breaks the single-stream
+  // layout — matching the old assistant behavior.
+  const wrapMode: "wrap" | "truncate" = line.kind === "code" ? "wrap" : "truncate";
+  const indent = line.kind === "code" ? "  " : "";
+  return h(
+    Box,
+    null,
+    indent ? h(Text, { color: "gray" }, indent) : null,
+    h(
+      Text,
+      { wrap: wrapMode },
+      ...line.spans.map((span, i) => h(Text, spanProps(span, fallback, i), span.text)),
+    ),
+    spinner ? h(Text, { color: spinnerColor, bold: true }, ` ${spinner}`) : null,
+  );
+}
+
+function spanProps(span: MdSpan, fallback: string, key: number): Record<string, unknown> {
+  return {
+    key,
+    color: span.color ?? fallback,
+    bold: span.bold ? true : undefined,
+    italic: span.italic ? true : undefined,
+    dimColor: span.dim ? true : undefined,
+  };
 }
 
 function truncateTail(text: string, max: number): string {
@@ -1339,9 +1613,35 @@ function TodosStrip({ theme, todos }: { theme: DeckTheme; todos: Todo[] }) {
   );
 }
 
-function TodoLine({ todo, theme }: { todo: Todo; theme: DeckTheme }) {
-  const color = todo.status === "completed" ? theme.success : todo.status === "in_progress" ? theme.warn : theme.dim;
-  return h(Text, { color, wrap: "truncate" }, `${todoMarker(todo)} ${todo.status === "in_progress" ? todo.activeForm : todo.content}`);
+// Live Conductor fleet panel — one line per agent while a fleet runs, bounded
+// to 12 rows + "+N more". Collapses to a one-line summary on completion.
+function FleetPanel({ theme, fleet, spinner, width }: { theme: DeckTheme; fleet: FleetState; spinner: string; width: number }) {
+  const { shown, hidden } = foldFleetRows(fleet.agents, 12);
+  const running = fleet.agents.filter((a) => a.status === "running").length;
+  return h(
+    Box,
+    { flexDirection: "column", width, borderStyle: theme.borderStyle, borderColor: theme.accent3, paddingX: 1, marginTop: 1 },
+    h(
+      Box,
+      { justifyContent: "space-between" },
+      h(Text, { color: theme.accent3, bold: true }, `⚔ FLEET${fleet.fleetId ? ` ${fleet.fleetId}` : ""}`),
+      h(Text, { color: theme.dim }, `${fleet.agents.length} agents · ${running} running`),
+    ),
+    ...shown.map((agent) => {
+      const color =
+        agent.status === "done" ? theme.success : agent.status === "failed" ? theme.error : agent.status === "resumed" ? theme.accent2 : theme.warn;
+      const glyph = agent.status === "running" ? (spinner || fleetGlyph(agent.status)) : fleetGlyph(agent.status);
+      return h(
+        Box,
+        { key: agent.agentId },
+        h(Text, { color, bold: agent.status === "running" }, `${glyph} `),
+        h(Text, { color: theme.text, bold: agent.status === "running" }, agent.agentId),
+        h(Text, { color: theme.accent2 }, ` [${agent.phase || agent.role}]`),
+        h(Text, { color: theme.dim, wrap: "truncate" }, ` ${agent.activity}`),
+      );
+    }),
+    hidden > 0 ? h(Text, { color: theme.dim }, `  +${hidden} more`) : null,
+  );
 }
 
 function deckTheme(): DeckTheme {
@@ -1359,16 +1659,6 @@ function toneColor(tone: LogLine["tone"], theme: DeckTheme): string {
   if (tone === "error") return theme.error;
   if (tone === "notice") return theme.accent2;
   return theme.dim;
-}
-
-function appendDiff(diff: string, append: (tone: LogLine["tone"], text: string, meta?: string) => void): void {
-  for (const line of diff.split(/\r?\n/)) {
-    if (!line) continue;
-    if (line.startsWith("+") && !line.startsWith("+++")) append("diff-add", line, "diff");
-    else if (line.startsWith("-") && !line.startsWith("---")) append("diff-del", line, "diff");
-    else if (line.startsWith("@@") || line.startsWith("---") || line.startsWith("+++")) append("diff-meta", line, "diff");
-    else append("muted", line, "diff");
-  }
 }
 
 function progressText(data: unknown): string | null {
@@ -1472,9 +1762,44 @@ function formatCost(usage: Usage): string {
   return `$${cost.toFixed(4)}`;
 }
 
-function bar(value: number, width: number): string {
-  const filled = Math.max(0, Math.min(width, Math.round((value / 100) * width)));
-  return "#".repeat(filled) + "-".repeat(width - filled);
+// Premium block-glyph gauge for the status bar — reads as a solid fuel bar,
+// matching the desktop's context meter rather than ASCII #/-.
+function fillBar(percent: number, width: number): string {
+  const p = Math.max(0, Math.min(100, percent));
+  const filled = Math.round((p / 100) * width);
+  return "█".repeat(filled) + "░".repeat(Math.max(0, width - filled));
+}
+
+// A model's context window, inferred from its name so the fill gauge is honest
+// without threading provider metadata all the way down. Override via
+// ARES_CONTEXT_WINDOW_TOKENS. Conservative defaults per known family.
+function contextWindowFor(model: string): number {
+  const override = Number(process.env.ARES_CONTEXT_WINDOW_TOKENS);
+  if (Number.isFinite(override) && override > 0) return override;
+  const m = model.toLowerCase();
+  if (m.includes("gpt-4o") || m.includes("gpt-4.1") || m.includes("o1") || m.includes("o3")) return 128_000;
+  if (m.includes("gpt")) return 128_000;
+  if (m.includes("deepseek")) return 128_000;
+  if (m.includes("gemini")) return 1_000_000;
+  if (m.includes("llama") || m.includes("qwen") || m.includes("mistral")) return 128_000;
+  if (m.includes("claude") || m.includes("sonnet") || m.includes("opus") || m.includes("haiku") || m.includes("fable")) return 200_000;
+  return 200_000;
+}
+
+// Context-fill percentage from the last request's prompt size — the single most
+// useful "how full is the window" readout, exactly what the desktop surfaces.
+function contextFillPercent(usage: Usage, model: string): number {
+  const window = contextWindowFor(model);
+  if (window <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((usage.inputTokens / window) * 100)));
+}
+
+// Health color for the context gauge: calm accent under load, amber as it fills,
+// crimson near the compaction ceiling — a glanceable "am I about to compact" cue.
+function fillColor(percent: number, theme: DeckTheme): string {
+  if (percent >= 85) return theme.error;
+  if (percent >= 65) return theme.warn;
+  return theme.success;
 }
 
 interface MouseEvent {
