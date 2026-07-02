@@ -13,8 +13,15 @@ concurrency:
 
 jobs:
   node:
-    name: Build & test (Node)
-    runs-on: ubuntu-latest
+    name: Build & test (Node, ${{ matrix.os }})
+    # Ares is a Windows-first product (PowerShell tools, Tauri shell), yet the
+    # test suite historically only ran on Linux. Run the same build + tests on
+    # both Ubuntu and Windows so platform-specific regressions surface in CI.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -38,6 +45,35 @@ jobs:
 
       - name: Test
         run: node --test tests/*.test.mjs
+
+  coverage:
+    name: Coverage (Node built-in)
+    # Zero-dependency coverage via Node 22's built-in test runner. No c8/nyc —
+    # --experimental-test-coverage prints an lcov-style summary table to the log.
+    # Linux-only is fine here; this measures coverage, not platform behavior.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      # --experimental-test-coverage is a Node 22 feature; the matrix job above
+      # already pins node-version 22, so this flag is safe to use here.
+      - name: Test with coverage
+        run: node --test --experimental-test-coverage tests/*.test.mjs
 
   rust:
     name: Build (Rust desktop shell)
