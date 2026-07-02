@@ -30,8 +30,10 @@ import { getCurrentWindow, LogicalSize, PhysicalSize, PhysicalPosition } from "@
 // Any model plugged into Ares emits a HoloSpec (*.holo.json) and this renders
 // it: exploded view, assembly steps, wiring overlay, BOM with STL export.
 import { buildHolotableHtml, validateHoloSpec, type HoloSpec } from "../../packages/cli/src/holotable";
+import { redactSecrets } from "../../packages/protocol/src/secretRedact";
 import { UpdateBanner } from "./UpdateBanner";
 import { WhatsNew } from "./WhatsNew";
+import { StyleCtx, SpringNumber, SpringHeight, TokenFlowStrip, pushTokenFlow, useNewStyle } from "./newStyle";
 import { CHANGELOG } from "./changelog";
 import "./styles.css";
 
@@ -91,6 +93,7 @@ interface AresEvent {
   goals?: unknown;
   activeCount?: number;
   autotick?: boolean;
+  trust?: unknown;
   lane?: string;
   routingMode?: "manual" | "auto";
   routing?: Prefs["routing"];
@@ -465,13 +468,13 @@ function foldEvent(s: SessionVm, e: AresEvent): SessionVm {
     }
     case "text_delta": {
       const a = openAssistant();
-      items[items.indexOf(a)] = { ...a, text: a.text + (e.text ?? "") };
+      items[items.length - 1] = { ...a, text: a.text + (e.text ?? "") };
       session.activity = "writing";
       break;
     }
     case "thinking_delta": {
       const a = openAssistant();
-      items[items.indexOf(a)] = { ...a, thinking: a.thinking + (e.text ?? "") };
+      items[items.length - 1] = { ...a, thinking: a.thinking + (e.text ?? "") };
       session.activity = "thinking";
       break;
     }
@@ -1085,6 +1088,10 @@ interface Prefs {
   pinned: string[];
   /** Accent theme for the desktop chrome. */
   theme: ThemeName;
+  /** Interface style — "new" = the Forged skin (glass depth, spring motion,
+   *  living gauges); "legacy" = the classic flat shell, pixel-identical to
+   *  the pre-skin app. Everything new is scoped under data-style="new". */
+  uiStyle: "legacy" | "new";
   /** Advanced engine knobs (mirrors the daemon's EngineConfig). */
   engine: EngineConfig;
 }
@@ -1120,6 +1127,7 @@ function loadPrefs(): Prefs {
     flameMode: "immersive",
     pinned: [],
     theme: "rage",
+    uiStyle: "new",
     engine: {},
   };
   try {
@@ -1140,6 +1148,7 @@ function loadPrefs(): Prefs {
       flameMode: raw.flameMode === "clean" || raw.flameMode === "combat" ? raw.flameMode : "immersive",
       pinned: Array.isArray(raw.pinned) ? raw.pinned.filter((p): p is string => typeof p === "string") : [],
       theme: themeOk ? (raw.theme as ThemeName) : "rage",
+      uiStyle: raw.uiStyle === "legacy" ? "legacy" : "new",
       engine: raw.engine && typeof raw.engine === "object" ? raw.engine : {},
     };
   } catch {
@@ -1570,7 +1579,7 @@ function App() {
   });
   const [keyStatus, setKeyStatus] = useState<Record<string, boolean>>({});
   const [permissions, setPermissions] = useState<PermSettings>(DEFAULT_PERMS);
-  const [opStatus, setOpStatus] = useState<{ activeCount: number; goals: Array<{ id: string; statement: string; status: string; progress: number }>; autotick: boolean } | null>(null);
+  const [opStatus, setOpStatus] = useState<{ activeCount: number; goals: Array<{ id: string; statement: string; status: string; progress: number }>; autotick: boolean; trust?: Array<{ domain: string; level: number; proven: number }> } | null>(null);
   const [oauthProviders, setOauthProviders] = useState<OAuthProviderVm[]>([]);
   const [strike, setStrike] = useState(0);
   // The embedded live browser: latest JPEG frame Ares streamed while driving its
@@ -1663,8 +1672,11 @@ function App() {
         for (const st of it.steps) {
           const tag = st.status === "error" ? "TOOL FAILED" : "TOOL";
           out.push(`  [${tag}] ${st.name} · ${st.status}${st.durationMs ? ` · ${st.durationMs}ms` : ""}`);
-          if (st.inputJson) out.push(`      input: ${st.inputJson}`);
-          if (st.detail) out.push(`      ${st.status === "error" ? "error" : "result"}: ${st.detail}`);
+          // Tool inputs/results routinely carry API keys pasted into a prompt or
+          // echoed back from a provider error — scrub before this leaves the app
+          // as an exported file the owner might paste into a bug report.
+          if (st.inputJson) out.push(`      input: ${redactSecrets(st.inputJson)}`);
+          if (st.detail) out.push(`      ${st.status === "error" ? "error" : "result"}: ${redactSecrets(st.detail)}`);
         }
       } else if (it.kind === "diff") out.push(`  [DIFF] ${(it.files ?? []).join(", ")}`);
       else if (it.kind === "subagent") out.push(`  [SUBAGENT] ${it.name} · ${it.status}${it.summary ? ` — ${it.summary}` : ""}`);
@@ -1696,6 +1708,21 @@ function App() {
     },
     [native],
   );
+
+  // HELM live feed: while the war room is visible, re-scry on open, every 5s,
+  // and on every busy flip (turn start/end) so missions, todos, and cost move
+  // without touching ⟳. Gated on view so the idle app costs nothing.
+  const helmBusy = Boolean(active?.busy);
+  useEffect(() => {
+    if (view !== "helm" || !native || daemon === "stopped" || daemon === "error") return;
+    const scry = () => {
+      daemonCmd({ type: "operator_status" });
+      daemonCmd({ type: "usage_stats", days: 14 });
+    };
+    scry();
+    const timer = window.setInterval(scry, 5_000);
+    return () => window.clearInterval(timer);
+  }, [view, native, daemon, helmBusy, daemonCmd]);
 
   const restartDaemon = useCallback(
     (provider?: string, model?: string) => {
@@ -1918,6 +1945,7 @@ function App() {
             activeCount: typeof e.activeCount === "number" ? e.activeCount : 0,
             goals: Array.isArray(e.goals) ? (e.goals as Array<{ id: string; statement: string; status: string; progress: number }>) : [],
             autotick: e.autotick !== false,
+            trust: Array.isArray(e.trust) ? (e.trust as Array<{ domain: string; level: number; proven: number }>) : [],
           });
           return true;
         case "oauth_status":
@@ -2006,16 +2034,16 @@ function App() {
           const tail = stderrTail.current.slice(-4).join("\n");
           const attempt = restartAttempts.current;
           const willRetry = attempt < MAX_AUTO_RESTARTS;
-          apply((s) => ({
-            ...foldEvent(s, {
-              type: "desktop_error",
-              text:
-                `The Garrison went down (exit code ${e.code ?? "unknown"}).` +
-                (tail ? `\n${tail}` : "") +
-                (willRetry ? `\nRestarting… (attempt ${attempt + 1}/${MAX_AUTO_RESTARTS})` : "\nAuto-restart limit reached — use Restart in the status bar."),
-            }),
-            busy: false,
-          }));
+          const errorText =
+            `The Garrison went down (exit code ${e.code ?? "unknown"}).` +
+            (tail ? `\n${tail}` : "") +
+            (willRetry ? `\nRestarting… (attempt ${attempt + 1}/${MAX_AUTO_RESTARTS})` : "\nAuto-restart limit reached — use Restart in the status bar.");
+          // A daemon crash kills every in-flight turn, not just the one the
+          // user is currently looking at — sweep ALL busy sessions so
+          // background cards don't stay stuck forever with no error shown.
+          setSessions((prev) =>
+            prev.map((s) => (s.busy ? { ...foldEvent(s, { type: "desktop_error", text: errorText }), busy: false } : s)),
+          );
           if (willRetry) {
             restartAttempts.current += 1;
             window.setTimeout(() => restartDaemon(), 900 * (attempt + 1));
@@ -2037,6 +2065,13 @@ function App() {
       // Surface attention-worthy events as OS notifications when you're not
       // looking at this session/window — so overnight & background work is visible.
       const ev = buffered.event;
+      // Feed the composer's token-flow strip: count every streamed character of
+      // the session you're LOOKING at (text, thinking, tool-input authoring).
+      // One integer addition on a module-level accumulator — no React involved.
+      if (!sid || sid === activeRef.current) {
+        if ((ev.type === "text_delta" || ev.type === "thinking_delta") && ev.text) pushTokenFlow(ev.text.length);
+        else if (ev.type === "tool_use_input_delta" && ev.deltaJson) pushTokenFlow(ev.deltaJson.length);
+      }
       const elsewhere = document.hidden || (!!sid && sid !== activeRef.current);
       if (ev.type === "permission_request" && elsewhere) {
         fireNotification("Ares needs your approval", ev.reason || ev.toolName || "A tool needs your OK");
@@ -2213,7 +2248,10 @@ function App() {
       }
       const reply = "Demo mode — no daemon attached. In the installed app this streams from the Garrison.";
       reply.split(" ").forEach((word, i) => {
-        window.setTimeout(() => apply((s) => foldEvent(s, { type: "text_delta", text: `${word} ` })), 300 + i * 40);
+        window.setTimeout(() => {
+          pushTokenFlow(word.length + 1); // demo mode still animates the token-flow strip
+          apply((s) => foldEvent(s, { type: "text_delta", text: `${word} ` }));
+        }, 300 + i * 40);
       });
       window.setTimeout(
         () => apply((s) => foldEvent(s, { type: "turn_end", status: "completed", durationMs: 1400, usage: { inputTokens: 220, outputTokens: 18 } })),
@@ -2663,11 +2701,13 @@ function App() {
   }, [activity]);
 
   return (
+    <StyleCtx.Provider value={prefs.uiStyle}>
     <div
       className="ares"
       data-daemon={daemon}
       data-theme={prefs.theme}
       data-flame={prefs.flameMode}
+      data-style={prefs.uiStyle}
       data-panel={forge.open ? "1" : "0"}
       data-working={active?.busy ? "1" : "0"}
       data-pill={pill ? "1" : "0"}
@@ -3008,7 +3048,7 @@ function App() {
               ⌘ Ctrl+K
             </button>
             <span className="hudReadout" title="tokens in / out this session">
-              ↑{fmtTokens(active?.tokensIn ?? 0)} ↓{fmtTokens(active?.tokensOut ?? 0)}
+              ↑<SpringNumber value={active?.tokensIn ?? 0} format={fmtTokens} /> ↓<SpringNumber value={active?.tokensOut ?? 0} format={fmtTokens} />
             </span>
             <span className="hudVersion">v{APP_VERSION}</span>
           </div>
@@ -3280,6 +3320,7 @@ function App() {
         </div>
       ) : null}
     </div>
+    </StyleCtx.Provider>
   );
 }
 
@@ -3685,7 +3726,7 @@ function HelmView({
   onRefresh,
 }: {
   daemon: DaemonState;
-  opStatus: { activeCount: number; goals: Array<{ id: string; statement: string; status: string; progress: number }>; autotick: boolean } | null;
+  opStatus: { activeCount: number; goals: Array<{ id: string; statement: string; status: string; progress: number }>; autotick: boolean; trust?: Array<{ domain: string; level: number; proven: number }> } | null;
   usage: UsageStats | null;
   keyStatus: Record<string, boolean>;
   sessions: SessionVm[];
@@ -3806,12 +3847,12 @@ function HelmView({
         <div className="helm-slate slate-cost">
           <h4>Entrails of Cost</h4>
           <div className="helm-cost">
-            <div><b>{kfmt(Math.max(0, (usage?.tokensIn ?? 0) - (usage?.cacheReadTokens ?? 0)))}</b><span>fresh in</span></div>
-            <div><b>{kfmt(usage?.tokensOut ?? 0)}</b><span>out</span></div>
-            <div><b>{kfmt(usage?.apiCalls ?? 0)}</b><span>calls</span></div>
+            <div><b><SpringNumber value={Math.max(0, (usage?.tokensIn ?? 0) - (usage?.cacheReadTokens ?? 0))} format={kfmt} /></b><span>fresh in</span></div>
+            <div><b><SpringNumber value={usage?.tokensOut ?? 0} format={kfmt} /></b><span>out</span></div>
+            <div><b><SpringNumber value={usage?.apiCalls ?? 0} format={kfmt} /></b><span>calls</span></div>
           </div>
           <div className="helm-cost-cached">
-            cached {kfmt(usage?.cacheReadTokens ?? 0)} · {usage && usage.tokensIn > 0 ? Math.round((usage.cacheReadTokens / usage.tokensIn) * 100) : 0}% reused
+            cached <SpringNumber value={usage?.cacheReadTokens ?? 0} format={kfmt} /> · {usage && usage.tokensIn > 0 ? Math.round((usage.cacheReadTokens / usage.tokensIn) * 100) : 0}% reused
           </div>
           <div className="helm-spark">
             {daily.slice(-14).map((d, i) => (
@@ -3848,6 +3889,18 @@ function HelmView({
             <div className="helm-gauge-fill" />
             <span>{daemon === "running" ? "FAVORED" : daemon.toUpperCase()}</span>
           </div>
+          {(opStatus?.trust ?? []).length > 0 ? (
+            <ul className="helm-trust" title="Earned leash — trust the Crucible has proven, domain by domain">
+              {(opStatus?.trust ?? []).slice(0, 4).map((t) => (
+                <li key={t.domain}>
+                  <span className="helm-trust-domain">{t.domain}</span>
+                  <span className="helm-trust-pips">
+                    {[1, 2, 3, 4, 5].map((p) => <i key={p} data-lit={p <= t.level ? "1" : "0"} />)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
           <button className="helm-toggle" data-on={opStatus?.autotick ? "1" : "0"} onClick={onToggleAutotick}>
             <i />{opStatus?.autotick ? "Unattended hunt: ON" : "Unattended hunt: OFF"}
           </button>
@@ -4274,8 +4327,24 @@ const Composer = React.memo(function Composer({
   onRoutingChip: () => void;
 }) {
   const [text, setText] = useState("");
-  const [attachments, setAttachments] = useState<Array<{ name: string; dataUrl: string }>>([]);
+  const [attachments, setAttachmentsState] = useState<Array<{ name: string; dataUrl: string }>>([]);
+  // Mirrors `attachments` synchronously. Refs update immediately (unlike state,
+  // which is batched/rendered-on-a-delay) — submit() reads THIS after awaiting
+  // in-flight reads below, since the `attachments` state variable itself would
+  // still be the stale value captured when this render's submit closure formed.
+  const attachmentsRef = useRef<Array<{ name: string; dataUrl: string }>>([]);
+  const setAttachments = (updater: (prev: Array<{ name: string; dataUrl: string }>) => Array<{ name: string; dataUrl: string }>) => {
+    attachmentsRef.current = updater(attachmentsRef.current);
+    setAttachmentsState(attachmentsRef.current);
+  };
   const ref = useRef<HTMLTextAreaElement | null>(null);
+  // In-flight FileReader reads from a paste/drop that haven't landed in
+  // `attachments` yet. FileReader is async — pasting a screenshot and
+  // immediately hitting Enter (a completely normal motion) could fire submit()
+  // before the read finishes, silently sending text-only with the image gone
+  // and no error shown ("Ares can't see my pasted image"). submit() awaits
+  // these before deciding what to send.
+  const pendingReads = useRef<Set<Promise<void>>>(new Set());
   // Dictation drops the transcript into the draft (appended), then focuses.
   const dictation = useDictation((t) => {
     setText((prev) => (prev.trim() ? prev.replace(/\s+$/, "") + " " : "") + t);
@@ -4286,27 +4355,35 @@ const Composer = React.memo(function Composer({
     for (const file of files) {
       if (!file.type.startsWith("image/")) continue; // vision models read images
       if (file.size > 15 * 1024 * 1024) continue;
-      const reader = new FileReader();
-      reader.onload = () => {
-        const dataUrl = String(reader.result ?? "");
-        if (dataUrl.startsWith("data:image/")) {
-          setAttachments((prev) => [...prev, { name: file.name || "pasted-image", dataUrl }]);
-        }
-      };
-      reader.readAsDataURL(file);
+      const read: Promise<void> = new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = String(reader.result ?? "");
+          if (dataUrl.startsWith("data:image/")) {
+            setAttachments((prev) => [...prev, { name: file.name || "pasted-image", dataUrl }]);
+          }
+          resolve();
+        };
+        reader.onerror = () => resolve(); // never hang submit() on an unreadable file
+        reader.readAsDataURL(file);
+      });
+      pendingReads.current.add(read);
+      void read.finally(() => pendingReads.current.delete(read));
     }
   };
 
-  const submit = () => {
+  const submit = async () => {
+    if (pendingReads.current.size > 0) await Promise.all(pendingReads.current);
     const t = text.trim();
-    if (!t && attachments.length === 0) return;
+    const currentAttachments = attachmentsRef.current;
+    if (!t && currentAttachments.length === 0) return;
     // The daemon's contentFromUserInput parses data:image URLs out of the goal
     // into image blocks — so we just append them to the message text.
-    const payload = [t, ...attachments.map((a) => a.dataUrl)].filter(Boolean).join("\n");
+    const payload = [t, ...currentAttachments.map((a) => a.dataUrl)].filter(Boolean).join("\n");
     if (busy) onSteer(payload);
     else onSend(payload);
     setText("");
-    setAttachments([]);
+    setAttachments(() => []);
     if (ref.current) ref.current.style.height = "auto";
   };
   return (
@@ -4363,7 +4440,7 @@ const Composer = React.memo(function Composer({
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
-              submit();
+              void submit();
             }
           }}
         />
@@ -4379,7 +4456,7 @@ const Composer = React.memo(function Composer({
         {busy ? (
           <>
             {text.trim() ? (
-              <button className="send steer" onClick={submit} aria-label="steer" title="queue this — folded in at a safe moment">
+              <button className="send steer" onClick={() => void submit()} aria-label="steer" title="queue this — folded in at a safe moment">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M8 3 L8 13 M3 8 L13 8" />
                 </svg>
@@ -4392,13 +4469,16 @@ const Composer = React.memo(function Composer({
             </button>
           </>
         ) : (
-          <button className="send" onClick={submit} disabled={!text.trim() && attachments.length === 0} aria-label="send">
+          <button className="send" onClick={() => void submit()} disabled={!text.trim() && attachments.length === 0} aria-label="send">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
               <path d="M2 8 L14 2 L10.5 14 L8 9 Z" />
             </svg>
           </button>
         )}
       </div>
+      {/* new-style only: a slim pulse line whose amplitude rides tokens/sec.
+          Renders null in legacy mode / at rest / under reduced motion. */}
+      <TokenFlowStrip busy={busy} />
     </div>
   );
 });
@@ -5055,6 +5135,7 @@ function ThinkingView({ text }: { text: string }) {
 // per-step breakdown stays one click away. One reused card, not a stack.
 function ToolGroup({ item, technical }: { item: Extract<Item, { kind: "tools" }>; technical?: boolean }) {
   const [open, setOpen] = useState(false);
+  const newStyle = useNewStyle();
   const running = item.steps.some((s) => s.status === "running" || s.status === "drafting");
   const failed = item.steps.some((s) => s.status === "error");
   const wallElapsed = item.finishedAt === undefined ? 0 : Math.max(0, item.finishedAt - item.startedAt);
@@ -5073,8 +5154,22 @@ function ToolGroup({ item, technical }: { item: Extract<Item, { kind: "tools" }>
     ? `${doneCount}/${total} done${runningSteps.length > 1 ? ` · ${runningSteps.length} running` : ""}`
     : `${summarizeSteps(item.steps)}${failed ? ` · ${failedCount} failed` : ""} · ${fmtMs(elapsed)}`;
 
-  return (
-    <div className="toolCard" data-state={failed ? "error" : running ? "running" : "ok"} data-open={open ? "1" : "0"}>
+  // New style: a finished card COLLAPSES to a compact ✓ line (height-spring via
+  // SpringHeight); clicking it re-expands the full breakdown. Legacy keeps the
+  // classic always-full card — `compactDone` is impossible there.
+  const compactDone = newStyle && !running && !open;
+
+  const inner = compactDone ? (
+    <button className="toolDoneLine" data-failed={failed ? "1" : "0"} onClick={() => setOpen(true)} title="show the full tool breakdown">
+      <i className="doneMark" aria-hidden="true">{failed ? "✕" : "✓"}</i>
+      <span className="doneSummary">
+        {total} tool{total === 1 ? "" : "s"} · {summarizeSteps(item.steps)}
+        {failed ? ` · ${failedCount} failed` : ""}
+      </span>
+      <em className="doneTime">{fmtMs(elapsed)}</em>
+    </button>
+  ) : (
+    <>
       <button className="toolCardHead" onClick={() => setOpen(!open)}>
         <span className="toolCardIcon">
           {/* keyed so the glyph re-animates (morphs) each time the active tool changes */}
@@ -5099,6 +5194,20 @@ function ToolGroup({ item, technical }: { item: Extract<Item, { kind: "tools" }>
           ))}
         </div>
       ) : null}
+    </>
+  );
+
+  const state = failed ? "error" : running ? "running" : "ok";
+  if (newStyle) {
+    return (
+      <SpringHeight className="toolCard" attrs={{ "data-state": state, "data-open": open ? "1" : "0", "data-compact": compactDone ? "1" : "0" }}>
+        {inner}
+      </SpringHeight>
+    );
+  }
+  return (
+    <div className="toolCard" data-state={state} data-open={open ? "1" : "0"}>
+      {inner}
     </div>
   );
 }
@@ -5663,6 +5772,29 @@ function Settings({
           {tab === "appearance" ? (
             <div className="settingsPane">
               <h3 className="paneTitle">Appearance</h3>
+              <label className="fieldLabel">Interface style</label>
+              <div className="displayModes">
+                <button
+                  data-on={draft.uiStyle === "new" ? "1" : "0"}
+                  onClick={() => {
+                    setDraftPrefs({ ...draft, uiStyle: "new" });
+                    onLivePref({ uiStyle: "new" }); // display-only — preview instantly
+                  }}
+                >
+                  <strong>Forged</strong>
+                  <span>Glass depth, spring motion, living gauges.</span>
+                </button>
+                <button
+                  data-on={draft.uiStyle === "legacy" ? "1" : "0"}
+                  onClick={() => {
+                    setDraftPrefs({ ...draft, uiStyle: "legacy" });
+                    onLivePref({ uiStyle: "legacy" });
+                  }}
+                >
+                  <strong>Legacy</strong>
+                  <span>The classic flat obsidian shell.</span>
+                </button>
+              </div>
               <label className="fieldLabel">Tool call display</label>
               <div className="displayModes">
                 <button data-on={draft.toolDisplay === "product" ? "1" : "0"} onClick={() => setDraftPrefs({ ...draft, toolDisplay: "product" })}>

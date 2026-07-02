@@ -26,8 +26,9 @@ test("engine bones: hologram, exploded view, assembly mode, wiring, BOM, STL exp
   assert.match(html, /id="explode" type="range"/);
   assert.match(html, /exploded/);
   assert.match(html, /addScaledVector\(p\.axis/);
-  // Hologram look.
-  assert.match(html, /wireframe: true/);
+  // Hologram look — crisp feature-edge outline (LineBasicMaterial) rather than a
+  // noisy triangle wireframe, over the additive-blended translucent surface.
+  assert.match(html, /LineBasicMaterial/);
   assert.match(html, /AdditiveBlending/);
   assert.match(html, /#c79a4e/);
   // The build-engine surfaces.

@@ -92,6 +92,15 @@ export function UpdateBanner(): React.ReactElement | null {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setPhase("error");
+      // We stopped the daemon above to free the files for the installer — if
+      // the install/relaunch itself failed, the daemon is now permanently
+      // dead until the owner manually restarts the app. Bring it back so a
+      // failed update doesn't also break the app that's still running.
+      try {
+        await invoke("ares_start_daemon");
+      } catch (restartErr) {
+        console.warn("post-failure daemon restart failed:", restartErr);
+      }
     }
   }, []);
 

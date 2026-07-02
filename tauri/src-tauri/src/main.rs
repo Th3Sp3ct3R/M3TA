@@ -167,13 +167,6 @@ fn ares_start_daemon(
     provider: Option<String>,
     model: Option<String>,
 ) -> Result<DaemonStatus, String> {
-    {
-        let child = state.child.lock().map_err(|_| "daemon state lock failed")?;
-        if child.is_some() {
-            return Ok(daemon_status(state.inner()));
-        }
-    }
-
     start_daemon(app, state.inner(), provider, model)
 }
 
@@ -199,6 +192,29 @@ fn start_daemon(
     provider: Option<String>,
     model: Option<String>,
 ) -> Result<DaemonStatus, String> {
+    // Acquire the child lock BEFORE doing any spawn work and hold it across the
+    // whole spawn-and-store sequence below. Two concurrent ares_start_daemon
+    // invokes used to both observe child==None (the check lived in the caller,
+    // released before start_daemon() ran), both fully spawn a daemon+garrison
+    // pair, and let the loser's Child handle drop — Child::drop() does not kill
+    // the process, so the loser became a permanently orphaned, untracked pair
+    // that stop_existing_daemon/kill_child_tree could never reach again. Holding
+    // the guard here makes the whole sequence atomic: a second caller sees
+    // child_guard.is_some() and returns the already-running status instead of
+    // spawning a duplicate.
+    let mut child_guard = state.child.lock().map_err(|_| "daemon child lock failed")?;
+    if let Some(proc) = child_guard.as_mut() {
+        // Live-check rather than trust the handle, mirroring daemon_status() —
+        // but we can't call daemon_status() here, it re-locks state.child and
+        // this guard is already held (std::sync::Mutex is not reentrant).
+        match proc.try_wait() {
+            Ok(None) => return Ok(status_from_locked_child(state, true)),
+            _ => {
+                *child_guard = None; // dead — fall through and start a fresh one
+            }
+        }
+    }
+
     let runtime = resolve_ares_runtime(Some(&app)).ok_or_else(|| {
         "Could not find Ares runtime. Rebuild the desktop runtime before launching the app."
             .to_string()
@@ -284,45 +300,46 @@ fn start_daemon(
         let mut stdin_state = state.stdin.lock().map_err(|_| "daemon stdin lock failed")?;
         *stdin_state = Some(stdin);
     }
-    {
-        let mut child_state = state.child.lock().map_err(|_| "daemon child lock failed")?;
-        *child_state = Some(child);
-    }
+    // Store into the still-held child_guard rather than re-locking — re-locking
+    // here would reopen the exact TOCTOU window this fix closes.
+    *child_guard = Some(child);
 
     // Own the Garrison gateway (the Telegram-bridge host) as a tracked child so it
     // dies WITH the app — closing Ares now stops the bridge too. Best-effort: if
     // the gateway can't start (e.g. a stale manual `garrison serve` still holds the
-    // port), the desktop session works fine; we just surface the error.
+    // port), the desktop session works fine; we just surface the error. Gated on
+    // its own lock, held across spawn-and-store, for the same reason as above.
     {
-        let mut garrison_cmd = Command::new(&runtime.node);
-        garrison_cmd.arg(&runtime.cli_entry).arg("garrison").arg("serve");
-        #[cfg(windows)]
-        {
-            garrison_cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        if bundled_browsers.is_dir() {
-            garrison_cmd.env("PLAYWRIGHT_BROWSERS_PATH", &bundled_browsers);
-        }
-        match garrison_cmd
-            .current_dir(&runtime.workspace)
-            .env("ARES_AGENT_ENABLED", "1")
-            .env("ARES_HOME", desktop_ares_home_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(garrison_child) => {
-                if let Ok(mut g) = state.garrison.lock() {
-                    *g = Some(garrison_child);
-                }
+        let mut garrison_guard = state.garrison.lock().map_err(|_| "daemon garrison lock failed")?;
+        if garrison_guard.is_none() {
+            let mut garrison_cmd = Command::new(&runtime.node);
+            garrison_cmd.arg(&runtime.cli_entry).arg("garrison").arg("serve");
+            #[cfg(windows)]
+            {
+                garrison_cmd.creation_flags(CREATE_NO_WINDOW);
             }
-            Err(error) => push_event_parts(
-                &app,
-                &state.events,
-                &state.next_event_seq,
-                json!({ "type": "desktop_garrison_error", "error": error.to_string() }),
-            ),
+            if bundled_browsers.is_dir() {
+                garrison_cmd.env("PLAYWRIGHT_BROWSERS_PATH", &bundled_browsers);
+            }
+            match garrison_cmd
+                .current_dir(&runtime.workspace)
+                .env("ARES_AGENT_ENABLED", "1")
+                .env("ARES_HOME", desktop_ares_home_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(garrison_child) => {
+                    *garrison_guard = Some(garrison_child);
+                }
+                Err(error) => push_event_parts(
+                    &app,
+                    &state.events,
+                    &state.next_event_seq,
+                    json!({ "type": "desktop_garrison_error", "error": error.to_string() }),
+                ),
+            }
         }
     }
 
@@ -582,14 +599,38 @@ fn ares_export_log(content: String) -> Result<String, String> {
     Ok(path.display().to_string())
 }
 
+/// `ares_read_text_file` is a registered #[tauri::command] — reachable from ANY
+/// JS in the webview via invoke(), not just its one current caller (HoloSpec
+/// preview). Confine reads to Ares-controlled roots (the desktop workspace and
+/// the Ares home/forge dir) so it can't be turned into an arbitrary-path file
+/// read. Mirrors the confinement discipline resolveWorkspacePath() already
+/// enforces on the TypeScript side (packages/tools/src/_shared.ts), enforced
+/// here independently in the native layer.
+fn allowed_read_roots() -> Vec<PathBuf> {
+    let mut roots = vec![desktop_workspace_dir()];
+    if let Some(home) = desktop_ares_home() {
+        roots.push(home);
+    }
+    roots
+        .into_iter()
+        .filter_map(|root| fs::canonicalize(&root).ok())
+        .collect()
+}
+
 #[tauri::command]
 fn ares_read_text_file(path: String) -> Result<String, String> {
-    let path = PathBuf::from(path);
-    let meta = fs::metadata(&path).map_err(|error| format!("cannot stat file: {error}"))?;
+    let requested = PathBuf::from(path);
+    let canonical = fs::canonicalize(&requested)
+        .map_err(|error| format!("cannot stat file: {error}"))?;
+    let roots = allowed_read_roots();
+    if !roots.iter().any(|root| canonical.starts_with(root)) {
+        return Err("file is outside the Ares workspace/home — refusing to read".to_string());
+    }
+    let meta = fs::metadata(&canonical).map_err(|error| format!("cannot stat file: {error}"))?;
     if meta.len() > 4_000_000 {
         return Err("file too large to preview".to_string());
     }
-    fs::read_to_string(&path).map_err(|error| format!("cannot read file: {error}"))
+    fs::read_to_string(&canonical).map_err(|error| format!("cannot read file: {error}"))
 }
 
 #[tauri::command]
@@ -944,6 +985,15 @@ fn daemon_status(state: &DaemonState) -> DaemonStatus {
             },
         })
         .unwrap_or(false);
+    status_from_locked_child(state, running)
+}
+
+/// Build a DaemonStatus from the root/provider/model locks without touching
+/// state.child — for callers that already hold the child MutexGuard (e.g.
+/// start_daemon()'s already-running early-return) and would deadlock on
+/// std::sync::Mutex's non-reentrant lock() if they went through
+/// daemon_status() instead.
+fn status_from_locked_child(state: &DaemonState, running: bool) -> DaemonStatus {
     let root = state
         .root
         .lock()
