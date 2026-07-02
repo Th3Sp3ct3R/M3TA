@@ -22,9 +22,18 @@ const inputSchema = z
       .int()
       .positive()
       .optional()
-      .describe("Maximum lines to read. Omit for whole file."),
+      .describe("Maximum lines to read. Defaults to 2000; the result says how to continue when truncated."),
   })
   .strict();
+
+/** Default window when the caller passes no limit — one Read of a 10MB log
+ *  must never build a 10MB tool result. Tunable: ARES_READ_MAX_LINES. */
+const DEFAULT_READ_LINES = (() => {
+  const raw = Number(process.env.ARES_READ_MAX_LINES);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 2_000;
+})();
+/** Minified bundles / data blobs: one pathological line can't flood context. */
+const MAX_LINE_CHARS = 4_000;
 
 export interface ReadOutput {
   path: string;
@@ -167,8 +176,10 @@ export const ReadTool = buildTool({
     const lines = raw.split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
     const total = lines.length;
     const start = i.offset ?? 0;
-    const end = i.limit !== undefined ? Math.min(total, start + i.limit) : total;
-    const slice = lines.slice(start, end);
+    const end = Math.min(total, start + (i.limit ?? DEFAULT_READ_LINES));
+    const slice = lines
+      .slice(start, end)
+      .map((l) => (l.length > MAX_LINE_CHARS ? `${l.slice(0, MAX_LINE_CHARS)}… [line truncated: ${l.length} chars total]` : l));
 
     const formatted = slice
       .map((line, idx) => {
