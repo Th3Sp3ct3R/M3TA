@@ -15,6 +15,7 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import { aresHome } from "../paths.js";
 import { contentHash } from "./embedIndex.js";
+import { MemoryRouter, type RoutedWrite } from "./router.js";
 import type { MemoryStore } from "./store.js";
 
 export const V4_PROVENANCE_TAG = "v4-vector-store";
@@ -63,40 +64,29 @@ export async function migrateLegacyVectors(opts: {
   }
   const rows = legacyRows(raw);
 
-  const present = new Set<string>();
-  for (const node of opts.store.all()) {
-    for (const tag of node.tags ?? []) {
-      if (tag.startsWith("v4-hash:")) present.add(tag.slice("v4-hash:".length));
-    }
-  }
-
-  let migrated = 0;
-  let skipped = 0;
+  // Shape every row into a typed write; the router's "v4-migration" channel owns
+  // the idempotency (v4-hash: tag dedupe, intra-batch included) and flushes the
+  // whole batch with ONE persist instead of the old per-row full-file rewrite.
+  const writes: RoutedWrite[] = [];
   for (const row of rows) {
     const content = typeof row.content === "string" ? row.content.trim() : "";
     if (!content) {
-      skipped++;
+      writes.push({ kind: "semantic", content: "" }); // counted as skipped by the router
       continue;
     }
-    const hash = contentHash(content);
-    if (present.has(hash)) {
-      skipped++;
-      continue;
-    }
-    const tags = [V4_PROVENANCE_TAG, `v4-hash:${hash}`];
+    const tags = [V4_PROVENANCE_TAG, `v4-hash:${contentHash(content)}`];
     if (typeof row.category === "string" && row.category) {
       tags.push(`v4-category:${row.category.toLowerCase()}`);
     }
     const score = typeof row.score === "number" && Number.isFinite(row.score) ? row.score : 1;
-    await opts.store.add({
+    writes.push({
       kind: "semantic",
       content,
       tags,
       source: V4_PROVENANCE_TAG,
       strength: Math.min(3, Math.max(0.5, score)),
     });
-    present.add(hash);
-    migrated++;
   }
-  return { scanned: rows.length, migrated, skipped };
+  const report = await new MemoryRouter(opts.store).write("v4-migration", writes);
+  return { scanned: rows.length, migrated: report.written.length, skipped: report.skipped.length };
 }

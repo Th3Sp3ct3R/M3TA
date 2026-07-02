@@ -16,11 +16,13 @@ import { emitLifecycle } from "../lifecycle/bus.js";
 import { gainForTarget } from "../voice.js";
 import { runSkill } from "../skills/runtime.js";
 import { recordOutcome } from "../self/store.js";
+import { SKILL_NAME } from "./SkillCraft.js";
 
 const inputSchema = z
   .object({
     name: z
       .string()
+      .regex(SKILL_NAME, "must be lowercase letters, digits, _ or - (no path separators or '..')")
       .describe("Name of the skill to run (the directory under ~/.ares/skills/). Must have a handler.js."),
     input: z
       .unknown()

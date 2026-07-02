@@ -39,6 +39,8 @@ export interface AddInput {
   at?: Date;
   status?: HypothesisStatus;
   check?: CrucibleCheck;
+  /** Tenant this node belongs to (e.g. a Telegram chatId). Absent = the owner. */
+  scope?: string;
 }
 
 export interface SynthesisReport {
@@ -68,6 +70,17 @@ const THEME_STOPWORDS = new Set([
 
 function resolveFile(root: string): string {
   return root.endsWith(".jsonl") ? root : path.join(root, "memory.jsonl");
+}
+
+/**
+ * Filter a node pool by tenant scope. `undefined` scope (the default, backward
+ * compatible) returns the pool untouched. A given `scope` keeps nodes stamped
+ * with that exact scope PLUS unscoped nodes (pre-existing/owner memories) —
+ * never nodes belonging to a DIFFERENT scope, which is the actual isolation.
+ */
+function scopedNodes(nodes: readonly MemoryNode[], scope: string | undefined): readonly MemoryNode[] {
+  if (scope === undefined) return nodes;
+  return nodes.filter((n) => n.scope === scope || n.scope === undefined);
 }
 
 function salientTokens(content: string): string[] {
@@ -201,6 +214,7 @@ export class MemoryStore {
       source: input.source,
       status: input.status,
       check: input.check,
+      scope: input.scope,
     };
     this.nodes.set(node.id, node);
     return node;
@@ -389,13 +403,34 @@ export class MemoryStore {
   }
 
   /**
+   * Forget a single memory node by id — the public counterpart to consolidate()'s
+   * internal auto-prune. Until now the only way to remove a node was to be a weak
+   * episodic memory caught by consolidate(); there was no way for a human (or an
+   * `ares mind forget <id>` command) to delete one on purpose. Returns whether a
+   * node with that id existed and was removed.
+   */
+  async forget(id: string): Promise<boolean> {
+    const existed = this.nodes.has(id);
+    if (!existed) return false;
+    this.deleteNode(id);
+    await this.persist();
+    return true;
+  }
+
+  /**
    * Recall a constellation of memories AND strengthen them. Surfacing a memory
    * reinforces it (so what's used stays vivid), and the top co-activated pair is
    * linked (Hebbian association forms from use).
+   *
+   * `scope` restricts the candidate pool to nodes owned by that tenant PLUS
+   * unscoped (owner) nodes — never the reverse, so a guest scope can never see
+   * another tenant's memories, and omitting scope entirely (the default) recalls
+   * exactly as before.
    */
-  async remember(cue: string, opts: RecallOptions = {}): Promise<RecallResult[]> {
+  async remember(cue: string, opts: RecallOptions & { scope?: string } = {}): Promise<RecallResult[]> {
     const now = opts.now ?? new Date();
-    const results = recall(cue, this.all(), await this.withCueVectors(cue, opts));
+    const pool = scopedNodes(this.all(), opts.scope);
+    const results = recall(cue, pool, await this.withCueVectors(cue, opts));
     for (const r of results) {
       const current = this.nodes.get(r.node.id);
       if (current) this.nodes.set(current.id, reinforce(current, now));
@@ -409,9 +444,11 @@ export class MemoryStore {
    * Read-only recall: surface the same constellation as remember() but WITHOUT
    * reinforcing, linking, or persisting. For inspection paths (status recaps,
    * "what were we doing?") that must not mutate memory just by looking.
+   *
+   * `scope` behaves exactly as in remember() — see there.
    */
-  peek(cue: string, opts: RecallOptions = {}): RecallResult[] {
-    return recall(cue, this.all(), opts);
+  peek(cue: string, opts: RecallOptions & { scope?: string } = {}): RecallResult[] {
+    return recall(cue, scopedNodes(this.all(), opts.scope), opts);
   }
 
   /** Sleep: forget trivial episodes; crystallize recurring themes into knowledge. */
@@ -423,8 +460,19 @@ export class MemoryStore {
 
     // 1. Forget faded one-off episodes and stale filler "theme" semantics.
     for (const node of this.all()) {
-      // Never prune crystallized insight/belief nodes the deep dream synthesized.
-      if (node.source === "synthesis") continue;
+      // Crystallized insight/belief nodes the deep dream synthesized are normally
+      // spared pruning — but not unconditionally: a synthesized belief that keeps
+      // getting DISPROVEN via recordOutcome (driven down to PRUNE_FLOOR by repeat
+      // losses) is dead weight forever otherwise, a near-zero-strength node that
+      // still surfaces as a recall candidate. Require enough evidence (>=3) so a
+      // single early loss can't kill a fresh insight, and a losing majority.
+      if (node.source === "synthesis") {
+        if (isDisprovenSynthesis(node, now)) {
+          this.deleteNode(node.id);
+          pruned++;
+        }
+        continue;
+      }
       if (node.kind === "episodic" && currentStrength(node, now) < PRUNE_FLOOR) {
         this.deleteNode(node.id);
         pruned++;
@@ -670,6 +718,22 @@ function isThemeEligibleEpisode(node: MemoryNode): boolean {
   if (/^(lol|lmao|haha|bet|ok|okay|cool|nice|word|true|facts|nun much|nothing much)\b/.test(content)) return false;
   if (/^decided to answer the user by using the strongest available tools\b/.test(content)) return false;
   return salientTokens(content).length >= 2;
+}
+
+const MIN_PRUNE_EVIDENCE = 3;
+
+/**
+ * True when a synthesized (insight/belief) node has been driven to (or near)
+ * PRUNE_FLOOR by repeated recordOutcome losses — i.e. reality kept disproving
+ * it. Requires at least MIN_PRUNE_EVIDENCE outcomes with a losing majority so
+ * one bad early trial can't prune a belief that hasn't had a fair shake yet.
+ */
+function isDisprovenSynthesis(node: MemoryNode, now: Date): boolean {
+  const evidence = node.evidence ?? [];
+  if (evidence.length < MIN_PRUNE_EVIDENCE) return false;
+  const losses = evidence.filter((e) => !e.won).length;
+  if (losses <= evidence.length / 2) return false;
+  return currentStrength(node, now) < PRUNE_FLOOR;
 }
 
 function isNoiseThemeSemantic(node: MemoryNode): boolean {

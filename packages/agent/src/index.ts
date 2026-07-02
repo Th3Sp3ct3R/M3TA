@@ -17,7 +17,13 @@ export { createMemoryStore, formatRecallReminder, type MemoryStore } from "./mem
 export type { AddMemoryInput, MemoryCategory, MemoryEntry, MemoryStoreStatus, RecallInput, RecallResult, CanonicalMemoryInput } from "./memory/types.js";
 export { memoryEntryToCanonical } from "./memory/types.js";
 export { onLifecycle, emitLifecycle, type LifecycleEvent, type DreamPhase } from "./lifecycle/bus.js";
-export { runHeartbeatTick, startHeartbeatLoop, type HeartbeatResult } from "./heartbeat.js";
+export { runHeartbeatTick, startHeartbeatLoop, heartbeatPass, heartbeatEveryMs, type HeartbeatResult } from "./heartbeat.js";
+export {
+  ReflectionScheduler,
+  type ReflectionTrigger,
+  type ReflectionPassFn,
+  type ReflectionPassOutcome,
+} from "./reflection/scheduler.js";
 export { runLightDream, runDeepDream, runRemDream, type DreamResult } from "./dreaming.js";
 export { recallForTurn, type RecallOptions } from "./recall.js";
 export {

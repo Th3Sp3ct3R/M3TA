@@ -18,7 +18,10 @@ import { emitLifecycle } from "../lifecycle/bus.js";
 import { gainForTarget } from "../voice.js";
 import { dropCapability, upsertCapability } from "../self/store.js";
 
-const SKILL_NAME = /^[a-z0-9][a-z0-9_-]{1,63}$/;
+// Exported so RunSkill (runtime.ts) can validate `name` before ever touching
+// disk — path.join does NOT clamp ".." segments, so an unvalidated name walks
+// straight out of skillsDir.
+export const SKILL_NAME = /^[a-z0-9][a-z0-9_-]{1,63}$/;
 
 const inputSchema = z
   .object({

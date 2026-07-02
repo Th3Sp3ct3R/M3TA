@@ -95,8 +95,10 @@ export interface MemoryNode {
   source?: string;
   /** Owning tenant for multi-user isolation (e.g. per-Telegram-user). Absent =
    *  the owner. Additive + optional, so no schema-version bump: older binaries
-   *  ignore it, newer ones default it to the owner. Recall/write filtering is
-   *  wired in Phase 2 (memory unification); inert until then. */
+   *  ignore it, newer ones default it to the owner. Recall (remember()/peek())
+   *  and write (add()) accept an optional scope filter/stamp — see MemoryStore —
+   *  so a guest scope only ever sees its own nodes plus the unscoped owner pool,
+   *  and never leaks new memories back into it. */
   scope?: string;
   /** Confidence (0..1) for a synthesized belief/insight. Absent on raw episodes. */
   confidence?: number;

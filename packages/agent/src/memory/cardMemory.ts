@@ -5,7 +5,7 @@
 // Idempotency is keyed on the card id via the memory `source`: re-running
 // `ares mission learn` on the same mission never plants a duplicate lesson.
 
-import type { MemoryStore } from "@ares/mind";
+import { MemoryRouter, type MemoryStore } from "@ares/mind";
 
 /** Tag stamped on every card lesson — the dedicated provenance marker. `source`
  *  is a freeform string overloaded by many subsystems (light-dreaming, synthesis,
@@ -21,19 +21,16 @@ export interface CardMemoryInput {
   tags?: string[];
 }
 
-/** Returns true if a new memory was written, false if the card was already recorded. */
+/** Returns true if a new memory was written, false if the card was already recorded.
+ *  Idempotency lives in the ONE write spine: the router's "card" channel dedupes
+ *  on source id + the card provenance tag, so a same-id memory from an unrelated
+ *  subsystem can never masquerade as this card's recorded lesson. */
 export async function recordCardMemoryOnce(store: MemoryStore, input: CardMemoryInput): Promise<boolean> {
-  // Dedup on source AND the card provenance tag, so a same-id memory from an
-  // unrelated subsystem can never masquerade as this card's recorded lesson.
-  const already = store.all().some(
-    (node) => node.source === input.id && (node.tags?.includes(CARD_PROVENANCE_TAG) ?? false),
-  );
-  if (already) return false;
-  await store.add({
+  const report = await new MemoryRouter(store).write("card", [{
     kind: "procedural",
     content: input.summary,
     tags: ["lesson", CARD_PROVENANCE_TAG, ...(input.tags ?? [])],
     source: input.id,
-  });
-  return true;
+  }]);
+  return report.written.length > 0;
 }

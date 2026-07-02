@@ -11,7 +11,7 @@
 // The distillation itself is an LLM call (the daemon supplies it via sideQueryJson);
 // everything here is pure + testable: build the digest, dedup, write.
 
-import { jaccard, tokenizeSalient } from "./idf.js";
+import { MemoryRouter, type RouterStoreLike } from "./router.js";
 import type { ReflectionResult, ReflectionSurface } from "./types.js";
 
 export type DurableFactKind = "preference" | "fact" | "decision" | "relationship" | "skill";
@@ -58,25 +58,6 @@ export function buildConversationDigest(
   return digest;
 }
 
-/** Normalize for dedup: lowercase, strip punctuation, collapse whitespace. */
-function normalizeFact(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-}
-
-/** True when `fact` says substantially the same thing as something already stored
- *  (salient-token Jaccard over the threshold). Cheap, no embeddings. */
-function isDuplicate(factContent: string, existing: readonly string[], threshold = 0.55): boolean {
-  const a = tokenizeSalient(normalizeFact(factContent));
-  if (a.length === 0) return true; // nothing salient → not worth storing
-  const aSet = new Set(a);
-  for (const prior of existing) {
-    const b = new Set(tokenizeSalient(normalizeFact(prior)));
-    if (b.size === 0) continue;
-    if (jaccard(aSet, b) >= threshold) return true;
-  }
-  return false;
-}
-
 /** One semantic-fact add input — what mergeDurableFacts hands the store. */
 type DurableAddInput = { kind: "semantic"; content: string; tags?: string[]; source?: string; strength?: number };
 
@@ -97,45 +78,32 @@ export interface MergeFactsResult {
 
 /** Write distilled facts to Living Memory, skipping near-duplicates and anything
  *  below the importance floor. Idempotent across runs: a fact already remembered
- *  (or paraphrased) is not re-added. */
+ *  (or paraphrased) is not re-added. Dedupe + salience gating live in the ONE
+ *  write spine (MemoryRouter "conversation" channel); this pass only shapes the
+ *  facts into typed writes. */
 export async function mergeDurableFacts(
   store: ReflectStoreLike,
   facts: ReadonlyArray<DurableFact>,
   opts: { minImportance?: number } = {},
 ): Promise<MergeFactsResult> {
-  const minImportance = opts.minImportance ?? 0.4;
-  const existing = store.all().map((n) => n.content);
-  const accepted = [...existing];
-  const result: MergeFactsResult = { added: 0, skipped: 0, addedFacts: [] };
-  // Accumulate accepted adds and flush them in ONE write (addMany) when the store
-  // supports it — looping add() rewrote the whole memory file once per fact (O(N²)).
-  const pending: DurableAddInput[] = [];
-
-  for (const fact of facts) {
-    const content = (fact.content ?? "").trim();
-    if (!content || content.length < 6) { result.skipped++; continue; }
-    if ((fact.importance ?? 0) < minImportance) { result.skipped++; continue; }
-    if (isDuplicate(content, accepted)) { result.skipped++; continue; }
-    pending.push({
-      kind: "semantic",
-      content,
+  const router = new MemoryRouter(store as RouterStoreLike);
+  const report = await router.write(
+    "conversation",
+    facts.map((fact) => ({
+      kind: "semantic" as const,
+      content: (fact.content ?? "").trim(),
       tags: ["reflected", "conversation", fact.kind],
       source: "conversation-reflection",
       strength: Math.max(1, Math.round((fact.importance ?? 0.5) * 3)),
-    });
-    accepted.push(content); // a later fact in the same batch dedups against this one
-    result.added++;
-    result.addedFacts.push(content);
-  }
-
-  if (pending.length > 0) {
-    if (store.addMany) {
-      await store.addMany(pending); // single flush
-    } else {
-      for (const input of pending) await store.add(input);
-    }
-  }
-  return result;
+      salience: fact.importance ?? 0,
+    })),
+    opts.minImportance === undefined ? {} : { policy: { minSalience: opts.minImportance } },
+  );
+  return {
+    added: report.written.length,
+    skipped: report.skipped.length,
+    addedFacts: report.written.map((w) => w.input.content),
+  };
 }
 
 /** This pass as a {@link ReflectionSurface}: same mergeDurableFacts(), uniform envelope. */

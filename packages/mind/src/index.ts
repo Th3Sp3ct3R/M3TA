@@ -15,6 +15,19 @@ export {
   type ConsolidationReport,
   type SynthesisReport,
 } from "./memory/store.js";
+export {
+  MemoryRouter,
+  MEMORY_CHANNEL_POLICIES,
+  type MemoryChannel,
+  type ChannelPolicy,
+  type DedupeRule,
+  type RoutedWrite,
+  type RouteReport,
+  type RouteOptions,
+  type RouterStoreLike,
+  type SkipReason,
+} from "./memory/router.js";
+export { withConsolidationLock, type ConsolidationLockOptions } from "./memory/consolidationLock.js";
 export { diagnoseMemory, type MemoryDoctorReport, type DuplicateMemoryGroup } from "./memory/doctor.js";
 export { recall, type RecallResult, type RecallOptions, type RecallVectors } from "./memory/recall.js";
 export {

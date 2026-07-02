@@ -15,7 +15,7 @@
 // dedupes against what the store already knows, and caps volume. A model
 // can propose anything; only disciplined candidates land.
 
-import type { CrucibleCheck, HypothesisStatus, MemoryKind, MemoryNode } from "@ares/mind";
+import { MemoryRouter, type CrucibleCheck, type HypothesisStatus, type MemoryKind, type MemoryNode } from "@ares/mind";
 
 export type WitnessKind = "belief" | "user_fact" | "feedback" | "procedure";
 
@@ -121,27 +121,38 @@ export async function runWitness(opts: WitnessOptions): Promise<WitnessReport> {
   }
   report.proposed = raw.length;
 
-  const known = new Set(opts.store.all().map((n) => normalize(n.content)));
+  // Duplicate detection now lives in the ONE write spine: the router's
+  // "witness" channel dedupes on normalized content against the store (and
+  // against candidates accepted earlier in this same pass, since each accepted
+  // write lands in the store before the next is routed). vetCandidate() keeps
+  // its `known` parameter for direct callers; the runWitness path hands it an
+  // empty set and lets the router judge.
+  const router = new MemoryRouter<MemoryNode>(opts.store);
+  const noKnown: ReadonlySet<string> = new Set();
   for (const item of raw) {
     if (report.accepted.length >= max) {
       report.rejected.push("candidate cap reached");
       break;
     }
-    const verdict = vetCandidate(item, known);
+    const verdict = vetCandidate(item, noKnown);
     if (typeof verdict === "string") {
       report.rejected.push(verdict);
       continue;
     }
-    const node = await opts.store.add({
+    const routed = await router.write("witness", [{
       kind: KIND_TO_MEMORY[verdict.kind],
       content: verdict.claim,
       tags: ["witness", `crucible:${verdict.kind}`],
       source: opts.source,
       status: "candidate",
       check: verdict.check,
-    });
-    known.add(normalize(verdict.claim));
-    report.accepted.push(node);
+    }]);
+    const hit = routed.written[0];
+    if (hit) {
+      report.accepted.push(hit.node);
+    } else {
+      report.rejected.push(`duplicate of an existing memory: "${verdict.claim.slice(0, 60)}"`);
+    }
   }
   return report;
 }

@@ -21,6 +21,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { agentPaths, aresAgentHome } from "../paths.js";
 import { exists, writeFileAtomic } from "../files.js";
+import { SKILL_NAME } from "../tools/SkillCraft.js";
 
 export interface RunSkillOptions {
   home?: string;
@@ -124,11 +125,28 @@ function clampLog(text: string): string {
 }
 
 export async function runSkill(opts: RunSkillOptions): Promise<SkillRunResult> {
+  // Validate before ever touching disk — path.join does not clamp ".." segments,
+  // so an unsanitized name (e.g. "../../../etc/whatever") would walk straight out
+  // of skillsDir. Same pattern SkillCraft enforces on write; enforce it on read too.
+  if (!SKILL_NAME.test(opts.name)) {
+    throw new Error(`skill '${opts.name}' is not a valid skill name`);
+  }
+
   const home = aresAgentHome(opts.home ?? process.env.ARES_HOME);
   const paths = agentPaths(home);
   const skillDir = path.join(paths.skillsDir, opts.name);
+  // Defense-in-depth: confirm the resolved dir still lives under skillsDir.
+  if (!path.resolve(skillDir).startsWith(path.resolve(paths.skillsDir) + path.sep)) {
+    throw new Error(`skill '${opts.name}' resolves outside the skills directory`);
+  }
   const handlerPath = path.join(skillDir, "handler.js");
   const timeoutMs = opts.timeoutMs && opts.timeoutMs > 0 ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
+
+  // Cosmetic-toggle fix: a skill marked disabled (marker file dropped/removed by
+  // entry.ts's skill_toggle handler) must never spawn, not just show as off in the UI.
+  if (await exists(path.join(skillDir, ".disabled"))) {
+    throw new Error(`skill '${opts.name}' is disabled`);
+  }
 
   if (!(await exists(handlerPath))) {
     throw new Error(`skill '${opts.name}' has no handler.js to run (looked in ${skillDir})`);

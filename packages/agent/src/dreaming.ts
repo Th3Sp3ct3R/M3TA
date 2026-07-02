@@ -9,7 +9,7 @@ import { emitLifecycle } from "./lifecycle/bus.js";
 import { loadSelfModel } from "./self/store.js";
 import { reflect } from "./self/reflect.js";
 import { gainForTarget } from "./voice.js";
-import { MemoryStore as LivingMemoryStore, migrateLegacyVectors, mindPaths } from "@ares/mind";
+import { MemoryRouter, MemoryStore as LivingMemoryStore, migrateLegacyVectors, mindPaths } from "@ares/mind";
 
 const DREAM_MEMORY_ITEM_CHARS = 420;
 const DREAM_MEMORY_MAX_ITEMS = 120;
@@ -47,10 +47,16 @@ export async function runLightDream(opts: {
     const living = await LivingMemoryStore.open(mindPaths(home).memoryFile).catch(() => null);
     for (const snippet of snippets) {
       await store.add({ category: classifySignal(snippet), workspace: opts.workspace, content: snippet, source: "light-dreaming", score: 0.55 });
-      // Episodic in v6: a dream candidate is a raw session signal; consolidation
-      // crystallizes the recurring ones into semantic. Best-effort — a dream is
-      // never broken by the living store being unavailable.
-      await living?.add({ kind: "episodic", content: snippet, source: "light-dreaming", strength: 0.55 }).catch(() => undefined);
+    }
+    // Episodic in v6: a dream candidate is a raw session signal; consolidation
+    // crystallizes the recurring ones into semantic. Routed through the ONE
+    // write spine ("dream" channel: ungated — consolidate() merges repeats into
+    // strength later) and flushed as a single batch. Best-effort — a dream is
+    // never broken by the living store being unavailable.
+    if (living) {
+      await new MemoryRouter(living)
+        .write("dream", snippets.map((snippet) => ({ kind: "episodic" as const, content: snippet, source: "light-dreaming", strength: 0.55 })))
+        .catch(() => undefined);
     }
   }
   const report = snippets.length > 0 ? `LIGHT staged ${snippets.length} memory candidate(s).` : "LIGHT found no durable memory candidates.";

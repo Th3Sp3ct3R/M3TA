@@ -12,7 +12,7 @@
 // Probes touch the real world, so the runner is injectable and the default
 // only runs the two check kinds the Witness intake vets as read-only.
 
-import type { CrucibleCheck, HypothesisStatus, MemoryNode } from "@ares/mind";
+import { MemoryRouter, type CrucibleCheck, type HypothesisStatus, type MemoryNode } from "@ares/mind";
 import { runProbe, type ProbeContext, type ProbeResult } from "./probe.js";
 import type { VerificationSpec } from "./types.js";
 
@@ -118,13 +118,14 @@ export async function runCrucibleTrials(opts: CrucibleTrialOptions): Promise<Tri
     if (action === "demoted") await opts.store.setStatus(node.id, "candidate", reason, { now: now() });
     if (action === "archived") {
       await opts.store.setStatus(node.id, "archived", reason, { now: now() });
-      // The failure itself is a learning — write the post-mortem back.
-      await opts.store.add({
+      // The failure itself is a learning — write the post-mortem back through
+      // the witness channel (exact-content dedupe on re-trials).
+      await new MemoryRouter(opts.store).write("witness", [{
         kind: "semantic",
         content: `Archived hypothesis: "${node.content.slice(0, 160)}" — ${reason}`,
         tags: ["crucible", "post-mortem"],
         source: node.id,
-      });
+      }]);
     }
   };
 

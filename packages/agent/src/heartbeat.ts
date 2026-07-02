@@ -9,6 +9,7 @@ import { emitLifecycle } from "./lifecycle/bus.js";
 import { loadSelfModel } from "./self/store.js";
 import { reflect } from "./self/reflect.js";
 import { gainForTarget } from "./voice.js";
+import { ReflectionScheduler } from "./reflection/scheduler.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -49,22 +50,41 @@ export async function runHeartbeatTick(opts: {
   return { status: "alert", text: findings.join("\n").slice(0, opts.config.heartbeat.ackMaxChars), tasks };
 }
 
+/** The heartbeat tick as a scheduler pass: run it, surface alerts/errors through
+ *  `onAlert`, never throw. The ReflectionScheduler owns the cadence. */
+export function heartbeatPass(opts: {
+  home?: string;
+  workspace: string;
+  config: AresAgentConfig;
+  onAlert: (text: string) => void;
+}): (ctx: { now: Date }) => Promise<void> {
+  return async ({ now }) => {
+    try {
+      const result = await runHeartbeatTick({ ...opts, reason: "interval", now });
+      if (result.status === "alert") opts.onAlert(result.text);
+    } catch (err) {
+      opts.onAlert(`Heartbeat failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+}
+
+/** Back-compat shim: the heartbeat no longer owns a timer — the ONE
+ *  ReflectionScheduler does. Same signature, same behavior, one timer owner. */
 export function startHeartbeatLoop(opts: {
   home?: string;
   workspace: string;
   config: AresAgentConfig;
   onAlert: (text: string) => void;
 }): () => void {
-  const everyMs = parseDurationMs(opts.config.heartbeat.every, 30 * 60_000);
-  const timer = setInterval(() => {
-    void runHeartbeatTick({ ...opts, reason: "interval" })
-      .then((result) => {
-        if (result.status === "alert") opts.onAlert(result.text);
-      })
-      .catch((err) => opts.onAlert(`Heartbeat failed: ${err instanceof Error ? err.message : String(err)}`));
-  }, everyMs);
-  timer.unref?.();
-  return () => clearInterval(timer);
+  const scheduler = new ReflectionScheduler();
+  scheduler.register("interval", "heartbeat", heartbeatPass(opts));
+  scheduler.start(heartbeatEveryMs(opts.config));
+  return () => scheduler.stop();
+}
+
+/** The configured heartbeat interval in ms (default 30 minutes). */
+export function heartbeatEveryMs(config: AresAgentConfig): number {
+  return parseDurationMs(config.heartbeat.every, 30 * 60_000);
 }
 
 async function reflectHeartbeat(home: string): Promise<string[]> {

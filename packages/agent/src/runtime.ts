@@ -4,8 +4,9 @@ import { ensureAgentScaffold, bootstrapReminder } from "./bootstrap/bootstrap.js
 import { loadAgentConfig, type AresAgentConfig } from "./config.js";
 import { composeAgentSystemPrompt, loadAgentSystemContext, type AgentSystemContext } from "./identity/context.js";
 import { runLightDream } from "./dreaming.js";
-import { MemoryStore as LivingMemoryStore, mindPaths } from "@ares/mind";
-import { startHeartbeatLoop } from "./heartbeat.js";
+import { MemoryStore as LivingMemoryStore, mindPaths, withConsolidationLock } from "@ares/mind";
+import { heartbeatEveryMs, heartbeatPass } from "./heartbeat.js";
+import { ReflectionScheduler } from "./reflection/scheduler.js";
 import { emitLifecycle } from "./lifecycle/bus.js";
 import { captureUserMessage } from "./capture.js";
 import { snapshotBrain } from "./persistence.js";
@@ -51,7 +52,9 @@ export async function prepareAresAgent(opts: {
 }
 
 export class AresAgentRuntime {
-  private stopHeartbeat: (() => void) | undefined;
+  /** The ONE reflection scheduler: owns the heartbeat timer AND the session-end
+   *  reflection passes (light dream, consolidate). No pass owns its own timer. */
+  private scheduler: ReflectionScheduler | undefined;
 
   constructor(
     readonly prepared: PreparedAgent,
@@ -69,7 +72,9 @@ export class AresAgentRuntime {
     // or accidental corruption can always be rolled back. Runs in the
     // background — never blocks the session loop.
     void snapshotBrain({ home: this.prepared.home, id: `snap_${this.opts.sessionId}` }).catch(() => undefined);
-    this.stopHeartbeat = startHeartbeatLoop({
+
+    const scheduler = new ReflectionScheduler();
+    scheduler.register("interval", "heartbeat", heartbeatPass({
       home: this.prepared.home,
       workspace: this.opts.workspace,
       config: this.prepared.config,
@@ -80,12 +85,41 @@ export class AresAgentRuntime {
           `BACKGROUND SIGNAL (ambient self-check — not a request, do not act on it unless it bears on the user's current message): ${text}`,
           "memory",
         ),
+    }));
+    this.registerSessionEndPasses(scheduler);
+    scheduler.start(heartbeatEveryMs(this.prepared.config));
+    this.scheduler = scheduler;
+  }
+
+  /** Session-end reflection: stage 1 distills the transcript into dream
+   *  candidates; stage 2 consolidates the living store — prune faded
+   *  episodics, dedupe, promote themes. Without a scheduled invoker the store
+   *  grows append-only and the dedupe/theme passes never fire (3-month rot). */
+  private registerSessionEndPasses(scheduler: ReflectionScheduler): void {
+    scheduler.register("sessionEnd", "light-dream", async () => {
+      await runLightDream({
+        home: this.prepared.home,
+        workspace: this.opts.workspace,
+        sessionId: this.opts.sessionId,
+        transcriptPath: this.transcriptPath ?? path.join(this.opts.workspace, ".ares", "sessions", this.opts.sessionId, "events.jsonl"),
+        config: this.prepared.config,
+      }).catch(() => undefined);
+    });
+    scheduler.register("sessionEnd", "consolidate", async ({ now }) => {
+      const memoryFile = mindPaths(this.prepared.home).memoryFile;
+      // Cross-process lock: daemon + garrison both reflect over the same
+      // ~/.ares — a concurrent consolidate() from another process would
+      // clobber this one's persist(). Skipping under contention is safe.
+      await withConsolidationLock(memoryFile, async () => {
+        const store = await LivingMemoryStore.open(memoryFile);
+        await store.consolidate({ now });
+      }).catch(() => undefined);
     });
   }
 
   stop(): void {
-    this.stopHeartbeat?.();
-    this.stopHeartbeat = undefined;
+    this.scheduler?.stop();
+    this.scheduler = undefined;
     emitLifecycle({ type: "session_ended", sessionId: this.opts.sessionId });
   }
 
@@ -111,18 +145,17 @@ export class AresAgentRuntime {
 
   async sessionEnded(transcriptPath?: string): Promise<void> {
     if (!this.prepared.enabled || !this.prepared.config.dreaming.enabled) return;
-    await runLightDream({
-      home: this.prepared.home,
-      workspace: this.opts.workspace,
-      sessionId: this.opts.sessionId,
-      transcriptPath: transcriptPath ?? path.join(this.opts.workspace, ".ares", "sessions", this.opts.sessionId, "events.jsonl"),
-      config: this.prepared.config,
-    }).catch(() => undefined);
-    // Consolidate the v6 living store on session end — prune faded episodics,
-    // dedupe, promote themes. Without a scheduled invoker the store grows
-    // append-only and the dedupe/theme passes never fire (3-month rot).
-    await LivingMemoryStore.open(mindPaths(this.prepared.home).memoryFile)
-      .then((store) => store.consolidate())
-      .catch(() => undefined);
+    this.transcriptPath = transcriptPath;
+    // A runtime that was never start()ed (some sessions skip the heartbeat)
+    // still reflects through the single scheduler path — a transient, timerless
+    // scheduler with the same passes, fired once.
+    let scheduler = this.scheduler;
+    if (!scheduler) {
+      scheduler = new ReflectionScheduler();
+      this.registerSessionEndPasses(scheduler);
+    }
+    await scheduler.fire("sessionEnd");
   }
+
+  private transcriptPath: string | undefined;
 }
