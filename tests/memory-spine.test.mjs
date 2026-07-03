@@ -256,10 +256,13 @@ test("lock: a held lock makes the second reflector skip, and releases after", as
   const memoryFile = path.join(dir, "memory.jsonl");
   let releaseFirst;
   const holdGate = new Promise((r) => { releaseFirst = r; });
-  let firstRan = false;
-  const first = withConsolidationLock(memoryFile, async () => { firstRan = true; await holdGate; return "first"; });
-  await sleep(20);
-  assert.equal(firstRan, true);
+  // The first holder SIGNALS the instant it's inside the critical section, so
+  // the test never guesses how long acquisition takes (a fixed sleep flakes
+  // under CI load — the async body may not have run yet). Deterministic.
+  let announceHeld;
+  const held = new Promise((r) => { announceHeld = r; });
+  const first = withConsolidationLock(memoryFile, async () => { announceHeld(); await holdGate; return "first"; });
+  await held; // the lock is provably held now
   const second = await withConsolidationLock(memoryFile, async () => "second");
   assert.equal(second, undefined, "contended pass is skipped, never queued");
   releaseFirst();

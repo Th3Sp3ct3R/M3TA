@@ -183,7 +183,13 @@ test("engine: interrupt() stops the current turn; the next turn is unaffected", 
   const run = (async () => {
     for await (const e of session.send("long task")) events.push(e);
   })();
-  await new Promise((r) => setTimeout(r, 80));
+  // Interrupt only ONCE the turn is provably streaming (its first text_delta
+  // has landed) — a fixed sleep races the generator's startup under CI load.
+  const deadline = Date.now() + 5000;
+  while (!events.some((e) => e.type === "text_delta") && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.ok(events.some((e) => e.type === "text_delta"), "the turn started streaming before interrupt");
   session.interrupt();
   await run;
   assert.equal(events.at(-1)?.type, "turn_end");

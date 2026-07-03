@@ -142,10 +142,24 @@ test("fan-out: one tool failing leaves its siblings' results intact", async () =
 
 test("task: two Task calls run their subagents in parallel", async () => {
   const tmp = await makeTmp();
+  // Prove parallelism STRUCTURALLY, not by wall-clock: track how many subagent
+  // streams are in-flight at once. A wall-clock threshold flakes under CI load
+  // (starvation inflates even genuinely-parallel runs); peak concurrency does
+  // not. Each stream waits on a gate released only when BOTH have started, so a
+  // sequential runner leaves peak at 1 and the assert fails loud (the 2nd never
+  // starts, the 1st releases via the 1s fallback — no hang).
+  let inFlight = 0;
+  let peak = 0;
+  let openGate;
+  const bothStarted = new Promise((r) => { openGate = r; });
   const slowSubProvider = {
     name: "slowsub",
     async *stream() {
-      await new Promise((r) => setTimeout(r, 300));
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      if (inFlight >= 2) openGate();
+      await Promise.race([bothStarted, new Promise((r) => setTimeout(r, 1000))]);
+      inFlight--;
       yield { type: "message_done", message: { id: "s", role: "assistant", content: [{ type: "text", text: "sub done" }], createdAt: new Date().toISOString() }, usage: { inputTokens: 1, outputTokens: 0 }, stopReason: "end_turn" };
     },
   };
@@ -154,7 +168,7 @@ test("task: two Task calls run their subagents in parallel", async () => {
   const taskTool = adaptToolForEngine(makeTaskTool(runner), (base) => ({ ...base, permissionMode: "bypass", fileReadStamps: base.fileReadStamps ?? new Map() }));
 
   const calls = [0, 1].map((i) => ({ id: `task${i}`, name: "Task", input: { subagent_type: "worker", description: `d${i}`, prompt: "work" } }));
-  const { elapsed, history } = await runTurn(batchProvider(calls), [taskTool], tmp);
-  assert.ok(elapsed < 540, `two 300ms Task subagents ran in parallel (${elapsed}ms), not ~600ms sequential`);
+  const { history } = await runTurn(batchProvider(calls), [taskTool], tmp);
+  assert.equal(peak, 2, `both Task subagents were in-flight at once (peak concurrency ${peak})`);
   assert.equal(toolResultIds(history).length, 2, "both Task calls returned results");
 });
