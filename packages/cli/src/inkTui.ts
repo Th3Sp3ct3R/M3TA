@@ -810,22 +810,36 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
   }, [append]);
 
   // Paired tool flow: tool_start opens a "▸ Name desc" line; tool_end/_error
-  // stamps the ✓/✗ result onto that same line (the mockup's `▸ Read … ✓ 1.2k`).
-  const toolLineRef = useRef<number | null>(null);
-  const appendToolLine = useCallback((name: string, desc: string) => {
+  // stamps the ✓/✗ result onto that SAME line — keyed by the tool_use id, not
+  // a single ref. The old single-ref version broke on PARALLEL tool calls:
+  // three tools fired together, each start clobbered the ref, so only the
+  // last-started line ever completed — the rest spun at "21m…" forever while
+  // their results landed as orphan lines. THE hang illusion, fixed for real.
+  const toolLinesById = useRef(new Map<string, number>());
+  const appendToolLine = useCallback((toolUseId: string, name: string, desc: string) => {
     const id = lineId.current++;
     setLines((prev) => [...prev, { id, tone: "tool" as const, text: desc, meta: name, startedAt: Date.now() }].slice(-600));
-    toolLineRef.current = id;
+    toolLinesById.current.set(toolUseId, id);
   }, []);
-  const finishToolLine = useCallback((ok: boolean, text: string, durationMs?: number) => {
-    const id = toolLineRef.current;
-    toolLineRef.current = null;
+  const finishToolLine = useCallback((toolUseId: string, ok: boolean, text: string, durationMs?: number) => {
+    const id = toolLinesById.current.get(toolUseId);
+    toolLinesById.current.delete(toolUseId);
     if (id == null) {
       append(ok ? "tool" : "error", text, ok ? "ok" : "tool");
       return;
     }
     setLines((prev) => prev.map((l) => (l.id === id ? { ...l, startedAt: undefined, result: { ok, text, durationMs } } : l)));
   }, [append]);
+  // A turn boundary settles any line whose completion event never arrived, so
+  // nothing can spin past its turn (belt-and-suspenders on top of id pairing).
+  const settleOrphanToolLines = useCallback(() => {
+    const orphaned = new Set(toolLinesById.current.values());
+    toolLinesById.current.clear();
+    if (orphaned.size === 0) return;
+    setLines((prev) =>
+      prev.map((l) => (orphaned.has(l.id) && l.startedAt != null ? { ...l, startedAt: undefined, result: { ok: false, text: "no result before turn end" } } : l)),
+    );
+  }, []);
 
   // Per-file diff cards: the newest file's hunk stays expanded while the turn
   // streams; older cards (and everything on tool completion) collapse to the
@@ -890,13 +904,13 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
       if (event.type === "tool_start") {
         flushAssistant();
         setActivity(event.name);
-        appendToolLine(event.name, event.activityDescription);
+        appendToolLine(event.id, event.name, event.activityDescription);
         return;
       }
       if (event.type === "tool_end") {
         setActivity("responding");
         setStats((prev) => ({ ...prev, tools: prev.tools + 1 }));
-        finishToolLine(true, event.display ?? "", event.durationMs);
+        finishToolLine(event.id, true, event.display ?? "", event.durationMs);
         collapseDiffCards();
         if (fleetToolRef.current === event.id) finalizeFleet();
         return;
@@ -917,7 +931,7 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
       }
       if (event.type === "tool_error") {
         setStats((prev) => ({ ...prev, errors: prev.errors + 1 }));
-        finishToolLine(false, event.error, event.durationMs);
+        finishToolLine(event.id, false, event.error, event.durationMs);
         collapseDiffCards();
         if (fleetToolRef.current === event.id) finalizeFleet();
         return;
@@ -960,6 +974,7 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
         flushAssistant();
         collapseDiffCards();
         finalizeFleet();
+        settleOrphanToolLines();
         setStats((prev) => ({
           ...prev,
           turns: prev.turns + 1,
@@ -974,7 +989,7 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
         }));
       }
     },
-    [append, flushAssistant, appendToolLine, finishToolLine, appendDiffGrouped, collapseDiffCards, applyFleetProgress, finalizeFleet],
+    [append, flushAssistant, appendToolLine, finishToolLine, settleOrphanToolLines, appendDiffGrouped, collapseDiffCards, applyFleetProgress, finalizeFleet],
   );
 
   const submit = useCallback(
