@@ -38,6 +38,32 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.13.1",
+    date: "July 2026",
+    title: "Your Ares account",
+    tagline: "Sign in with credits — your models, usage, and limits, one click from the wordmark.",
+    highlights: [
+      {
+        icon: "⚔️",
+        title: "Account under the wordmark",
+        tag: "New",
+        blurb: "Click the ARES wordmark for a clean panel: your credit balance, the models you can use with their spend limits, and today's usage. Pick any model right from there.",
+      },
+      {
+        icon: "🔌",
+        title: "Connect once, route through credits",
+        tag: "New",
+        blurb: "Paste your account token and Ares routes every turn through the gateway on your credits — real cost metered live, no keys to manage.",
+      },
+      {
+        icon: "🛠️",
+        title: "Steadier long turns",
+        tag: "Safer",
+        blurb: "A big file write that streams quietly no longer gets cut short, parallel tool calls all finish cleanly instead of spinning, and connecting is rock-solid.",
+      },
+    ],
+  },
+  {
     version: "0.13.0",
     date: "July 2026",
     title: "The war room opens",
