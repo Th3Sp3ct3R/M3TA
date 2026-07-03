@@ -1116,6 +1116,7 @@ export class QueryEngine {
             let sawCommittedOutput = false;
             for await (const ev of guardStreamStalls(stream, {
               idleMs: streamIdleMs(),
+              activeIdleMs: streamActiveIdleMs(),
               thinkCeilingMs: thinkCeilingMs(),
               onStall: () => attemptAbort.abort(),
             })) {
@@ -2446,6 +2447,15 @@ function streamIdleMs(): number {
   const raw = Number(process.env.ARES_STREAM_IDLE_MS);
   return Number.isFinite(raw) && raw >= 1_000 ? Math.floor(raw) : 90_000;
 }
+/** Idle window ONCE real output has started. Providers that don't stream
+ *  tool-input deltas go silent for minutes while the model writes a large
+ *  file — a real user's Minecraft-clone build got cut mid-Write by the 90s
+ *  guard. Post-output silence is normal work, not a hang; and a post-output
+ *  cut can't even retry (content is committed), so it MUST be generous. */
+function streamActiveIdleMs(): number {
+  const raw = Number(process.env.ARES_STREAM_IDLE_ACTIVE_MS);
+  return Number.isFinite(raw) && raw >= 1_000 ? Math.floor(raw) : 360_000;
+}
 /** Reasoning-only output for this long → the model is spinning, not working. */
 function thinkCeilingMs(): number {
   const raw = Number(process.env.ARES_THINK_CEILING_MS);
@@ -2455,6 +2465,9 @@ function thinkCeilingMs(): number {
 interface StallGuardOpts {
   idleMs: number;
   thinkCeilingMs: number;
+  /** Idle window after ANY model output event (default: same as idleMs).
+   *  Set higher in production: buffered tool-input writes are silent-but-alive. */
+  activeIdleMs?: number;
   /** Called the moment a stall is declared — abort the underlying request. */
   onStall: () => void;
   now?: () => number;
@@ -2475,14 +2488,18 @@ export async function* guardStreamStalls(
   const it = stream[Symbol.asyncIterator]();
   let thinkingStartedAt = 0;
   let committed = false;
+  let sawOutput = false;
   try {
     while (true) {
-      // The per-event deadline: idle cutoff, tightened by the thinking ceiling
-      // while the model has produced nothing but reasoning.
-      let waitMs = opts.idleMs;
+      // The per-event deadline: pre-output silence means a hung REQUEST (short
+      // window); post-output silence usually means the model is composing a
+      // large buffered tool input (long window — a cut here can't retry, the
+      // content is committed). The thinking ceiling still clamps thinking-only.
+      let waitMs = sawOutput ? (opts.activeIdleMs ?? opts.idleMs) : opts.idleMs;
       if (!committed && thinkingStartedAt > 0) {
         waitMs = Math.min(waitMs, Math.max(0, thinkingStartedAt + opts.thinkCeilingMs - now()));
       }
+      const appliedIdleMs = waitMs;
       // Deliberately NOT unref'd: a wedged provider stream may hold no other
       // handles, and this timer firing is the only way the turn recovers.
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -2504,7 +2521,7 @@ export async function* guardStreamStalls(
             code: thinking ? "reasoning_stall" : "stream_stall",
             message: thinking
               ? `model produced only reasoning for ${Math.round(opts.thinkCeilingMs / 1000)}s — cutting the attempt`
-              : `no stream events for ${Math.round(opts.idleMs / 1000)}s — cutting the attempt`,
+              : `no stream events for ${Math.round(appliedIdleMs / 1000)}s — cutting the attempt`,
             retriable: true,
           },
         };
@@ -2512,6 +2529,7 @@ export async function* guardStreamStalls(
       }
       if (winner.done) return;
       const ev = winner.value;
+      if (isModelOutputEvent(ev)) sawOutput = true;
       if (ev.type === "thinking_delta") {
         if (thinkingStartedAt === 0) thinkingStartedAt = now();
       } else if (isModelOutputEvent(ev)) {

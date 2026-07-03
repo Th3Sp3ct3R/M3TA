@@ -156,3 +156,34 @@ test("engine: ARES_STALL_DOWNGRADE=0 retries at the same level", async () => {
     if (prevAdaptive === undefined) delete process.env.ARES_ADAPTIVE_REASONING; else process.env.ARES_ADAPTIVE_REASONING = prevAdaptive;
   }
 });
+
+test("guard: post-output silence gets the ACTIVE window, not the pre-output cutoff", async () => {
+  // The Minecraft-clone regression: model streams text, then goes silent while
+  // composing a big buffered Write. The old guard cut at idleMs and killed a
+  // healthy turn that could not retry (output was committed).
+  async function* buffering() {
+    yield { type: "text_delta", text: "Building the voxel engine…" };
+    await new Promise((r) => setTimeout(r, 250)); // silent 250ms >> idleMs
+    yield { type: "text_delta", text: "done" };
+    yield msgDone("done");
+  }
+  const events = [];
+  for await (const ev of guardStreamStalls(buffering(), { idleMs: 60, activeIdleMs: 2_000, thinkCeilingMs: 10_000, onStall: () => {} })) {
+    events.push(ev);
+  }
+  assert.ok(events.every((e) => e.type !== "error"), "no stall cut during committed work");
+  assert.equal(events.at(-1).type, "message_done");
+});
+
+test("guard: pre-output hang still cuts fast even with a generous active window", async () => {
+  let stalled = false;
+  async function* dead() {
+    await new Promise(() => {});
+  }
+  const events = [];
+  for await (const ev of guardStreamStalls(dead(), { idleMs: 60, activeIdleMs: 60_000, thinkCeilingMs: 10_000, onStall: () => (stalled = true) })) {
+    events.push(ev);
+  }
+  assert.ok(stalled);
+  assert.equal(events[0].error.code, "stream_stall");
+});
