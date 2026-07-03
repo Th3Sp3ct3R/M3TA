@@ -38,6 +38,32 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.13.2",
+    date: "July 2026",
+    title: "Ares leads the way",
+    tagline: "One provider to rule them: Ares first in the picker, your granted models one click away.",
+    highlights: [
+      {
+        icon: "🏛️",
+        title: "Ares is now a first-class provider",
+        tag: "New",
+        blurb: "Open the model picker under the input bar and Ares sits on top — it routes through your account credits to whatever models you've been granted. No keys, no setup.",
+      },
+      {
+        icon: "🖱️",
+        title: "Click a model, use a model",
+        tag: "New",
+        blurb: "The models in your Ares Account panel are buttons now: click one and the session switches to it instantly, with your remaining spend shown right on the row.",
+      },
+      {
+        icon: "🧹",
+        title: "A cleaner owner hub",
+        tag: "Polished",
+        blurb: "The website's admin got a total revamp — four clear tabs, grant AND deduct credits, one-click model access chips, and model discovery with auto-pricing as the main flow.",
+      },
+    ],
+  },
+  {
     version: "0.13.1",
     date: "July 2026",
     title: "Your Ares account",
