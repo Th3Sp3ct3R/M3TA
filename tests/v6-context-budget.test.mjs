@@ -194,6 +194,58 @@ test("chat tuning: context-limit errors retry with a smaller recent-history wind
   assert.equal(events.at(-1)?.status, "completed");
 });
 
+test("chat tuning: a gateway 413 (Vercel body limit) retries with a smaller window instead of dead-looping", async () => {
+  // Regression: the Ares Gateway runs on Vercel, which rejects oversized request
+  // bodies with a hard HTTP 413 ("Request Entity Too Large" /
+  // "FUNCTION_PAYLOAD_TOO_LARGE") that never says "prompt too long". This error
+  // must be recognized as a context-limit condition so the shrink-and-retry loop
+  // engages — otherwise every resend ships the same too-large body and 413s
+  // forever, locking the session (the "Hi → 413, Hello → 413" report).
+  const callMessageCounts = [];
+  const provider = {
+    name: "gateway-413-on-history",
+    async *stream(req) {
+      callMessageCounts.push(req.messages.length);
+      if (req.messages.length > 1) {
+        yield {
+          type: "error",
+          error: {
+            code: "http_413",
+            message: "Anthropic returned 413: Request Entity Too Large\n\nFUNCTION_PAYLOAD_TOO_LARGE\n\ncle1::abc",
+            retriable: false,
+          },
+        };
+        return;
+      }
+      yield {
+        type: "message_done",
+        message: { id: "a", role: "assistant", content: [{ type: "text", text: "ok" }], createdAt: new Date().toISOString() },
+        usage: { inputTokens: 1, outputTokens: 1 },
+        stopReason: "end_turn",
+      };
+    },
+  };
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "ares-gateway-413-"));
+  const oldMessages = Array.from({ length: 10 }, (_, i) => textMsg(i % 2 ? "assistant" : "user", 20_000, `old_${i}`));
+  const session = new Session({
+    workspace,
+    provider,
+    model: "ares-internal",
+    systemPrompt: "s",
+    tools: [],
+    initialMessages: oldMessages,
+    contextBudgetTokens: 100_000,
+  });
+
+  const events = [];
+  for await (const event of session.send("final")) events.push(event);
+
+  assert.ok(callMessageCounts.length > 1, "a gateway 413 should trigger a retry, not a dead loop");
+  assert.equal(callMessageCounts.at(-1), 1, "final retry should shrink to just the pending user message");
+  assert.equal(events.some((event) => event.type === "error"), false, "a recoverable 413 should not surface as a final error");
+  assert.equal(events.at(-1)?.status, "completed");
+});
+
 test("chat tuning: tool results are bounded before entering model context", () => {
   const result = stringifyModelToolOutput("x".repeat(40_000));
   assert.ok(result.length < 25_000, "model-facing tool result should be clipped");

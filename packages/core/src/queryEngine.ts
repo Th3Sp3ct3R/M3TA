@@ -227,7 +227,15 @@ const IMAGE_TOKEN_CAP = 2000; // providers downscale — per-image token cost is
 // accounting (below) AND cap total image payload bytes separately (fitImagesToBudget).
 const MAX_IMAGE_PAYLOAD_BYTES = (() => {
   const raw = Number(process.env.ARES_MAX_IMAGE_PAYLOAD_BYTES);
-  return Number.isFinite(raw) && raw > 0 ? raw : 12 * 1024 * 1024; // ~12MB decoded, safely under provider limits
+  // The binding limit is the DEFAULT transport: the Ares Gateway runs on Vercel,
+  // whose serverless functions cap the request body at ~4.5MB and reject
+  // overflow with a hard 413 (FUNCTION_PAYLOAD_TOO_LARGE) — no compaction, no
+  // retry, just a dead turn. This cap is on DECODED bytes, but the wire body is
+  // base64 (~1.33x bigger) plus the system prompt, tool defs, and text history,
+  // so we leave generous headroom: 3MB decoded ≈ 4MB base64, fits under 4.5MB
+  // with room for the rest. Anthropic-direct users (32MB API limit) who paste
+  // large multi-image payloads can raise it via ARES_MAX_IMAGE_PAYLOAD_BYTES.
+  return Number.isFinite(raw) && raw > 0 ? raw : 3 * 1024 * 1024;
 })();
 
 // Microcompact rung: cheaply clear OLD tool-output bodies (no model call) before
@@ -2725,7 +2733,18 @@ function isContextLimitError(error: { code: string; message: string }): boolean 
     text.includes("maximum context") ||
     text.includes("input length") ||
     text.includes("too many tokens") ||
-    text.includes("exceeded max context")
+    text.includes("exceeded max context") ||
+    // A too-big REQUEST BODY is the same recoverable condition as a too-long
+    // prompt: shrink the recent-history window and retry. The Ares Gateway runs
+    // on Vercel, whose serverless functions hard-cap the request body (~4.5MB)
+    // and reject overflow with an HTTP 413 that never mentions "prompt" —
+    // "Request Entity Too Large" / "FUNCTION_PAYLOAD_TOO_LARGE". Without these,
+    // an oversized turn (a big pasted image, a long transcript) dead-loops:
+    // every resend ships the same too-large body and 413s again, forever.
+    text.includes("http_413") ||
+    text.includes("entity too large") ||
+    text.includes("payload too large") ||
+    text.includes("payload_too_large")
   );
 }
 

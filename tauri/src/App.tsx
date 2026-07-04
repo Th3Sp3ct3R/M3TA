@@ -4562,6 +4562,72 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
+// Base64 payload of a data URL (the part that actually crosses the wire).
+function dataUrlB64Len(dataUrl: string): number {
+  const i = dataUrl.indexOf(",");
+  return i >= 0 ? dataUrl.length - i - 1 : dataUrl.length;
+}
+
+// Vision-safe downscale, done in the webview with a plain <canvas> — no deps.
+// WHY THIS EXISTS: the Ares Gateway rides Vercel, whose serverless transport
+// hard-caps the request body at ~4.5MB. A raw pasted screenshot (often 5–12MB)
+// used to sail past the old client guard, 413 at the gateway, and — because the
+// same oversized body was resent every turn — LOCK the session dead (a real
+// user sat stranded for 8h overnight). Models already downscale images to
+// ~1568px on the long edge, so shrinking to that here costs the model nothing
+// while cutting multi-MB pastes to a few hundred KB. We re-encode as JPEG and
+// step quality/size down until the payload is comfortably under budget.
+const MAX_ATTACH_B64 = 2_000_000; // ~1.5MB decoded — leaves room for text + a 2nd image under 4.5MB
+const MAX_IMG_EDGE = 1568; // Anthropic's long-edge downscale target; larger buys no quality
+async function downscaleAttachment(dataUrl: string): Promise<string> {
+  // Already small — leave it byte-for-byte (keeps PNG alpha / exact pixels).
+  if (dataUrlB64Len(dataUrl) <= MAX_ATTACH_B64) return dataUrl;
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("decode failed"));
+      el.src = dataUrl;
+    });
+    let w = img.naturalWidth || img.width;
+    let h = img.naturalHeight || img.height;
+    if (!w || !h) return dataUrl;
+    const scale = Math.min(1, MAX_IMG_EDGE / Math.max(w, h));
+    w = Math.max(1, Math.round(w * scale));
+    h = Math.max(1, Math.round(h * scale));
+    const render = (cw: number, ch: number): HTMLCanvasElement | null => {
+      const canvas = document.createElement("canvas");
+      canvas.width = cw;
+      canvas.height = ch;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      // JPEG has no alpha — white-fill first so transparent PNGs don't go black.
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, cw, ch);
+      ctx.drawImage(img, 0, 0, cw, ch);
+      return canvas;
+    };
+    let canvas = render(w, h);
+    if (!canvas) return dataUrl;
+    // Step quality down, then halve dimensions, until it fits the wire budget.
+    for (const quality of [0.85, 0.7, 0.55, 0.4]) {
+      const out = canvas.toDataURL("image/jpeg", quality);
+      if (dataUrlB64Len(out) <= MAX_ATTACH_B64) return out;
+    }
+    for (let pass = 0; pass < 3; pass++) {
+      w = Math.max(1, Math.round(w / 2));
+      h = Math.max(1, Math.round(h / 2));
+      canvas = render(w, h);
+      if (!canvas) break;
+      const out = canvas.toDataURL("image/jpeg", 0.6);
+      if (dataUrlB64Len(out) <= MAX_ATTACH_B64) return out;
+    }
+    return canvas ? canvas.toDataURL("image/jpeg", 0.4) : dataUrl; // best effort
+  } catch {
+    return dataUrl; // never block a paste on a processing failure — the daemon guard is the backstop
+  }
+}
+
 async function transcribeSpeech(blob: Blob, language = "en-US"): Promise<string> {
   const key = atob(STT_KEY_ENC);
   const content = await blobToBase64(blob);
@@ -4781,10 +4847,17 @@ const Composer = React.memo(function Composer({
         const reader = new FileReader();
         reader.onload = () => {
           const dataUrl = String(reader.result ?? "");
-          if (dataUrl.startsWith("data:image/")) {
-            setAttachments((prev) => [...prev, { name: file.name || "pasted-image", dataUrl }]);
+          if (!dataUrl.startsWith("data:image/")) {
+            resolve();
+            return;
           }
-          resolve();
+          // Shrink to a vision-safe size BEFORE it becomes an attachment, so an
+          // oversized paste can never reach the gateway and 413 the turn.
+          void downscaleAttachment(dataUrl)
+            .then((processed) => {
+              setAttachments((prev) => [...prev, { name: file.name || "pasted-image", dataUrl: processed }]);
+            })
+            .finally(() => resolve());
         };
         reader.onerror = () => resolve(); // never hang submit() on an unreadable file
         reader.readAsDataURL(file);

@@ -38,6 +38,26 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.13.10",
+    date: "July 2026",
+    title: "No more frozen chats from a big image",
+    tagline: "Pasting a large screenshot could silently lock a conversation — that's fixed, and images are now auto-shrunk on the way in.",
+    highlights: [
+      {
+        icon: "🖼️",
+        title: "Screenshots just work",
+        tag: "Safer",
+        blurb: "Paste any screenshot and Ares shrinks it to a vision-safe size before sending — no quality loss the model can see, and no more oversized uploads getting rejected.",
+      },
+      {
+        icon: "🔓",
+        title: "Chats can't get stuck anymore",
+        tag: "Safer",
+        blurb: "If a message ever grows too large to send, Ares now trims and retries on its own instead of freezing. Sessions that were jammed heal themselves on the next message.",
+      },
+    ],
+  },
+  {
     version: "0.13.9",
     date: "July 2026",
     title: "Updates that don't jam — and Light Mode",
