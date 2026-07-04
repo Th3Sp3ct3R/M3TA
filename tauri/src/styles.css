@@ -3255,3 +3255,12 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .bugReportActions .primary { background: var(--ember, #e08b2e); color: #1a1206; border: none; font-weight: 700; padding: 8px 16px; border-radius: 9px; cursor: pointer; }
 .bugReportActions .primary:disabled { opacity: 0.6; cursor: default; }
 .bugReportActions .ghost { background: transparent; border: 1px solid var(--line); color: var(--text); padding: 8px 14px; border-radius: 9px; cursor: pointer; }
+
+/* custom provider preset gallery */
+.presetGallery { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+.presetChip { font-size: 11.5px; padding: 5px 10px; border-radius: 999px; border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 55%, transparent); color: var(--text); cursor: pointer; transition: all 130ms; }
+.presetChip:hover { border-color: color-mix(in srgb, var(--ember, #e08b2e) 45%, var(--line)); }
+.presetChip[data-on="1"] { border-color: var(--ember, #e08b2e); background: color-mix(in srgb, var(--ember, #e08b2e) 16%, transparent); font-weight: 700; }
+.presetHint { margin: -4px 0 8px; }
+.presetHint a { color: var(--ember, #e08b2e); text-decoration: none; }
+.presetHint a:hover { text-decoration: underline; }

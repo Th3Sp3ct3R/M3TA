@@ -2006,6 +2006,10 @@ function App() {
           if (e.ok) setReportOpen(false);
           return true;
         }
+        case "custom_models":
+          // Server-side discovery result for the Custom provider card to consume.
+          window.dispatchEvent(new CustomEvent("ares:custom-models", { detail: e }));
+          return true;
         case "oauth_status":
           if (Array.isArray(e.providers)) setOauthProviders(e.providers as OAuthProviderVm[]);
           return true;
@@ -5606,10 +5610,39 @@ function readCustomModels(): string[] {
   }
 }
 
+// Known OpenAI-compatible providers — click one and the base URL fills itself
+// so nobody has to hunt for it. keyUrl points at where to mint a key.
+interface ProviderPreset {
+  id: string;
+  label: string;
+  base: string;
+  keyUrl?: string;
+  keyHint?: string;
+  sample?: string;
+  keyless?: boolean;
+}
+const PROVIDER_PRESETS: ProviderPreset[] = [
+  { id: "google", label: "Google AI Studio", base: "https://generativelanguage.googleapis.com/v1beta/openai", keyUrl: "https://aistudio.google.com/app/apikey", keyHint: "AIza… key — set it to unrestricted", sample: "gemini-2.5-flash" },
+  { id: "nvidia", label: "NVIDIA NIM", base: "https://integrate.api.nvidia.com/v1", keyUrl: "https://build.nvidia.com", keyHint: "nvapi-… key", sample: "meta/llama-3.1-70b-instruct" },
+  { id: "groq", label: "Groq", base: "https://api.groq.com/openai/v1", keyUrl: "https://console.groq.com/keys", keyHint: "gsk_… key", sample: "llama-3.3-70b-versatile" },
+  { id: "xai", label: "xAI (Grok)", base: "https://api.x.ai/v1", keyUrl: "https://console.x.ai", keyHint: "xai-… key", sample: "grok-4" },
+  { id: "together", label: "Together", base: "https://api.together.xyz/v1", keyUrl: "https://api.together.ai/settings/api-keys", sample: "meta-llama/Llama-3.3-70B-Instruct-Turbo" },
+  { id: "fireworks", label: "Fireworks", base: "https://api.fireworks.ai/inference/v1", keyUrl: "https://fireworks.ai/account/api-keys", sample: "accounts/fireworks/models/llama-v3p3-70b-instruct" },
+  { id: "mistral", label: "Mistral", base: "https://api.mistral.ai/v1", keyUrl: "https://console.mistral.ai/api-keys", sample: "mistral-large-latest" },
+  { id: "deepinfra", label: "DeepInfra", base: "https://api.deepinfra.com/v1/openai", keyUrl: "https://deepinfra.com/dash/api_keys", sample: "meta-llama/Llama-3.3-70B-Instruct" },
+  { id: "cerebras", label: "Cerebras", base: "https://api.cerebras.ai/v1", keyUrl: "https://cloud.cerebras.ai", sample: "llama-3.3-70b" },
+  { id: "perplexity", label: "Perplexity", base: "https://api.perplexity.ai", keyUrl: "https://www.perplexity.ai/settings/api", sample: "sonar-pro" },
+  { id: "openai", label: "OpenAI", base: "https://api.openai.com/v1", keyUrl: "https://platform.openai.com/api-keys", keyHint: "sk-… key", sample: "gpt-5.5" },
+  { id: "lmstudio", label: "LM Studio (local)", base: "http://localhost:1234/v1", keyless: true, keyHint: "no key needed", sample: "" },
+  { id: "vllm", label: "vLLM (local)", base: "http://localhost:8000/v1", keyless: true, keyHint: "no key needed", sample: "" },
+];
+
 function CustomProviderBlock({
   onDaemonCommand,
+  native,
 }: {
   onDaemonCommand: (cmd: Record<string, unknown>) => void;
+  native: boolean;
 }) {
   const [base, setBase] = useState<string>(() => {
     try { return window.localStorage.getItem(CUSTOM_BASE_LS) ?? ""; } catch { return ""; }
@@ -5622,11 +5655,49 @@ function CustomProviderBlock({
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string>("");
   const [ok, setOk] = useState<boolean | null>(null);
+  const [presetId, setPresetId] = useState<string>("");
+  const preset = PROVIDER_PRESETS.find((p) => p.id === presetId);
+
+  const applyModels = useCallback((ids: string[]) => {
+    setModels(ids);
+    setModel((cur) => (!cur || !ids.includes(cur) ? ids[0] : cur));
+    try { window.localStorage.setItem(CUSTOM_MODELS_LS, JSON.stringify(ids)); } catch { /* ignore */ }
+    setOk(true);
+    setMsg(`Found ${ids.length} model${ids.length === 1 ? "" : "s"}.`);
+  }, []);
 
   const discover = useCallback(async () => {
     const root = base.trim().replace(/\/+$/, "");
-    if (!root) { setOk(false); setMsg("Enter a base URL first — e.g. https://api.together.xyz/v1"); return; }
+    if (!root) { setOk(false); setMsg("Pick a provider above, or enter a base URL — e.g. https://api.together.xyz/v1"); return; }
     setBusy(true); setOk(null); setMsg("Discovering models…");
+
+    // Preferred path: ask the daemon to fetch server-side (Node, no CORS) so
+    // hosts that block browser requests (NVIDIA, Google, most) still work.
+    if (native) {
+      const done = await new Promise<boolean>((resolve) => {
+        const onResult = (ev: Event) => {
+          const d = (ev as CustomEvent<{ ok?: boolean; models?: string[]; error?: string }>).detail;
+          window.removeEventListener("ares:custom-models", onResult);
+          window.clearTimeout(timer);
+          if (d?.ok && Array.isArray(d.models) && d.models.length) {
+            applyModels(d.models);
+          } else {
+            setOk(false);
+            setMsg(d?.error ? String(d.error) : "no models returned. You can still type a model id by hand below.");
+          }
+          resolve(true);
+        };
+        const timer = window.setTimeout(() => {
+          window.removeEventListener("ares:custom-models", onResult);
+          resolve(false); // daemon didn't answer — fall through to the browser attempt
+        }, 12000);
+        window.addEventListener("ares:custom-models", onResult);
+        onDaemonCommand({ type: "discover_custom_models", base: root, key: key.trim() });
+      });
+      if (done) { setBusy(false); return; }
+    }
+
+    // Fallback: direct browser fetch (works for CORS-friendly / local endpoints).
     try {
       const res = await fetch(`${root}/models`, {
         headers: key.trim() ? { Authorization: `Bearer ${key.trim()}` } : {},
@@ -5639,21 +5710,26 @@ function CustomProviderBlock({
         .filter((x): x is string => typeof x === "string" && x.length > 0)
         .sort((a, b) => a.localeCompare(b));
       if (!ids.length) throw new Error("the endpoint returned no models");
-      setModels(ids);
-      if (!model || !ids.includes(model)) setModel(ids[0]);
-      try { window.localStorage.setItem(CUSTOM_MODELS_LS, JSON.stringify(ids)); } catch { /* ignore */ }
-      setOk(true);
-      setMsg(`Found ${ids.length} model${ids.length === 1 ? "" : "s"}.`);
+      applyModels(ids);
     } catch (err) {
       setOk(false);
       setMsg(
         `Couldn't reach ${root}/models — ${err instanceof Error ? err.message : String(err)}. ` +
-        `Make sure it's an OpenAI-compatible endpoint; some hosts block browser requests, in which case enter a model id by hand below.`,
+        `Make sure the key is valid and unrestricted, or just type a model id by hand below.`,
       );
     } finally {
       setBusy(false);
     }
-  }, [base, key, model]);
+  }, [base, key, native, onDaemonCommand, applyModels]);
+
+  const choosePreset = useCallback((p: ProviderPreset) => {
+    setPresetId(p.id);
+    setBase(p.base);
+    setModels([]);
+    setModel(p.sample ?? "");
+    setOk(null);
+    setMsg(p.keyless ? "No key needed — click Discover (make sure the local server is running)." : `Paste your ${p.label} key, then Discover.`);
+  }, []);
 
   const save = useCallback(() => {
     const root = base.trim().replace(/\/+$/, "");
@@ -5671,14 +5747,41 @@ function CustomProviderBlock({
     <div className="customProv">
       <div className="keyGroupLabel">Custom provider · OpenAI-compatible</div>
       <p className="keyHint" style={{ margin: "0 0 8px" }}>
-        Point Ares at any OpenAI-compatible endpoint — Together, Groq, Fireworks, a gateway, or a local
-        vLLM&nbsp;/ LM&nbsp;Studio. Discover pulls its full model list automatically.
+        Pick a provider below and the base URL fills itself — just paste your key and Discover. Or point Ares at
+        any OpenAI-compatible endpoint by hand. Discovery runs through Ares (not the browser), so hosts that block
+        browser requests still work.
       </p>
+      <div className="presetGallery">
+        {PROVIDER_PRESETS.map((p) => (
+          <button
+            key={p.id}
+            className="presetChip"
+            data-on={presetId === p.id ? "1" : "0"}
+            onClick={() => choosePreset(p)}
+            title={p.base}
+          >
+            {p.label}
+          </button>
+        ))}
+      </div>
+      {preset ? (
+        <p className="keyHint presetHint">
+          {preset.keyHint ? <span>{preset.keyHint}</span> : null}
+          {preset.keyUrl ? (
+            <>
+              {preset.keyHint ? " · " : null}
+              <a href="#" onClick={(e) => { e.preventDefault(); if (native) void invoke("ares_open_url", { url: preset.keyUrl }).catch(() => null); }}>
+                get a key ↗
+              </a>
+            </>
+          ) : null}
+        </p>
+      ) : null}
       <input
         className="keyInput"
         placeholder="Base URL — e.g. https://api.together.xyz/v1"
         value={base}
-        onChange={(e) => setBase(e.target.value)}
+        onChange={(e) => { setBase(e.target.value); setPresetId(""); }}
       />
       <input
         className="keyInput"
@@ -6245,7 +6348,7 @@ function Settings({
                     ) : null}
                   </div>
                 ))}
-                <CustomProviderBlock onDaemonCommand={onDaemonCommand} />
+                <CustomProviderBlock onDaemonCommand={onDaemonCommand} native={native} />
                 <div className="keyGroupLabel">Tools</div>
                 <div className="keyRegRow">
                   <div className="keyRegName">

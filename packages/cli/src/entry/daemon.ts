@@ -27,7 +27,7 @@ import { gateToolPermission } from "../policyGate.js";
 import { embeddedBridge } from "./browserBridge.js";
 import { garrisonCommand } from "./garrisonCmd.js";
 import { cleanCommandId, normalizePermissionDecision } from "./permissions.js";
-import { aresGatewayBase, daemonModelCatalog, fetchAresGatewayMe, postAresGatewayReport, providerFamilyForSelection, selectProvider } from "./providers.js";
+import { aresGatewayBase, daemonModelCatalog, fetchAresGatewayMe, fetchCustomOpenAiModels, postAresGatewayReport, providerFamilyForSelection, selectProvider } from "./providers.js";
 import { ParsedArgs, cliVersion } from "./runtime.js";
 import { LiveSession, chatContextBudget, createSession, createSessionWithSelection, handleReasoningCommand, isProviderFatalError, makeSpanSummarizer, pickHealthyFallback, resolveReasoningLevel } from "./sessionFactory.js";
 import { startGatewayMirror } from "./telegramWiring.js";
@@ -41,6 +41,8 @@ interface DaemonInputCommand {
   url?: string;
   /** bug_report — optional user description of what went wrong. */
   note?: string;
+  /** discover_custom_models — OpenAI-compatible base URL to probe. */
+  base?: string;
   goal?: string;
   command?: string;
   level?: string;
@@ -1249,6 +1251,19 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
         } catch (err) {
           process.stdout.write(JSON.stringify({ type: "daemon_error", error: `session_history: ${err instanceof Error ? err.message : String(err)}` }) + "\n");
         }
+        continue;
+      }
+      if (command.type === "discover_custom_models") {
+        // Server-side model discovery for the Custom (OpenAI-compatible)
+        // provider — runs here in Node so CORS / browser-origin rejection
+        // (NVIDIA, Google AI Studio, most hosted APIs) can't block it.
+        const base = typeof command.base === "string" ? command.base : "";
+        const key = typeof command.key === "string" ? command.key : "";
+        const result = await fetchCustomOpenAiModels(base, key).catch((err) => ({
+          ok: false as const,
+          error: err instanceof Error ? err.message : String(err),
+        }));
+        process.stdout.write(JSON.stringify({ type: "custom_models", ...result }) + "\n");
         continue;
       }
       if (command.type === "bug_report") {

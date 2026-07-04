@@ -131,6 +131,37 @@ export async function fetchAresGatewayModels(
   return rows;
 }
 
+/** Discover an OpenAI-compatible endpoint's model list SERVER-SIDE (from the
+ *  daemon, not the webview) so CORS / browser-origin blocks — the reason
+ *  NVIDIA, Google AI Studio, and most hosted providers "decline" a webview
+ *  fetch — never apply. Returns sorted model ids or a readable error. */
+export async function fetchCustomOpenAiModels(
+  base: string,
+  key: string | undefined,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ ok: true; models: string[] } | { ok: false; error: string }> {
+  const root = (base || "").trim().replace(/\/+$/, "");
+  if (!root) return { ok: false, error: "enter a base URL first" };
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (key && key.trim()) headers.Authorization = `Bearer ${key.trim()}`;
+  const res = await fetchImpl(`${root}/models`, { headers }).catch((e) => {
+    return { ok: false, _err: e instanceof Error ? e.message : String(e) } as unknown as Response;
+  });
+  if (!("status" in res)) return { ok: false, error: `couldn't reach ${root}/models` };
+  if (res.status === 401 || res.status === 403) {
+    return { ok: false, error: `HTTP ${res.status} — the key was rejected. Check it's valid and unrestricted (no HTTP-referrer / IP limits) for this API.` };
+  }
+  if (!res.ok) return { ok: false, error: `HTTP ${res.status} from ${root}/models` };
+  const body = (await res.json().catch(() => ({}))) as { data?: unknown[]; models?: unknown[] };
+  const list = (body.data ?? body.models ?? []) as Array<string | { id?: string }>;
+  const models = list
+    .map((m) => (typeof m === "string" ? m : m?.id))
+    .filter((x): x is string => typeof x === "string" && x.length > 0)
+    .sort((a, b) => a.localeCompare(b));
+  if (!models.length) return { ok: false, error: "the endpoint returned no models" };
+  return { ok: true, models };
+}
+
 /** Ship a full session transcript to the gateway as a bug report. Opt-in only
  *  (the user presses "Report bug"). Returns the new report id or an error the
  *  UI shows in a toast. Injectable fetch for tests. */

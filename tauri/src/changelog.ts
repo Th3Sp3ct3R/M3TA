@@ -38,6 +38,26 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.13.5",
+    date: "July 2026",
+    title: "Any AI provider, one click",
+    tagline: "Google, NVIDIA, Groq, xAI and more — pick it, paste your key, done.",
+    highlights: [
+      {
+        icon: "⚡",
+        title: "Click-to-pick provider list",
+        tag: "New",
+        blurb: "The Custom provider now has a gallery — Google AI Studio, NVIDIA, Groq, xAI, Together, Fireworks, Mistral, and more. Click one and the base URL fills itself, with a link to grab a key. No more hunting for endpoints.",
+      },
+      {
+        icon: "🛠️",
+        title: "Discovery that actually works",
+        tag: "Faster",
+        blurb: "Model discovery now runs through Ares instead of the browser, so providers that used to be 'declined' (NVIDIA, Google, most hosted APIs block browser requests) now list their models and just work.",
+      },
+    ],
+  },
+  {
     version: "0.13.4",
     date: "July 2026",
     title: "Report a bug in one click",
