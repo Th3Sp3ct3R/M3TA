@@ -2439,6 +2439,63 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .modelHintEmpty { font-size: 11.5px; color: var(--faint); padding: 14px; text-align: center; }
 @keyframes modelRowIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
+/* The ⓘ details affordance on a card — click opens the big page, without selecting. */
+.modelInfo {
+  flex: none; align-self: center; width: 20px; height: 20px; display: grid; place-items: center;
+  border-radius: 50%; font: 600 12px/1 var(--mono); color: var(--faint); cursor: pointer;
+  border: 1px solid transparent; transition: color 130ms ease, border-color 130ms ease, background 130ms ease;
+}
+.modelInfo:hover { color: var(--bronze-hi); border-color: var(--bronze); background: rgba(var(--accent-rgb), 0.12); }
+
+/* ── The model DETAIL page — big, readable, opened from a card ─────────────── */
+.modelDetail {
+  border: 1px solid var(--line-strong); border-radius: var(--r-md);
+  background: radial-gradient(120% 80% at 0% -10%, rgba(var(--ember-rgb), 0.08), transparent 55%), var(--panel);
+  padding: 16px; display: grid; gap: 14px;
+  animation: modelDetailIn 240ms cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+.mdBack {
+  justify-self: start; font: 600 11px/1 var(--mono); color: var(--faint); cursor: pointer;
+  background: none; border: none; padding: 2px 0; transition: color 130ms ease;
+}
+.mdBack:hover { color: var(--bronze-hi); }
+.mdHead { display: flex; align-items: center; gap: 13px; }
+.mdGlyph {
+  width: 52px; height: 52px; flex: none; display: grid; place-items: center; font-size: 27px;
+  border-radius: 15px; border: 1px solid var(--line-strong); background: rgba(0, 0, 0, 0.28);
+  box-shadow: 0 0 20px -6px var(--ember-hi);
+}
+.mdTitle { display: grid; gap: 3px; min-width: 0; }
+.mdTitle strong { font: 700 16px/1.15 var(--mono); color: var(--text); word-break: break-word; }
+.mdSub { font: 500 11px/1.3 var(--mono); color: var(--faint); word-break: break-all; }
+.mdStats { display: flex; flex-wrap: wrap; gap: 8px; }
+.mdStat {
+  display: grid; gap: 2px; padding: 9px 14px; border-radius: 11px;
+  border: 1px solid var(--line); background: rgba(0, 0, 0, 0.22); min-width: 84px;
+}
+.mdStat b { font: 700 17px/1 var(--mono); color: var(--bronze-hi); }
+.mdStat span { font: 500 9.5px/1 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--faint); }
+.mdStat.mdFree b { color: var(--steel, #7fa6a3); }
+.mdCaps { display: flex; flex-wrap: wrap; gap: 6px; }
+.mdCap {
+  padding: 5px 11px; border-radius: 999px; font: 600 10px/1 var(--mono); letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--muted); border: 1px solid var(--line-strong); background: rgba(0, 0, 0, 0.2);
+}
+.mdCap[data-cap="vision"] { color: #8b8bd9; border-color: rgba(139, 139, 217, 0.4); }
+.mdCap[data-cap="reasoning"] { color: var(--ember-hi); border-color: rgba(var(--ember-rgb), 0.4); }
+.mdCap[data-cap="free"] { color: var(--steel, #7fa6a3); border-color: rgba(127, 166, 163, 0.4); }
+.mdDesc { margin: 0; font: 400 13px/1.6 -apple-system, system-ui, "Segoe UI", sans-serif; color: var(--text); }
+.mdDescThin { color: var(--muted); font-style: italic; }
+.mdUse {
+  justify-self: start; margin-top: 2px; padding: 11px 22px; border-radius: var(--r-sm); cursor: pointer;
+  font: 650 13px/1 var(--mono); color: #1c1206; border: 1px solid transparent;
+  background: linear-gradient(180deg, var(--bronze-hi), var(--bronze));
+  box-shadow: 0 6px 20px -6px rgba(var(--accent-rgb), 0.6); transition: transform 120ms ease, filter 120ms ease;
+}
+.mdUse:hover { transform: translateY(-1px); filter: brightness(1.07); }
+.mdUse[data-on="1"] { background: rgba(var(--ember-rgb), 0.14); color: var(--ember-hi); border-color: rgba(var(--ember-rgb), 0.5); box-shadow: none; cursor: default; }
+@keyframes modelDetailIn { from { opacity: 0; transform: translateY(8px) scale(0.99); } to { opacity: 1; transform: none; } }
+
 /* routing */
 .routingToggle { text-align: left; font: 600 11px/1 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; }
 .routing { display: grid; gap: 8px; }

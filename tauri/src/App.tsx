@@ -1252,6 +1252,10 @@ interface ModelOption {
   capabilities?: string[];
   /** Rich prose (OpenRouter) shown on the discovery card. */
   description?: string;
+  /** Context window in tokens (OpenRouter) — shown as a big stat on the detail page. */
+  contextLength?: number;
+  /** $ per million tokens (OpenRouter): input = prompt, output = completion. */
+  pricing?: { input?: number; output?: number };
 }
 
 const OLLAMA_CLOUD_MODELS: ModelOption[] = [
@@ -1345,7 +1349,7 @@ async function fetchOpenRouterModels(): Promise<ModelOption[]> {
       id?: string;
       name?: string;
       context_length?: number;
-      pricing?: { prompt?: string };
+      pricing?: { prompt?: string; completion?: string };
       description?: string;
       supported_parameters?: string[];
       architecture?: { input_modalities?: string[] };
@@ -1355,7 +1359,9 @@ async function fetchOpenRouterModels(): Promise<ModelOption[]> {
     .filter((m): m is typeof m & { id: string } => Boolean(m.id))
     .map((m) => {
       const ctx = m.context_length ? `${Math.round(m.context_length / 1000)}k ctx` : "";
-      const price = m.pricing?.prompt ? `$${(Number(m.pricing.prompt) * 1e6).toFixed(2)}/M in` : "";
+      const inPrice = m.pricing?.prompt ? Number(m.pricing.prompt) * 1e6 : undefined;
+      const outPrice = m.pricing?.completion ? Number(m.pricing.completion) * 1e6 : undefined;
+      const price = inPrice !== undefined ? `$${inPrice.toFixed(2)}/M in` : "";
       const capabilities = [
         ...(m.supported_parameters ?? []).filter((p) => p === "tools" || p === "reasoning" || p === "structured_outputs"),
         ...((m.architecture?.input_modalities ?? []).includes("image") ? ["vision"] : []),
@@ -1368,6 +1374,8 @@ async function fetchOpenRouterModels(): Promise<ModelOption[]> {
         group: "OpenRouter",
         capabilities: [...new Set(capabilities)],
         description: m.description?.trim() || undefined,
+        contextLength: m.context_length,
+        pricing: (inPrice !== undefined || outPrice !== undefined) ? { input: inPrice, output: outPrice } : undefined,
       };
     });
   models.sort((a, b) => a.id.localeCompare(b.id));
@@ -6296,6 +6304,8 @@ function ModelPicker({
   const [open, setOpen] = useState(Boolean(searchOnly || compact));
   const [query, setQuery] = useState("");
   const [capability, setCapability] = useState<"all" | "tools" | "reasoning" | "vision" | "free">("all");
+  // The model DETAIL page — click a card's ⓘ to open a big, readable view.
+  const [detail, setDetail] = useState<ModelOption | null>(null);
   const q = query.trim().toLowerCase();
   const byCapability = capability === "all" ? models : models.filter((model) => model.capabilities?.includes(capability));
   const filtered = q
@@ -6375,6 +6385,17 @@ function ModelPicker({
                     {m.description ? <span className="modelDesc" title={m.description}>{m.description}</span> : null}
                   </span>
                   {m.hint ? <span className="modelHint">{m.hint}</span> : null}
+                  {!compact ? (
+                    <span
+                      className="modelInfo"
+                      role="button"
+                      tabIndex={0}
+                      title="Details"
+                      aria-label={`Details for ${m.label ?? m.id}`}
+                      onClick={(e) => { e.stopPropagation(); setDetail(m); }}
+                      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); setDetail(m); } }}
+                    >ⓘ</span>
+                  ) : null}
                   <span className="modelTick" aria-hidden="true" />
                 </button>
               ))}
@@ -6382,6 +6403,52 @@ function ModelPicker({
         ))}
         {!loading && filtered.length === 0 ? <div className="modelHintEmpty">no models match</div> : null}
       </div> : null}
+      {detail ? (
+        <ModelDetail
+          model={detail}
+          selected={detail.id === value}
+          onUse={(id) => { choose(id); setDetail(null); }}
+          onBack={() => setDetail(null)}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+// The big, readable model page — opened from a card's ⓘ. Shows the full
+// description, context window, per-Mtok pricing, and every capability, with a
+// primary "Use this model" action. Overlays the picker so all mount sites work.
+function ModelDetail({ model, selected, onUse, onBack }: { model: ModelOption; selected: boolean; onUse: (id: string) => void; onBack: () => void }) {
+  const price = model.pricing;
+  const ctxK = model.contextLength ? Math.round(model.contextLength / 1000) : undefined;
+  const isFree = model.capabilities?.includes("free");
+  return (
+    <div className="modelDetail" role="dialog" aria-label={`${model.label ?? model.id} details`}>
+      <button className="mdBack" onClick={onBack}>← Back to models</button>
+      <div className="mdHead">
+        <span className="mdGlyph" aria-hidden="true">{modelGlyph(model)}</span>
+        <div className="mdTitle">
+          <strong>{model.label ?? model.id}</strong>
+          <span className="mdSub">{model.group}{model.label && model.label !== model.id ? ` · ${model.id}` : ""}</span>
+        </div>
+      </div>
+      <div className="mdStats">
+        {ctxK ? <div className="mdStat"><b>{ctxK >= 1000 ? `${(ctxK / 1000).toFixed(ctxK % 1000 ? 1 : 0)}M` : `${ctxK}k`}</b><span>context</span></div> : null}
+        {isFree ? <div className="mdStat mdFree"><b>FREE</b><span>no token cost</span></div>
+          : price?.input !== undefined ? <div className="mdStat"><b>${price.input.toFixed(2)}</b><span>/M input</span></div> : null}
+        {!isFree && price?.output !== undefined ? <div className="mdStat"><b>${price.output.toFixed(2)}</b><span>/M output</span></div> : null}
+      </div>
+      {model.capabilities && model.capabilities.length > 0 ? (
+        <div className="mdCaps">
+          {model.capabilities.map((c) => <span key={c} className="mdCap" data-cap={c}>{c}</span>)}
+        </div>
+      ) : null}
+      {model.description ? <p className="mdDesc">{model.description}</p>
+        : model.hint ? <p className="mdDesc mdDescThin">{model.hint}</p>
+        : <p className="mdDesc mdDescThin">No description available for this model.</p>}
+      <button className="mdUse" data-on={selected ? "1" : "0"} onClick={() => onUse(model.id)}>
+        {selected ? "✓ Current model" : "Use this model"}
+      </button>
     </div>
   );
 }

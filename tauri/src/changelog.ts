@@ -38,6 +38,20 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.14.2",
+    date: "July 2026",
+    title: "Model pages, not just rows",
+    tagline: "Click the ⓘ on any model to open a full page — description, context window, pricing, capabilities.",
+    highlights: [
+      {
+        icon: "🗂️",
+        title: "A real page for every model",
+        tag: "New",
+        blurb: "The model list was just rows. Now each card has an ⓘ that opens a big, readable page: the full description, context window, per-million input/output pricing, and every capability — then one click to use it. Especially good across OpenRouter's huge catalog.",
+      },
+    ],
+  },
+  {
     version: "0.14.1",
     date: "July 2026",
     title: "Your call: delegate, or Ares does it",
