@@ -10,6 +10,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { buildTool, toolError } from "./_shared.js";
+import { getMcpAccessToken } from "@ares/core";
 
 const listInputSchema = z
   .object({
@@ -42,6 +43,10 @@ interface RemoteServerConfig {
   url: string;
   headers?: Record<string, string>;
   authToken?: string;
+  /** OAuth connector — the bearer lives in the encrypted vault, not here. */
+  oauth?: boolean;
+  /** Injected at load time (the config-map key) so the vault token resolves. */
+  serverName?: string;
 }
 
 type McpServerConfig = StdioServerConfig | RemoteServerConfig;
@@ -169,6 +174,11 @@ async function loadMcpConfig(workspace: string): Promise<{ servers: Record<strin
     } catch {
       // absent or invalid; ignore here so the tool still reports what is available
     }
+  }
+  // Tag remote entries with their name so the OAuth-token resolver can find the
+  // matching vault bundle at call-time.
+  for (const [name, cfg] of Object.entries(servers)) {
+    if (isRemote(cfg)) (cfg as RemoteServerConfig).serverName = name;
   }
   return { servers, configFiles };
 }
@@ -363,8 +373,15 @@ async function withMcpClient<T>(
 ): Promise<T> {
   if (isRemote(cfg)) {
     const headers: Record<string, string> = { ...(cfg.headers ?? {}) };
-    if (cfg.authToken && !headers.Authorization && !headers.authorization) {
-      headers.Authorization = `Bearer ${cfg.authToken}`;
+    // OAuth connectors carry no secret on disk — resolve a fresh (auto-refreshed)
+    // access token from the encrypted vault at call-time. A manually pasted
+    // authToken is used as-is. Either way it becomes the bearer.
+    let bearer = cfg.authToken;
+    if (cfg.oauth && cfg.serverName) {
+      bearer = (await getMcpAccessToken(cfg.serverName).catch(() => null)) ?? bearer;
+    }
+    if (bearer && !headers.Authorization && !headers.authorization) {
+      headers.Authorization = `Bearer ${bearer}`;
     }
     const client = new HttpMcpClient(cfg.url, headers);
     let timer: ReturnType<typeof setTimeout> | undefined;

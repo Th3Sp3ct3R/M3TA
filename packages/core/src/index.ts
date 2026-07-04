@@ -145,10 +145,22 @@ export {
   registerMcpClient,
   buildMcpAuthorizeUrl,
   exchangeMcpCode,
+  refreshMcpToken,
   type McpAuthServer,
   type McpClientRegistration,
   type McpTokenResponse,
 } from "./mcpOAuth.js";
+
+export {
+  connectMcpServer,
+  disconnectMcpServer,
+  getMcpAccessToken,
+  loadRemoteMcpServers,
+  connectorNameFromUrl,
+  type RemoteMcpEntry,
+  type ConnectMcpOptions,
+  type ConnectMcpResult,
+} from "./mcpConnect.js";
 
 export {
   Session,

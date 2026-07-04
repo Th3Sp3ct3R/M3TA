@@ -156,6 +156,62 @@ export interface McpTokenResponse {
   tokenType?: string;
 }
 
+/** Parse a token endpoint's JSON into our shape (shared by code-exchange and
+ *  refresh). Throws with the server's error text when no access token is issued. */
+function parseTokenBody(
+  body: Record<string, unknown>,
+  status: number,
+  ok: boolean,
+  now: () => number,
+  prevRefresh?: string,
+): McpTokenResponse {
+  const b = body as {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    scope?: string;
+    token_type?: string;
+    error_description?: string;
+    error?: string;
+  };
+  if (!ok || !b.access_token) {
+    throw new Error(`token endpoint error: ${b.error_description || b.error || `HTTP ${status}`}`);
+  }
+  return {
+    accessToken: b.access_token,
+    // A refresh response often omits a new refresh_token — keep the old one.
+    refreshToken: b.refresh_token ?? prevRefresh,
+    expiresAt: typeof b.expires_in === "number" ? now() + b.expires_in * 1000 : undefined,
+    scope: b.scope,
+    tokenType: b.token_type,
+  };
+}
+
+/** Refresh an access token via the refresh_token grant. Used transparently when
+ *  a stored token is near expiry, so connectors keep working without a reconnect. */
+export async function refreshMcpToken(
+  input: { tokenEndpoint: string; clientId: string; clientSecret?: string; refreshToken: string; resource?: string },
+  deps: McpOAuthDeps & { now?: () => number } = {},
+): Promise<McpTokenResponse> {
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const now = deps.now ?? Date.now;
+  const form = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: input.refreshToken,
+    client_id: input.clientId,
+  });
+  if (input.clientSecret) form.set("client_secret", input.clientSecret);
+  if (input.resource) form.set("resource", input.resource);
+  const res = await fetchImpl(input.tokenEndpoint, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", Accept: "application/json" },
+    body: form.toString(),
+  }).catch(() => null);
+  if (!res) throw new Error("couldn't reach the token endpoint to refresh");
+  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  return parseTokenBody(body, res.status, res.ok, now, input.refreshToken);
+}
+
 /** Exchange an authorization code (with the PKCE verifier) for tokens at the
  *  server's token endpoint. `now` is injectable for deterministic expiry tests. */
 export async function exchangeMcpCode(

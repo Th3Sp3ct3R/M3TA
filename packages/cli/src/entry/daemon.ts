@@ -1,6 +1,6 @@
 // Extracted from entry.ts — daemon.
 
-import { authStatus, listSessions, loadSessionSnapshot, loadSessionRollout, deleteSession, renameSession, type Provider, classifyLane, runAnthropicLoginFlow, sideQuery, sideQueryJson, QueryEngine, installGlobalCrashHandlers, EventRing, probeCredentialEncryption } from "@ares/core";
+import { authStatus, listSessions, loadSessionSnapshot, loadSessionRollout, deleteSession, renameSession, type Provider, classifyLane, runAnthropicLoginFlow, sideQuery, sideQueryJson, QueryEngine, installGlobalCrashHandlers, EventRing, probeCredentialEncryption, connectMcpServer, disconnectMcpServer, loadRemoteMcpServers, connectorNameFromUrl } from "@ares/core";
 import { appendFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -1251,6 +1251,54 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
         } catch (err) {
           process.stdout.write(JSON.stringify({ type: "daemon_error", error: `session_history: ${err instanceof Error ? err.message : String(err)}` }) + "\n");
         }
+        continue;
+      }
+      if (command.type === "mcp_list") {
+        const servers = await loadRemoteMcpServers().catch(() => ({}));
+        const connectors = Object.entries(servers).map(([name, e]) => ({
+          name,
+          url: e.url,
+          displayName: e.displayName ?? name,
+          oauth: !!e.oauth,
+          connectedAt: e.connectedAt ?? null,
+        }));
+        process.stdout.write(JSON.stringify({ type: "mcp_directory", connectors }) + "\n");
+        continue;
+      }
+      if (command.type === "mcp_connect") {
+        const url = typeof command.url === "string" ? command.url.trim() : "";
+        if (!url) {
+          process.stdout.write(JSON.stringify({ type: "mcp_connect_result", ok: false, error: "a connector URL is required" }) + "\n");
+          continue;
+        }
+        const name = typeof command.name === "string" && command.name.trim() ? command.name.trim() : connectorNameFromUrl(url);
+        // The OAuth dance can take minutes (the user authorizes in a browser), so
+        // run it OFF the command loop and report via frames when it settles.
+        void (async () => {
+          try {
+            const result = await connectMcpServer(url, {
+              name,
+              onAuthorizeUrl: (authUrl) => {
+                // Reuse the existing oauth_url frame — the desktop opens it in the real browser.
+                process.stdout.write(JSON.stringify({ type: "oauth_url", url: authUrl }) + "\n");
+              },
+            });
+            const servers = await loadRemoteMcpServers().catch(() => ({}));
+            const connectors = Object.entries(servers).map(([n, e]) => ({ name: n, url: e.url, displayName: e.displayName ?? n, oauth: !!e.oauth, connectedAt: e.connectedAt ?? null }));
+            process.stdout.write(JSON.stringify({ type: "mcp_connect_result", ok: true, name: result.name }) + "\n");
+            process.stdout.write(JSON.stringify({ type: "mcp_directory", connectors }) + "\n");
+          } catch (err) {
+            process.stdout.write(JSON.stringify({ type: "mcp_connect_result", ok: false, name, error: err instanceof Error ? err.message : String(err) }) + "\n");
+          }
+        })();
+        continue;
+      }
+      if (command.type === "mcp_disconnect") {
+        const name = typeof command.name === "string" ? command.name.trim() : "";
+        await disconnectMcpServer(name).catch(() => false);
+        const servers = await loadRemoteMcpServers().catch(() => ({}));
+        const connectors = Object.entries(servers).map(([n, e]) => ({ name: n, url: e.url, displayName: e.displayName ?? n, oauth: !!e.oauth, connectedAt: e.connectedAt ?? null }));
+        process.stdout.write(JSON.stringify({ type: "mcp_directory", connectors }) + "\n");
         continue;
       }
       if (command.type === "discover_custom_models") {

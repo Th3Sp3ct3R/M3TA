@@ -12,6 +12,8 @@ import {
   registerMcpClient,
   buildMcpAuthorizeUrl,
   exchangeMcpCode,
+  refreshMcpToken,
+  connectorNameFromUrl,
 } from "../packages/core/dist/index.js";
 
 const jsonOk = (body) => ({ ok: true, status: 200, json: async () => body });
@@ -119,4 +121,27 @@ test("exchangeMcpCode surfaces the server's error", async () => {
     () => exchangeMcpCode({ tokenEndpoint: "https://auth.example/token", clientId: "x", code: "c", verifier: "v", redirectUri: "r", resource: "https://mcp.example" }, { fetchImpl }),
     /expired code/,
   );
+});
+
+test("refreshMcpToken swaps a refresh_token for a new access token, keeping the old refresh when omitted", async () => {
+  let sentForm;
+  const fetchImpl = async (url, init) => {
+    sentForm = new URLSearchParams(init.body);
+    return jsonOk({ access_token: "at2", expires_in: 3600, token_type: "Bearer" }); // no new refresh_token
+  };
+  const tok = await refreshMcpToken(
+    { tokenEndpoint: "https://auth.example/token", clientId: "dyn-123", refreshToken: "rt1", resource: "https://mcp.example" },
+    { fetchImpl, now: () => 2_000_000 },
+  );
+  assert.equal(tok.accessToken, "at2");
+  assert.equal(tok.refreshToken, "rt1"); // preserved
+  assert.equal(tok.expiresAt, 2_000_000 + 3600 * 1000);
+  assert.equal(sentForm.get("grant_type"), "refresh_token");
+  assert.equal(sentForm.get("refresh_token"), "rt1");
+});
+
+test("connectorNameFromUrl derives a brand from the host", () => {
+  assert.equal(connectorNameFromUrl("https://mcp.notion.com/sse"), "notion");
+  assert.equal(connectorNameFromUrl("https://api.linear.app/mcp"), "linear");
+  assert.equal(connectorNameFromUrl("https://mcp.sentry.dev"), "sentry");
 });
