@@ -1140,6 +1140,13 @@ interface EngineConfig {
   subagentTurnLimit?: number;
 }
 
+// WebKitGTK (the Linux webview) composites backdrop-filter and the edge-flame
+// on the CPU — the whole app turns into a slideshow. Detect Linux once at boot
+// and run in "lite" rendering mode (CSS strips the expensive effects); the
+// flame defaults to clean there too. Windows/macOS keep the full show.
+const IS_LINUX = /linux/i.test(navigator.userAgent) && !/android/i.test(navigator.userAgent);
+if (IS_LINUX) document.documentElement.dataset.perf = "lite";
+
 const PREFS_KEY = "ares.desktop.v3";
 function loadPrefs(): Prefs {
   const fallback: Prefs = {
@@ -1149,7 +1156,7 @@ function loadPrefs(): Prefs {
     routing: {},
     routingMode: "manual",
     toolDisplay: "product",
-    flameMode: "immersive",
+    flameMode: IS_LINUX ? "clean" : "immersive",
     pinned: [],
     theme: "rage",
     uiStyle: "new",
@@ -1170,7 +1177,7 @@ function loadPrefs(): Prefs {
         ? raw.routingMode
         : Object.keys(routing).length > 0 ? "auto" : "manual",
       toolDisplay: raw.toolDisplay === "technical" ? "technical" : "product",
-      flameMode: raw.flameMode === "clean" || raw.flameMode === "combat" ? raw.flameMode : "immersive",
+      flameMode: raw.flameMode === "clean" || raw.flameMode === "combat" || raw.flameMode === "immersive" ? raw.flameMode : fallback.flameMode,
       pinned: Array.isArray(raw.pinned) ? raw.pinned.filter((p): p is string => typeof p === "string") : [],
       theme: themeOk ? (raw.theme as ThemeName) : "rage",
       uiStyle: raw.uiStyle === "legacy" ? "legacy" : "new",

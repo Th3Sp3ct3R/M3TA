@@ -862,6 +862,21 @@ fn stop_voice_sidecar(state: &VoiceState) {
 }
 
 fn main() {
+    // WebKitGTK's DMABUF renderer is the #1 cause of a stuttering/black-flashing
+    // Tauri app on Linux (especially NVIDIA + Wayland). Disabling it falls back
+    // to the stable software/GL path and makes the UI feel native. Respect an
+    // explicit user override if they've already set it.
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        if env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
+            env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+        // Nouveau/llvmpipe setups also hit compositing stalls; opt-in escape
+        // hatch stays available: ARES_WEBKIT_COMPOSITING=1 re-enables.
+        if env::var("ARES_WEBKIT_COMPOSITING").as_deref() == Ok("0") {
+            env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        }
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())

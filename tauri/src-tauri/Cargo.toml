@@ -1,6 +1,6 @@
 [package]
 name = "ares-tauri"
-version = "0.13.7"
+version = "0.13.8"
 edition = "2021"
 
 [build-dependencies]
@@ -12,4 +12,8 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Windows-only shell affordances (DWM dark titlebar, ShellExecute). Everything
+# that uses these is #[cfg(windows)]-guarded, so Linux/macOS builds skip them.
+[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

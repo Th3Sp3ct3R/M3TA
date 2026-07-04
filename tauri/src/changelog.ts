@@ -38,6 +38,26 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.13.8",
+    date: "July 2026",
+    title: "Ares on Linux — for real this time",
+    tagline: "Native Linux installers, and the lag is gone.",
+    highlights: [
+      {
+        icon: "🐧",
+        title: "Linux installers",
+        tag: "New",
+        blurb: "Every release now ships an AppImage (with auto-updates) and a .deb alongside the Windows installer — same runtime, same features, same account.",
+      },
+      {
+        icon: "⚡",
+        title: "The lag fix",
+        tag: "Faster",
+        blurb: "Linux's webview was rendering Ares's blur effects and flame on the CPU — that was the slideshow. Ares now disables the buggy renderer path and runs a lite visual mode on Linux: same look, smooth feel.",
+      },
+    ],
+  },
+  {
     version: "0.13.7",
     date: "July 2026",
     title: "Bug reports that actually send",

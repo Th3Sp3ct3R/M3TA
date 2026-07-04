@@ -67,3 +67,57 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: --bundles nsis
+
+  release-linux:
+    name: Build & publish Linux installers
+    # Runs AFTER Windows so both jobs write into the same release and
+    # tauri-action MERGES latest.json (windows + linux updater entries) instead
+    # of racing and clobbering each other. The embedded runtime script is
+    # platform-aware: on this runner it bundles a Linux node binary.
+    needs: release
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # WebKitGTK 4.1 + friends — the Tauri v2 Linux build chain.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf \
+            build-essential curl wget file libssl-dev libxdo-dev
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace
+        run: pnpm build
+
+      - name: Build embedded runtime
+        run: pnpm --filter ares-tauri build:runtime
+
+      # AppImage feeds the in-app auto-updater (the only Linux format Tauri's
+      # updater supports); the .deb is for people who prefer a real install.
+      - name: Build, sign, and publish Linux bundles
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: "Ares ${{ github.ref_name }}"
+          releaseBody: "Automated release. The desktop app will offer this as an in-app update."
+          releaseDraft: false
+          prerelease: false
+          args: --bundles appimage,deb

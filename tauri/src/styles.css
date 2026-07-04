@@ -3297,3 +3297,21 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .dirCustom .primary { background: var(--ember, #e08b2e); color: #1a1206; border: none; font-weight: 700; padding: 8px 16px; border-radius: 9px; cursor: pointer; white-space: nowrap; }
 .dirCustom .primary:disabled { opacity: 0.55; cursor: default; }
 .dirFootnote { margin: 0; font-size: 11px; color: var(--dim, #8a8f98); }
+
+/* ── linux perf-lite ─────────────────────────────────────────────────────────
+   Set at boot (<html data-perf="lite">) on Linux, where WebKitGTK composites
+   backdrop-filter and the animated edge-flame on the CPU and the app crawls.
+   Strip the expensive layers, keep the look: panels go near-opaque so text
+   stays readable without the blur behind it. */
+html[data-perf="lite"] * { backdrop-filter: none !important; }
+html[data-perf="lite"] .screenFlame { display: none !important; }
+html[data-perf="lite"] .palette,
+html[data-perf="lite"] .accountMenu,
+html[data-perf="lite"] .modelSwap,
+html[data-perf="lite"] .directory,
+html[data-perf="lite"] .bugReport {
+  background-color: color-mix(in srgb, var(--panel, #17151a) 97%, black);
+}
+/* Ambient glow keyframes (pulse/shimmer style loops) repaint constantly on
+   WebKitGTK; halve their cadence rather than freezing feedback spinners. */
+html[data-perf="lite"] .brandBtn, html[data-perf="lite"] .hudVersion { animation: none; }
