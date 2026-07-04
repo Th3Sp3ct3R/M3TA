@@ -27,11 +27,27 @@ const callInputSchema = z
   })
   .strict();
 
-interface McpServerConfig {
+interface StdioServerConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
   cwd?: string;
+}
+
+/** A remote MCP server reachable over Streamable HTTP. `url` is the message
+ *  endpoint; `authToken` (or an explicit Authorization in `headers`) is the
+ *  bearer used on every request. Remote connectors persisted by the OAuth
+ *  gallery live in ~/.ares/mcp-remote.json in this shape. */
+interface RemoteServerConfig {
+  url: string;
+  headers?: Record<string, string>;
+  authToken?: string;
+}
+
+type McpServerConfig = StdioServerConfig | RemoteServerConfig;
+
+function isRemote(cfg: McpServerConfig): cfg is RemoteServerConfig {
+  return typeof (cfg as RemoteServerConfig).url === "string" && (cfg as RemoteServerConfig).url.length > 0;
 }
 
 interface McpConfig {
@@ -136,7 +152,13 @@ function extractMcpErrorText(result: unknown): string {
 
 async function loadMcpConfig(workspace: string): Promise<{ servers: Record<string, McpServerConfig>; configFiles: string[] }> {
   const home = process.env.ARES_HOME || path.join(os.homedir(), ".ares");
-  const candidates = [path.join(home, "mcp.json"), path.join(workspace, ".ares", "mcp.json")];
+  // mcp-remote.json is written by the connector gallery (remote HTTP servers);
+  // mcp.json is the classic hand-authored (usually stdio) config.
+  const candidates = [
+    path.join(home, "mcp.json"),
+    path.join(home, "mcp-remote.json"),
+    path.join(workspace, ".ares", "mcp.json"),
+  ];
   const servers: Record<string, McpServerConfig> = {};
   const configFiles: string[] = [];
   for (const file of candidates) {
@@ -244,11 +266,124 @@ class StdioMcpClient {
   }
 }
 
+/** The subset of the client both transports share — enough for list/call. */
+interface McpClient {
+  initialize(): Promise<void>;
+  request(method: string, params: unknown): Promise<unknown>;
+}
+
+/** MCP over Streamable HTTP (the remote-connector transport). One JSON-RPC
+ *  request per POST; the server answers with either a JSON body or an SSE
+ *  stream whose `data:` event carries the response. A session id handed back on
+ *  initialize is echoed on every later request. Injectable fetch for tests. */
+export class HttpMcpClient implements McpClient {
+  private nextId = 1;
+  private sessionId: string | null = null;
+  private readonly protocolVersion = "2025-06-18";
+
+  constructor(
+    private readonly url: string,
+    private readonly baseHeaders: Record<string, string> = {},
+    private readonly fetchImpl: typeof fetch = fetch,
+  ) {}
+
+  async initialize(): Promise<void> {
+    await this.request("initialize", {
+      protocolVersion: this.protocolVersion,
+      capabilities: {},
+      clientInfo: { name: "ares", version: "1" },
+    });
+    // Best-effort per spec; a server that rejects the notification must not
+    // break the session, so swallow errors here.
+    await this.send("notifications/initialized", {}, true).catch(() => undefined);
+  }
+
+  request(method: string, params: unknown): Promise<unknown> {
+    return this.send(method, params, false);
+  }
+
+  private async send(method: string, params: unknown, isNotification: boolean): Promise<unknown> {
+    const body: Record<string, unknown> = { jsonrpc: "2.0", method, params };
+    if (!isNotification) body.id = this.nextId++;
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "mcp-protocol-version": this.protocolVersion,
+      ...this.baseHeaders,
+    };
+    if (this.sessionId) headers["mcp-session-id"] = this.sessionId;
+
+    const res = await this.fetchImpl(this.url, { method: "POST", headers, body: JSON.stringify(body) });
+    const sid = res.headers.get("mcp-session-id");
+    if (sid) this.sessionId = sid;
+    if (isNotification) return undefined;
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(`MCP server rejected auth (HTTP ${res.status}) — reconnect this connector`);
+    }
+    if (!res.ok) throw new Error(`MCP HTTP ${res.status} from ${this.url}`);
+
+    const ctype = res.headers.get("content-type") ?? "";
+    const text = await res.text();
+    const message = ctype.includes("text/event-stream") ? parseSseJsonRpc(text) : safeJson(text);
+    if (message == null) throw new Error("MCP server returned an empty/unparseable response");
+    if (message.error) throw new Error(message.error.message ?? "MCP error");
+    return message.result;
+  }
+}
+
+/** Pull the first JSON-RPC response object out of an SSE body (the `data:`
+ *  lines of the last event that parses as a JSON-RPC message). */
+function parseSseJsonRpc(text: string): { result?: unknown; error?: { message?: string } } | null {
+  let last: { result?: unknown; error?: { message?: string } } | null = null;
+  for (const block of text.split(/\r?\n\r?\n/)) {
+    const data = block
+      .split(/\r?\n/)
+      .filter((l) => l.startsWith("data:"))
+      .map((l) => l.slice(5).trim())
+      .join("\n");
+    if (!data) continue;
+    const parsed = safeJson(data);
+    if (parsed && ("result" in parsed || "error" in parsed)) last = parsed;
+  }
+  return last;
+}
+
+function safeJson(text: string): { result?: unknown; error?: { message?: string } } | null {
+  try {
+    return JSON.parse(text) as { result?: unknown; error?: { message?: string } };
+  } catch {
+    return null;
+  }
+}
+
 async function withMcpClient<T>(
   cfg: McpServerConfig,
   timeoutMs: number,
-  fn: (client: StdioMcpClient) => Promise<T>,
+  fn: (client: McpClient) => Promise<T>,
 ): Promise<T> {
+  if (isRemote(cfg)) {
+    const headers: Record<string, string> = { ...(cfg.headers ?? {}) };
+    if (cfg.authToken && !headers.Authorization && !headers.authorization) {
+      headers.Authorization = `Bearer ${cfg.authToken}`;
+    }
+    const client = new HttpMcpClient(cfg.url, headers);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`MCP request timed out after ${timeoutMs}ms`)), timeoutMs);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([
+        (async () => {
+          await client.initialize();
+          return await fn(client);
+        })(),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   const child = spawn(cfg.command, cfg.args ?? [], {
     cwd: cfg.cwd,
     env: { ...process.env, ...(cfg.env ?? {}) },
