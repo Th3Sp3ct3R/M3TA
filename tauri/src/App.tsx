@@ -165,6 +165,15 @@ interface OAuthProviderVm {
   hasApp: boolean;
 }
 
+/** A connected remote MCP server (the /mcp Directory). */
+interface McpConnectorVm {
+  name: string;
+  url: string;
+  displayName?: string;
+  oauth?: boolean;
+  connectedAt?: string | null;
+}
+
 /** Ares Gateway account snapshot (doingteam.com /me via the daemon bridge). */
 interface GatewayAccountVm {
   connected?: boolean;
@@ -1643,6 +1652,10 @@ function App() {
   // Bug report: opt-in upload of the full session transcript to the gateway.
   const [reportOpen, setReportOpen] = useState(false);
   const [reportBusy, setReportBusy] = useState(false);
+  // Connector Directory (/mcp): remote MCP servers connected via OAuth.
+  const [directoryOpen, setDirectoryOpen] = useState(false);
+  const [mcpConnectors, setMcpConnectors] = useState<McpConnectorVm[]>([]);
+  const [mcpConnecting, setMcpConnecting] = useState<string | null>(null);
   // Floating-pill mode: shrink the window to an always-on-top mic bar.
   const [pill, setPill] = useState(false);
   const [pinTop, setPinTop] = useState(true);
@@ -2010,6 +2023,15 @@ function App() {
           // Server-side discovery result for the Custom provider card to consume.
           window.dispatchEvent(new CustomEvent("ares:custom-models", { detail: e }));
           return true;
+        case "mcp_directory": {
+          const list = (e as { connectors?: unknown }).connectors;
+          if (Array.isArray(list)) setMcpConnectors(list as McpConnectorVm[]);
+          return true;
+        }
+        case "mcp_connect_result":
+          setMcpConnecting(null);
+          pushGatewayToast(e.ok ? `🔌 Connected ${e.name ?? "connector"} — its tools are live.` : `Connect failed: ${e.error ? stringify(e.error) : "unknown"}`);
+          return true;
         case "oauth_status":
           if (Array.isArray(e.providers)) setOauthProviders(e.providers as OAuthProviderVm[]);
           return true;
@@ -2259,6 +2281,13 @@ function App() {
   const send = useCallback((text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return;
+    // Slash command: "/mcp" (or /connectors) opens the connector Directory
+    // instead of sending a message — the one-word way in the user asked for.
+    if (/^\/(mcp|connectors?)$/i.test(trimmed)) {
+      setDirectoryOpen(true);
+      daemonCmd({ type: "mcp_list" });
+      return;
+    }
     const sid = activeRef.current;
     // ULTRA posture: steer the agent toward the Conductor fleet for this turn.
     // Prepended to the GOAL the daemon receives (provider-agnostic) but NOT shown
@@ -2624,6 +2653,7 @@ function App() {
     { label: "Forge: sandbox", hint: "live HTML scratchpad", run: () => setForge((f) => ({ ...f, open: true, tab: "sandbox" })) },
     { label: "Forge: holotable", hint: "3D build engine", run: () => setForge((f) => ({ ...f, open: true, tab: "holo" })) },
     { label: "Settings", hint: "provider · model · keys", run: () => setSettingsOpen(true) },
+    { label: "Connectors — the Directory", hint: "/mcp · connect tools & apps", run: () => { setDirectoryOpen(true); daemonCmd({ type: "mcp_list" }); } },
     { label: "Switch model", hint: `current: ${prefs.routingMode === "auto" ? "routing (auto)" : prefs.model}`, run: () => setModelPopOpen(true) },
     { label: "Routing — the war table", hint: "per-lane model assignments", run: () => setRoutingOpen(true) },
     { label: `Reasoning effort (now ${prefs.reasoning})`, hint: "low / medium / high / max", run: () => setReasoningOpen(true) },
@@ -3357,6 +3387,19 @@ function App() {
         />
       ) : null}
 
+      {directoryOpen ? (
+        <ConnectorDirectory
+          connectors={mcpConnectors}
+          connecting={mcpConnecting}
+          onClose={() => setDirectoryOpen(false)}
+          onConnect={(url, name) => {
+            setMcpConnecting(name);
+            daemonCmd({ type: "mcp_connect", url, name });
+          }}
+          onDisconnect={(name) => daemonCmd({ type: "mcp_disconnect", name })}
+        />
+      ) : null}
+
       {modelPopOpen ? (
         <ModelPopover
           prefs={prefs}
@@ -3664,6 +3707,136 @@ function RoutingPanel({
 }
 
 // ─── Model hot-swap popover ────────────────────────────────────────────────
+
+// A curated set of popular remote MCP servers. The URLs are the servers'
+// message endpoints; connecting runs the generic OAuth flow. "Add by URL"
+// below the gallery covers everything not listed (the long tail is huge).
+interface ConnectorPreset {
+  id: string;
+  label: string;
+  url: string;
+  blurb: string;
+  glyph: string;
+}
+const CONNECTOR_PRESETS: ConnectorPreset[] = [
+  { id: "notion", label: "Notion", url: "https://mcp.notion.com/mcp", blurb: "Search & update your Notion workspace", glyph: "📝" },
+  { id: "linear", label: "Linear", url: "https://mcp.linear.app/sse", blurb: "Issues, projects & team workflows", glyph: "📐" },
+  { id: "sentry", label: "Sentry", url: "https://mcp.sentry.dev/mcp", blurb: "Search, query & debug errors", glyph: "🛡️" },
+  { id: "github", label: "GitHub", url: "https://api.githubcopilot.com/mcp/", blurb: "Repos, issues, PRs & code search", glyph: "🐙" },
+  { id: "vercel", label: "Vercel", url: "https://mcp.vercel.com", blurb: "Deployments, projects & logs", glyph: "▲" },
+  { id: "atlassian", label: "Atlassian", url: "https://mcp.atlassian.com/v1/sse", blurb: "Jira & Confluence", glyph: "🔵" },
+  { id: "asana", label: "Asana", url: "https://mcp.asana.com/sse", blurb: "Tasks, projects & goals", glyph: "🎯" },
+  { id: "stripe", label: "Stripe", url: "https://mcp.stripe.com", blurb: "Payments & financial data", glyph: "💳" },
+  { id: "cloudflare", label: "Cloudflare", url: "https://docs.mcp.cloudflare.com/sse", blurb: "Docs, Workers & platform", glyph: "☁️" },
+  { id: "supabase", label: "Supabase", url: "https://mcp.supabase.com/mcp", blurb: "Databases, auth & storage", glyph: "🟢" },
+  { id: "huggingface", label: "Hugging Face", url: "https://huggingface.co/mcp", blurb: "Models, datasets & Spaces", glyph: "🤗" },
+  { id: "square", label: "Square", url: "https://mcp.squareup.com/sse", blurb: "Payments & merchant data", glyph: "⬜" },
+];
+
+function ConnectorDirectory({
+  connectors,
+  connecting,
+  onConnect,
+  onDisconnect,
+  onClose,
+}: {
+  connectors: McpConnectorVm[];
+  connecting: string | null;
+  onConnect: (url: string, name: string) => void;
+  onDisconnect: (name: string) => void;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [customUrl, setCustomUrl] = useState("");
+  const connectedNames = new Set(connectors.map((c) => c.name));
+  const q = query.trim().toLowerCase();
+  const shown = q ? CONNECTOR_PRESETS.filter((p) => `${p.label} ${p.blurb}`.toLowerCase().includes(q)) : CONNECTOR_PRESETS;
+
+  return (
+    <div className="paletteScrim" onClick={onClose}>
+      <div className="palette directory" onClick={(e) => e.stopPropagation()}>
+        <header className="dirHead">
+          <div>
+            <strong>Directory</strong>
+            <em>Connect tools & apps — Ares does the OAuth, then their tools are live for the agent.</em>
+          </div>
+          <button className="ghost" onClick={onClose}>Close</button>
+        </header>
+
+        <input className="dirSearch" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search connectors…" spellCheck={false} autoFocus />
+
+        {connectors.length ? (
+          <>
+            <div className="dirSectionLabel">Connected</div>
+            <div className="dirConnected">
+              {connectors.map((c) => (
+                <div key={c.name} className="dirConnRow">
+                  <span className="dirConnName">🔌 {c.displayName ?? c.name}</span>
+                  <span className="dirConnUrl">{c.url}</span>
+                  <button className="dirDisconnect" onClick={() => onDisconnect(c.name)}>Disconnect</button>
+                </div>
+              ))}
+            </div>
+          </>
+        ) : null}
+
+        <div className="dirSectionLabel">Popular</div>
+        <div className="dirGallery">
+          {shown.map((p) => {
+            const isConnected = connectedNames.has(p.id) || connectedNames.has(p.label.toLowerCase());
+            const isConnecting = connecting === p.id;
+            return (
+              <button
+                key={p.id}
+                className="dirCard"
+                data-connected={isConnected ? "1" : "0"}
+                disabled={isConnected || isConnecting || connecting !== null}
+                onClick={() => onConnect(p.url, p.id)}
+                title={p.url}
+              >
+                <span className="dirCardGlyph">{p.glyph}</span>
+                <span className="dirCardBody">
+                  <strong>{p.label}</strong>
+                  <em>{p.blurb}</em>
+                </span>
+                <span className="dirCardAction">{isConnected ? "✓ connected" : isConnecting ? "connecting…" : "+ connect"}</span>
+              </button>
+            );
+          })}
+          {shown.length === 0 ? <div className="dirEmpty">No preset matches — add it by URL below.</div> : null}
+        </div>
+
+        <div className="dirSectionLabel">Add any MCP server by URL</div>
+        <div className="dirCustom">
+          <input
+            className="dirSearch"
+            value={customUrl}
+            onChange={(e) => setCustomUrl(e.target.value)}
+            placeholder="https://mcp.example.com/sse"
+            spellCheck={false}
+          />
+          <button
+            className="primary"
+            disabled={!/^https?:\/\//i.test(customUrl.trim()) || connecting !== null}
+            onClick={() => {
+              const url = customUrl.trim();
+              try {
+                const host = new URL(url).host.replace(/^www\.|^mcp\.|^api\./, "").split(".")[0];
+                onConnect(url, host || "connector");
+                setCustomUrl("");
+              } catch { /* invalid url ignored (button is gated anyway) */ }
+            }}
+          >
+            Connect
+          </button>
+        </div>
+        <p className="dirFootnote">
+          A browser window opens for you to approve access. Tokens are stored encrypted on your machine — never in plain text.
+        </p>
+      </div>
+    </div>
+  );
+}
 
 function BugReportModal({
   busy,
