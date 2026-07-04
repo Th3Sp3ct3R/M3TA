@@ -3315,3 +3315,45 @@ html[data-perf="lite"] .bugReport {
 /* Ambient glow keyframes (pulse/shimmer style loops) repaint constantly on
    WebKitGTK; halve their cadence rather than freezing feedback spinners. */
 html[data-perf="lite"] .brandBtn, html[data-perf="lite"] .hudVersion { animation: none; }
+
+/* ── daylight — the one LIGHT war-band. The forge at high noon: warm parchment
+   and iron ink instead of obsidian. Sets color-scheme:light so native controls,
+   the caret, and scrollbars flip. Overrides --line to a readable strength (the
+   accent-derived hairline is too faint on a light field) and softens the heavy
+   ember glows/shadows that only read well on black. */
+.ares[data-theme="daylight"] {
+  color-scheme: light;
+  --accent: #c0392b; --accent-hi: #e0503a; --accent-rgb: 192, 57, 43;
+  --bg: #efe9e3; --bg-raised: #ffffff; --panel: #ffffff; --panel-2: #f5efe8;
+  --text: #211a18; --muted: #5f524b; --faint: #8d7d74;
+  --ember: #d9541e; --ember-hi: #b8430f; --ember-rgb: 217, 84, 30; --blood: #e9cabc;
+  --line: rgba(70, 48, 40, 0.16);
+  --line-strong: rgba(70, 48, 40, 0.30);
+}
+/* Light-mode surface fixes — dial back effects tuned for a black room. */
+.ares[data-theme="daylight"] .screenFlame { opacity: 0.32; mix-blend-mode: multiply; }
+.ares[data-theme="daylight"] ::-webkit-scrollbar-thumb { background: rgba(70, 48, 40, 0.22); }
+.ares[data-theme="daylight"] ::-webkit-scrollbar-thumb:hover { background: rgba(70, 48, 40, 0.36); }
+.ares[data-theme="daylight"] a { color: var(--accent); }
+/* On white, panels that were mixed toward black for depth now read as clean
+   light cards with a hairline instead of a murky gray. */
+.ares[data-theme="daylight"] .palette,
+.ares[data-theme="daylight"] .accountMenu,
+.ares[data-theme="daylight"] .directory,
+.ares[data-theme="daylight"] .bugReport,
+.ares[data-theme="daylight"] .gwModelBtn {
+  background: var(--panel);
+  box-shadow: 0 18px 50px -20px rgba(40, 25, 20, 0.35);
+}
+
+/* model picker — brand glyph makes the list read like a gallery */
+.modelRow { display: flex; align-items: center; gap: 10px; }
+.modelGlyph { font-size: 16px; width: 22px; text-align: center; flex-shrink: 0;
+  opacity: 0; animation: modelGlyphIn 220ms ease forwards; animation-delay: calc(var(--i, 0) * 18ms); }
+@keyframes modelGlyphIn { from { opacity: 0; transform: translateX(-4px); } to { opacity: 1; transform: none; } }
+
+/* daylight: the stage texture is a dark photo — drop it and keep only the faint
+   astrolabe line-art so the main area is actually light. */
+.ares[data-theme="daylight"] .backdrop::before { display: none !important; }
+.ares[data-theme="daylight"] .backdrop { opacity: 0.35; }
+.ares[data-theme="daylight"] .astrolabe { opacity: 0.5; }

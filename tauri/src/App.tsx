@@ -1121,7 +1121,7 @@ interface Prefs {
   engine: EngineConfig;
 }
 
-type ThemeName = "rage" | "bronze" | "crimson" | "steel" | "nightfall" | "verdant";
+type ThemeName = "rage" | "bronze" | "crimson" | "steel" | "nightfall" | "verdant" | "daylight";
 const THEMES: Array<{ id: ThemeName; label: string; hint: string; swatch: string }> = [
   { id: "rage", label: "Blood & Rage", hint: "obsidian scorched with ember — the god of war", swatch: "#d6402e" },
   { id: "bronze", label: "Bronze", hint: "the old warband gold", swatch: "#c79a4e" },
@@ -1129,6 +1129,7 @@ const THEMES: Array<{ id: ThemeName; label: string; hint: string; swatch: string
   { id: "steel", label: "Steel Legion", hint: "cool tempered teal", swatch: "#7fa6a3" },
   { id: "nightfall", label: "Nightfall", hint: "violet dusk", swatch: "#8b8bd9" },
   { id: "verdant", label: "Verdant", hint: "emerald phalanx", swatch: "#74c39c" },
+  { id: "daylight", label: "Daylight", hint: "the forge at high noon — light mode", swatch: "#f0e9e2" },
 ];
 
 interface EngineConfig {
@@ -6000,6 +6001,27 @@ const KEYED_PROVIDERS: Array<{ id: string; label: string; placeholder: string }>
   { id: "ollama", label: "Ollama Cloud API key", placeholder: "cloud catalog; auth for OLLAMA_HOST=https://ollama.com" },
 ];
 
+// A small brand glyph per model so the picker reads like a gallery, not a
+// wall of ids. Keyed off the catalog group first, then the id prefix that
+// OpenRouter-style ids carry ("openai/…", "anthropic/…").
+function modelGlyph(m: { id: string; group?: string }): string {
+  const g = (m.group ?? "").toLowerCase();
+  if (g.includes("ares")) return "⚔️";
+  if (g.includes("anthropic")) return "🔶";
+  if (g.includes("openai")) return "🟢";
+  if (g.includes("deepseek")) return "🐋";
+  if (g.includes("ollama")) return "🦙";
+  if (g.includes("openrouter")) return "🧭";
+  if (g.includes("custom")) return "🔧";
+  if (g.includes("mock")) return "🎭";
+  const prefix = m.id.split("/")[0]?.toLowerCase() ?? "";
+  const byPrefix: Record<string, string> = {
+    openai: "🟢", anthropic: "🔶", google: "🔵", "meta-llama": "🦙", meta: "🦙",
+    mistralai: "🌫️", deepseek: "🐋", qwen: "🟣", "x-ai": "✖️", cohere: "🔗",
+  };
+  return byPrefix[prefix] ?? "🔥";
+}
+
 function ModelPicker({
   provider,
   value,
@@ -6086,6 +6108,7 @@ function ModelPicker({
               .filter((m) => m.group === g)
               .map((m, i) => (
                 <button key={m.id} className="modelRow" data-on={m.id === value ? "1" : "0"} style={{ ["--i" as string]: i }} onClick={() => choose(m.id)}>
+                  <span className="modelGlyph" aria-hidden="true">{modelGlyph(m)}</span>
                   <span className="modelIdentity">
                     {/* Friendly name leads (white-labeled for gateway models); raw id demotes to a tag. */}
                     <span className="modelId">{m.label ?? m.id}</span>

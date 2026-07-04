@@ -2,14 +2,22 @@
   ; Free the files the updater must overwrite. The running app, the node daemon /
   ; Telegram bridge it spawned, AND any GHOST node left orphaned by a previous
   ; run all hold Ares.exe and the bundled node.exe open — which made in-app
-  ; updates die with "node in use" (retry/ignore/abort) and left the daemon
-  ; unable to rebind/restart afterward. Kill the app (no /T — the updater itself
-  ; may be a child of Ares.exe and we must not kill it), then any node.exe whose
-  ; image lives under THIS install dir (never the user's unrelated node).
+  ; updates die with "Error opening file for writing … node.exe" (retry/ignore/
+  ; abort). Kill the app (no /T — the updater itself may be a child of Ares.exe
+  ; and we must not kill it), then every node.exe whose image lives under THIS
+  ; install dir (never the user's unrelated node), then WAIT until the file is
+  ; actually writable before the copy step begins.
+  ;
+  ; We match on CIM's ExecutablePath, not Get-Process().Path: the latter returns
+  ; $null for processes whose main-module path Windows won't hand back, so the
+  ; old filter silently skipped the very node.exe holding the lock. CIM is
+  ; reliable for the current user's own processes.
   nsExec::ExecToLog 'taskkill /F /IM Ares.exe'
-  nsExec::ExecToLog `powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Process node -ErrorAction SilentlyContinue | Where-Object { $$_.Path -like '$INSTDIR\*' } | Stop-Process -Force -ErrorAction SilentlyContinue"`
-  ; Let Windows release the file handles before the copy step begins.
-  Sleep 1000
+  nsExec::ExecToLog `powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object { $$_.Name -eq 'node.exe' -and $$_.ExecutablePath -like '$INSTDIR*' } | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force -ErrorAction SilentlyContinue }"`
+  ; Block until node.exe can be opened for exclusive write (handles released),
+  ; up to ~8s — so NSIS never races the OS and hits 'file in use'.
+  nsExec::ExecToLog `powershell -NoProfile -ExecutionPolicy Bypass -Command "$$f = Join-Path '$INSTDIR' 'runtime\bin\node.exe'; for ($$i = 0; $$i -lt 16; $$i++) { if (-not (Test-Path $$f)) { break }; try { $$s = [System.IO.File]::Open($$f, 'Open', 'ReadWrite', 'None'); $$s.Close(); break } catch { Start-Sleep -Milliseconds 500 } }"`
+  Sleep 500
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL

@@ -38,6 +38,32 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.13.9",
+    date: "July 2026",
+    title: "Updates that don't jam — and Light Mode",
+    tagline: "Fixed the \"node.exe in use\" update error, added a light theme, and made the model list a gallery.",
+    highlights: [
+      {
+        icon: "🩹",
+        title: "Updates install cleanly",
+        tag: "Safer",
+        blurb: "The updater was hitting \"Error opening file for writing … node.exe\" because a running Ares process still held the file. It now reliably shuts those down and waits for the file to free before installing.",
+      },
+      {
+        icon: "☀️",
+        title: "Daylight — a light theme",
+        tag: "New",
+        blurb: "Prefer a bright workspace? Settings → Appearance now has Daylight: the forge at high noon, warm parchment and iron ink instead of obsidian.",
+      },
+      {
+        icon: "🎨",
+        title: "The model picker reads like a gallery",
+        tag: "Polished",
+        blurb: "Every model now shows a provider glyph with a subtle stagger-in, so the list is scannable at a glance instead of a wall of ids.",
+      },
+    ],
+  },
+  {
     version: "0.13.8",
     date: "July 2026",
     title: "Ares on Linux — for real this time",
