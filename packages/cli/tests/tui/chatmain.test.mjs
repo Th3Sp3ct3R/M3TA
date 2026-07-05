@@ -29,7 +29,7 @@ test("ChatMain: composes header + transcript + input + status coherently", () =>
   assert.match(s, /ARES/); assert.match(s, /ares-internal/); assert.match(s, /8,421 tokens/);
   assert.match(s, /D:\/Ares/); assert.match(s, /main/);
   // transcript
-  assert.match(s, /▌ add a test/); assert.match(s, /on it/); assert.match(s, /✓ Write │ foo\.test\.ts/);
+  assert.match(s, /❯ add a test/); assert.match(s, /on it/); assert.match(s, /⏺ Write │ foo\.test\.ts/);
   // input + status
   assert.match(s, /What are we building/);
   assert.match(s, /● ready/); assert.match(s, /2 msgs/); assert.match(s, /slate/); assert.match(s, /v0\.15\.0/);

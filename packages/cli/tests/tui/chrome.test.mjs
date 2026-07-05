@@ -42,18 +42,18 @@ test("Transcript: empty state, and user/assistant/tool tones", () => {
   ];
   const f = frame(h(Transcript, { theme: SLATE, lines, width: 60 }));
   const s = strip(f);
-  assert.match(s, /▌ fix the bug/, "user row has spine");
+  assert.match(s, /❯ fix the bug/, "user row has chevron");
   assert.match(s, /on it/);
-  assert.match(s, /✓ Bash │ npm test/, "tool row");
+  assert.match(s, /⏺ Bash │ npm test/, "tool row");
   assert.match(s, /boom/);
   assert.ok(f.includes(bg(SLATE.surfaceAlt)), "user row band");
-  assert.ok(f.includes(fg(SLATE.success)), "tool ✓ success color");
+  assert.ok(f.includes(fg(SLATE.success)), "tool ⏺ success color");
   assert.ok(f.includes(fg(SLATE.danger)), "error row danger");
 });
 
 test("LogRow: failed tool shows ✗ in danger", () => {
   const f = frame(h(LogRow, { theme: SLATE, line: { tone: "tool", name: "Edit", text: "no match", ok: false }, width: 60 }));
-  assert.match(strip(f), /✗ Edit │ no match/);
+  assert.match(strip(f), /⏺ Edit │ no match/);
   assert.ok(f.includes(fg(SLATE.danger)));
 });
 

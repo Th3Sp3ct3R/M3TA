@@ -7,6 +7,7 @@ import { renderMarkdown, type MdLine, type MdSpan, type MdTheme } from "./mdRend
 import { flameLine, moltenCursor, forgeStrike, type FxSpan, type FxPalette } from "./tuiFx.js";
 import { ChatMain, mapTone } from "./ui/chat/ChatMain.js";
 import { PermissionCard } from "./ui/chat/PermissionCard.js";
+import { TodoStrip } from "./ui/chat/TodoStrip.js";
 import { SLATE } from "./ui/theme.js";
 import {
   diffHeaderLabel,
@@ -1743,7 +1744,7 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
       currentTool: activity && activity !== "responding" && activity !== "thinking" ? activity : undefined,
       fleet: slateFleet,
       scrolled: scrollOffset,
-      todosNode: todos.length > 0 ? h(TodosStrip, { theme, todos }) : undefined,
+      todosNode: todos.length > 0 ? h(TodoStrip, { theme: SLATE, todos, width: layout.screenWidth }) : undefined,
       paletteNode: paletteOpen ? h(CommandPalette, { theme, query: input, selected: paletteSel, width: layout.screenWidth }) : undefined,
       permNode: perm
         ? h(PermissionCard, { theme: SLATE, toolName: perm.toolName, reason: perm.reason, suggestion: perm.suggestion, tick: spin, width: layout.screenWidth })

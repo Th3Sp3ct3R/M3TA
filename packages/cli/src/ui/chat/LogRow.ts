@@ -1,16 +1,18 @@
-// Transcript rows — the main screen's body. Every row is tone-styled and pure;
-// the cutover feeds it from the engine's LogLine model.
+// Transcript rows — the main screen's body, redesigned around a GUTTER GRAMMAR
+// so a session reads as structured work, not a log file:
 //
-//   user       ▌ banded row (surfaceAlt)
-//   assistant  markdown-rendered prose; the streaming draft gets a live cursor
-//   tool       a live CARD: braille spinner + elapsed while running, ✓/✗ +
-//              duration + dim output preview when settled
-//   notice     secondary accent (verifier verdicts etc.)
-//   error      danger
-//   muted      dim plumbing (checkpoints, compaction)
+//   ❯ user message                          (primary chevron, banded)
 //
-// When 2+ tools are in flight at once, the batch gets a banner row so parallel
-// fan-out reads as one visible act, not scattered rows.
+//   ● assistant prose                       (dot gutter, markdown body,
+//     continuation lines indent under it)    code on a surface band)
+//     ⠹ Write │ minecraft.html  2.3s        (tools indent under the turn,
+//     ⏺ Glob │ 5 files  747ms                live spinner → colored dot)
+//       ⎿ preview line                      (results hang off the tool)
+//     ✗ EPERM …  ×5                         (identical error spam COLLAPSES)
+//
+// Every row is tone-styled and pure; the cutover feeds it from the engine's
+// LogLine model. When 2+ tools are in flight, the batch gets a banner so
+// parallel fan-out reads as one visible act.
 
 import React from "react";
 import { Box, Text } from "ink";
@@ -52,11 +54,15 @@ export function slateMdTheme(theme: SlateTheme): MdTheme {
   };
 }
 
+const IND = "  "; // everything under a turn indents beneath the gutter
+
 function AssistantProse(props: { theme: SlateTheme; line: LogLine; tick: number; width: number }): React.ReactElement {
   const { theme, line, tick, width } = props;
   const cursor = line.stream && cursorOn(tick) ? h(Text, { color: theme.primary }, "▊") : null;
+  const gutter = (first: boolean) =>
+    first ? h(Text, { color: theme.primary }, "● ") : h(Text, null, IND);
   if (!line.md) {
-    return h(Text, { color: theme.text, wrap: "wrap" }, line.text, cursor);
+    return h(Text, { wrap: "wrap" }, gutter(true), h(Text, { color: theme.text }, line.text), cursor);
   }
   const rows = renderMarkdown(line.text, slateMdTheme(theme));
   return h(
@@ -69,10 +75,14 @@ function AssistantProse(props: { theme: SlateTheme; line: LogLine; tick: number;
         h(Text, { key: `s-${j}`, color: s.color ?? theme.text, bold: s.bold, italic: s.italic, dimColor: s.dim }, s.text),
       );
       if (row.kind === "code" || row.kind === "code-fence") {
-        // Code lines sit on a subtle panel band and never wrap mid-token.
-        return h(Box, { key: `md-${i}`, width, backgroundColor: theme.surface }, h(Text, { wrap: "truncate-end" }, ...spans, last ? cursor : null));
+        // Code lines sit on a subtle panel band, indented, and never wrap mid-token.
+        return h(
+          Box,
+          { key: `md-${i}`, width, backgroundColor: theme.surface },
+          h(Text, { wrap: "truncate-end" }, h(Text, null, IND), ...spans, last ? cursor : null),
+        );
       }
-      return h(Text, { key: `md-${i}`, wrap: "wrap" }, ...spans, last ? cursor : null);
+      return h(Text, { key: `md-${i}`, wrap: "wrap" }, gutter(i === 0), ...spans, last ? cursor : null);
     }),
   );
 }
@@ -80,10 +90,11 @@ function AssistantProse(props: { theme: SlateTheme; line: LogLine; tick: number;
 function ToolCard(props: { theme: SlateTheme; line: LogLine; tick: number; width: number }): React.ReactElement {
   const { theme, line, tick, width } = props;
   if (line.running) {
-    // In flight — spinner, name in active amber, elapsed ticking on the right.
+    // In flight — spinner, name bold, elapsed ticking in active amber.
     return h(
       Text,
       { wrap: "truncate-end" },
+      h(Text, null, IND),
       h(Text, { color: theme.active }, `${spinnerFrame(tick)} `),
       h(Text, { color: theme.text, bold: true }, line.name ?? "tool"),
       h(Text, { color: theme.line }, " │ "),
@@ -92,13 +103,12 @@ function ToolCard(props: { theme: SlateTheme; line: LogLine; tick: number; width
     );
   }
   const failed = line.ok === false;
-  const mark = failed ? "✗" : "✓";
-  const color = failed ? theme.danger : theme.success;
   const head = h(
     Text,
     { wrap: "truncate-end" },
-    h(Text, { color }, `${mark} `),
-    h(Text, { color: theme.text }, line.name ?? "tool"),
+    h(Text, null, IND),
+    h(Text, { color: failed ? theme.danger : theme.success }, "⏺ "),
+    h(Text, { color: theme.text, bold: true }, line.name ?? "tool"),
     h(Text, { color: theme.line }, " │ "),
     h(Text, { color: failed ? theme.danger : theme.muted }, line.text),
     line.elapsed ? h(Text, { color: theme.faint }, `  ${line.elapsed}`) : null,
@@ -112,7 +122,7 @@ function ToolCard(props: { theme: SlateTheme; line: LogLine; tick: number; width
       h(
         Text,
         { key: `p-${i}`, wrap: "truncate-end" },
-        h(Text, { color: theme.line }, i === 0 ? "  ⤷ " : "    "),
+        h(Text, { color: theme.line }, i === 0 ? `${IND}  ⎿ ` : `${IND}    `),
         h(Text, { color: theme.faint }, p),
       ),
     ),
@@ -126,17 +136,17 @@ export function LogRow(props: { theme: SlateTheme; line: LogLine; tick?: number;
       return h(
         Box,
         { width, backgroundColor: theme.surfaceAlt },
-        h(Text, { color: theme.primary }, "▌ "),
+        h(Text, { color: theme.primary, bold: true }, "❯ "),
         h(Text, { color: theme.text, wrap: "wrap" }, line.text),
       );
     case "tool":
       return h(ToolCard, { theme, line, tick, width });
     case "notice":
-      return h(Text, { color: theme.secondary, wrap: "wrap" }, line.text);
+      return h(Text, { wrap: "wrap" }, h(Text, null, IND), h(Text, { color: theme.secondary }, "◆ "), h(Text, { color: theme.secondary }, line.text));
     case "error":
-      return h(Text, { color: theme.danger, wrap: "wrap" }, line.text);
+      return h(Text, { wrap: "wrap" }, h(Text, null, IND), h(Text, { color: theme.danger }, "✗ "), h(Text, { color: theme.danger }, line.text));
     case "muted":
-      return h(Text, { color: theme.muted, wrap: "wrap" }, line.text);
+      return h(Text, { wrap: "wrap" }, h(Text, null, IND), h(Text, { color: theme.muted }, line.text));
     case "assistant":
     default:
       return h(AssistantProse, { theme, line, tick, width });
@@ -159,10 +169,24 @@ export function Transcript(props: {
       h(Text, { color: theme.faint }, "Ready. What are we building?"),
     );
   }
+
+  // Collapse consecutive IDENTICAL error rows into one with a ×N count — five
+  // EPERM lines screaming the same path taught us what that wall looks like.
+  const folded: Array<{ line: LogLine; count: number }> = [];
+  for (const line of lines) {
+    const prev = folded[folded.length - 1];
+    if (prev && line.tone === "error" && prev.line.tone === "error" && prev.line.text === line.text) {
+      prev.count++;
+      continue;
+    }
+    folded.push({ line, count: 1 });
+  }
+
   const rows: React.ReactNode[] = [];
   const inFlight = lines.filter((l) => l.tone === "tool" && l.running).length;
   let bannerPlaced = false;
-  for (const [i, line] of lines.entries()) {
+  for (const [i, entry] of folded.entries()) {
+    const line = entry.line;
     // Turn rhythm: a breath of air before each user message (except the first
     // visible row) — turns read as separate exchanges, not one dense wall.
     if (line.tone === "user" && i > 0) {
@@ -174,11 +198,25 @@ export function Transcript(props: {
         h(
           Text,
           { key: "batch" },
+          h(Text, null, IND),
           h(Text, { color: theme.active, bold: true }, "⚡ "),
           h(Text, { color: theme.active }, `${inFlight} tools in flight`),
         ),
       );
       bannerPlaced = true;
+    }
+    if (entry.count > 1) {
+      rows.push(
+        h(
+          Text,
+          { key: `l-${i}`, wrap: "truncate-end" },
+          h(Text, null, IND),
+          h(Text, { color: theme.danger }, "✗ "),
+          h(Text, { color: theme.danger }, line.text),
+          h(Text, { color: theme.faint, bold: true }, `  ×${entry.count}`),
+        ),
+      );
+      continue;
     }
     rows.push(h(LogRow, { key: `l-${i}`, theme, line, tick, width: width - 2 }));
   }

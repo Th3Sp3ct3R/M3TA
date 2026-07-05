@@ -17,15 +17,15 @@ test("tool card: RUNNING renders a spinner + live elapsed in active amber", () =
   const s = strip(f);
   assert.match(s, /⠋ WebSearch │ searching the web {2}2\.3s/);
   assert.ok(f.includes(fg(SLATE.active)), "spinner + elapsed in active amber");
-  assert.ok(!s.includes("✓"), "a running tool must NOT read as done");
+  assert.ok(!s.includes("⏺"), "a running tool must NOT read as done");
 });
 
 test("tool card: settled shows ✓ + duration + dim preview lines", () => {
   const line = { tone: "tool", name: "Weather", text: "Houston, TX", ok: true, elapsed: "547ms", preview: ["Now: 85°F, Partly cloudy", "2026-07-05: 100°F/79°F — Sunny"] };
   const f = frame(h(LogRow, { theme: SLATE, line, tick: 0, width: 70 }));
   const s = strip(f);
-  assert.match(s, /✓ Weather │ Houston, TX {2}547ms/);
-  assert.match(s, /⤷ Now: 85°F, Partly cloudy/);
+  assert.match(s, /⏺ Weather │ Houston, TX {2}547ms/);
+  assert.match(s, /⎿ Now: 85°F, Partly cloudy/);
   assert.match(s, /2026-07-05: 100°F\/79°F — Sunny/);
 });
 
