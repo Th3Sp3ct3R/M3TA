@@ -38,9 +38,36 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.20.0",
+    date: "July 2026",
+    title: "Elite coding, cleaner story",
+    tagline: "The transcript reads like structured work now, exploration got 10x cheaper, and long sessions keep their file state through compaction.",
+    highlights: [
+      {
+        icon: "🧭",
+        title: "Cheap, wide exploration",
+        tag: "Faster",
+        blurb: "A new explorer scout fans out searches on a fast, inexpensive model and reports back conclusions with citations — wide codebase exploration without burning frontier-model tokens or clogging the main context.",
+      },
+      {
+        icon: "📌",
+        title: "Long sessions keep their footing",
+        tag: "Safer",
+        blurb: "When a long session compresses its history to free space, the files being worked on are now re-read and pinned fresh — the first edit after compression is never a blind edit against a remembered version.",
+      },
+      {
+        icon: "🧵",
+        title: "A transcript that reads like work",
+        tag: "Polished",
+        blurb: "Your messages get a chevron, replies get a clean gutter, tools tuck under the turn with their results hanging off them — and a wall of repeated errors collapses to one line with a ×count.",
+      },
+    ],
+  },
+  {
     version: "0.19.1",
     date: "July 2026",
     title: "Unkillable writes",
+    tagline: "Locked files and giant folders can no longer take a file-write down with them.",
     highlights: [
       {
         icon: "🛡️",
