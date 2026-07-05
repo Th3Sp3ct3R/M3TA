@@ -80,6 +80,8 @@ export interface UiSettings {
   customApiKey?: string;
   /** Last model id selected on the custom provider (from /models discovery). */
   lastCustomModel?: string;
+  /** Last Mixture-of-Agents ensemble picked (e.g. "moa-council"). */
+  lastMoaModel?: string;
   /** Advanced engine knobs surfaced in the desktop Advanced tab. */
   engine?: EngineConfig;
   /** Owner-toggleable permission posture (master + per-category + fleet inherit).

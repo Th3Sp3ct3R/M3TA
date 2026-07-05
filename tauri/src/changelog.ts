@@ -38,6 +38,26 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.15.0",
+    date: "July 2026",
+    title: "Pick a whole council as your model",
+    tagline: "Mixture-of-Agents: choose an ensemble in the model picker and a committee of frontier models drafts the answer, then one synthesizes the best of all of them.",
+    highlights: [
+      {
+        icon: "🜲",
+        title: "Mixture-of-Agents, one click",
+        tag: "New",
+        blurb: "There's a new \"Mixture of Agents\" provider in the model picker. Choose an ensemble like \"Frontier Council\" and Ares runs your prompt through several models independently, then a synthesizer takes the strongest reasoning from each into one answer — with tools, like any model.",
+      },
+      {
+        icon: "🧩",
+        title: "Uses whatever you've got",
+        tag: "Polished",
+        blurb: "An ensemble uses whichever of its members you have configured — the rest simply sit out, so it's useful the moment you have any of them keyed. Your pick sticks across restarts, too.",
+      },
+    ],
+  },
+  {
     version: "0.14.3",
     date: "July 2026",
     title: "\"Done\" means proven",

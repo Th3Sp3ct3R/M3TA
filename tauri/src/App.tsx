@@ -1473,6 +1473,12 @@ function useModelCatalog(provider: string, native: boolean) {
         }
         return;
       }
+      if (provider === "moa") {
+        // Ensembles come from the daemon catalog ("Mixture of Agents" group).
+        setModels([]);
+        requestDaemonCatalog();
+        return;
+      }
       // ollama: curated cloud + whatever is installed locally
       setModels(OLLAMA_CLOUD_MODELS);
       requestDaemonCatalog();
@@ -6032,7 +6038,7 @@ function Boot() {
 }
 
 // Ares (the owner gateway) leads; mock is dev-only and hidden from users.
-const PROVIDERS = ["ares", "ollama", "openai", "anthropic", "deepseek", "openrouter", "custom"];
+const PROVIDERS = ["ares", "ollama", "openai", "anthropic", "deepseek", "openrouter", "custom", "moa"];
 
 // ─── Custom (OpenAI-compatible) provider: bring-your-own URL + key + discovery ──
 // Point Ares at ANY OpenAI-compatible endpoint and pull its full model list from
@@ -6274,6 +6280,7 @@ function modelGlyph(m: { id: string; group?: string }): string {
   if (g.includes("ollama")) return "🦙";
   if (g.includes("openrouter")) return "🧭";
   if (g.includes("custom")) return "🔧";
+  if (g.includes("mixture") || g.includes("moa")) return "🜲";
   if (g.includes("mock")) return "🎭";
   const prefix = m.id.split("/")[0]?.toLowerCase() ?? "";
   const byPrefix: Record<string, string> = {

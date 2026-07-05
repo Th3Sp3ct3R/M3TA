@@ -1207,6 +1207,7 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
             // "ares-internal"/"" default. Remember them like every other provider.
             lastAresModel: provider === "ares" ? model : settings.lastAresModel,
             lastCustomModel: provider === "custom" ? model : settings.lastCustomModel,
+            lastMoaModel: provider === "moa" ? model : settings.lastMoaModel,
           });
           process.stdout.write(JSON.stringify({ type: "model_switched", provider, model }) + "\n");
         } catch (err) {

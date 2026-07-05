@@ -248,6 +248,7 @@ export async function persistTerminalModelPreference(provider: string, model: st
     // weren't being remembered. Persist them so a /model choice survives restart.
     lastAresModel: provider === "ares" ? model : settings.lastAresModel,
     lastCustomModel: provider === "custom" ? model : settings.lastCustomModel,
+    lastMoaModel: provider === "moa" ? model : settings.lastMoaModel,
   });
 }
 

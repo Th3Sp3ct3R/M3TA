@@ -1995,6 +1995,7 @@ button.small { padding: 5px 12px; font-size: 11px; border-radius: var(--r-sm); }
 .provDot[data-provider="anthropic"] { background: #d9935a; color: #d9935a; }
 .provDot[data-provider="deepseek"] { background: #5f8ff7; color: #5f8ff7; }
 .provDot[data-provider="openrouter"] { background: #8b8bd9; color: #8b8bd9; }
+.provDot[data-provider="moa"] { background: #c99a4b; color: #c99a4b; }
 .provDot[data-provider="mock"] { background: var(--faint); color: var(--faint); box-shadow: none; }
 
 .logView {

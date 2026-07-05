@@ -37,6 +37,7 @@ export {
 } from "./forkedTurn.js";
 
 export { MockEchoProvider } from "./providers/mock.js";
+export { MoaProvider, type MoaMember, type MoaProviderOptions } from "./providers/moa.js";
 export { parseRetryAfterMs } from "./providers/retryAfter.js";
 
 export {

@@ -1,6 +1,6 @@
 // Extracted from entry.ts — providers.
 
-import { MockEchoProvider, OpenAIResponsesProvider, OpenRouterProvider, DeepSeekProvider, AnthropicProvider, DEFAULT_ANTHROPIC_MODEL, OllamaCloudPool, DEFAULT_OLLAMA_SLOTS, OLLAMA_CLOUD_MODELS, fetchDeepSeekModels, fetchOpenRouterModels, fetchAnthropicModels, loadAuthToken, type Provider } from "@ares/core";
+import { MockEchoProvider, OpenAIResponsesProvider, OpenRouterProvider, DeepSeekProvider, AnthropicProvider, DEFAULT_ANTHROPIC_MODEL, OllamaCloudPool, DEFAULT_OLLAMA_SLOTS, OLLAMA_CLOUD_MODELS, fetchDeepSeekModels, fetchOpenRouterModels, fetchAnthropicModels, loadAuthToken, MoaProvider, type MoaMember, type Provider } from "@ares/core";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
 import { type SubModelPool } from "@ares/tools";
@@ -33,7 +33,40 @@ interface DaemonModelOption {
   description?: string;
 }
 
-export const TERMINAL_PROVIDERS = ["ollama", "openai", "anthropic", "deepseek", "openrouter", "ares", "custom", "mock"] as const;
+export const TERMINAL_PROVIDERS = ["ollama", "openai", "anthropic", "deepseek", "openrouter", "ares", "custom", "moa", "mock"] as const;
+
+// Mixture-of-Agents ensembles — pickable "models" under the `moa` provider.
+// Each reference drafts independently; the aggregator (tool-capable) synthesizes.
+// Members route through whatever provider they name — unconfigured ones simply
+// drop out of the committee (graceful), so an ensemble is useful the moment the
+// user has ANY of its members keyed.
+interface MoaEnsembleSpec {
+  label: string;
+  hint: string;
+  references: Array<{ provider: string; model: string; label: string }>;
+  aggregator: { provider: string; model: string };
+}
+export const MOA_ENSEMBLES: Record<string, MoaEnsembleSpec> = {
+  "moa-council": {
+    label: "MoA · Frontier Council",
+    hint: "3 frontier drafts → 1 synthesis",
+    references: [
+      { provider: "ares", model: "ares-internal", label: "Ares house" },
+      { provider: "anthropic", model: DEFAULT_ANTHROPIC_MODEL, label: "Claude" },
+      { provider: "deepseek", model: "deepseek-v4-pro", label: "DeepSeek" },
+    ],
+    aggregator: { provider: "ares", model: "ares-internal" },
+  },
+  "moa-lite": {
+    label: "MoA · Lite",
+    hint: "2 cheap drafts → 1 synthesis",
+    references: [
+      { provider: "deepseek", model: "deepseek-v4-pro", label: "DeepSeek" },
+      { provider: "openrouter", model: "openai/gpt-4o-mini", label: "GPT-4o-mini" },
+    ],
+    aggregator: { provider: "ares", model: "ares-internal" },
+  },
+};
 
 type TerminalProviderId = (typeof TERMINAL_PROVIDERS)[number];
 
@@ -229,6 +262,18 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
     return STATIC_MODEL_CATALOG[provider];
   }
 
+  if (provider === "moa") {
+    // Ensembles appear as pickable models under "Mixture of Agents".
+    return Object.entries(MOA_ENSEMBLES).map(([id, spec]) => ({
+      id,
+      label: spec.label,
+      hint: spec.hint,
+      group: "Mixture of Agents",
+      capabilities: ["tools", "reasoning"],
+      description: `An ensemble: ${spec.references.map((r) => r.label).join(", ")} each draft independently, then a synthesizer produces the final answer. Unconfigured members drop out gracefully.`,
+    }));
+  }
+
   if (provider === "anthropic") {
     // Live-fetch-with-static-fallback, same pattern as the deepseek branch below:
     // an unreachable/unauthed Anthropic API silently falls back to the curated
@@ -343,9 +388,23 @@ export function providerFamilyForSelection(selection: ProviderSelection): string
     return fromSource;
   }
   const name = selection.provider.name.toLowerCase();
+  if (name.startsWith("moa")) return "moa";
   if (name.startsWith("ollama")) return "ollama";
   if (name.startsWith("mock")) return "mock";
   return name;
+}
+
+/** Resolve a MoA ensemble's members into concrete Providers by re-entering
+ *  selectProvider per member, then build the synthetic MoaProvider. */
+async function buildMoaProvider(ensembleName: string): Promise<MoaProvider> {
+  const spec = MOA_ENSEMBLES[ensembleName] ?? MOA_ENSEMBLES["moa-council"];
+  const resolve = async (m: { provider: string; model: string; label?: string }): Promise<MoaMember> => {
+    const sel = await selectProvider(new Map([["provider", m.provider], ["model", m.model]]));
+    return { provider: sel.provider, model: sel.model, label: m.label ?? m.model };
+  };
+  const references = await Promise.all(spec.references.map(resolve));
+  const aggregator = await resolve(spec.aggregator);
+  return new MoaProvider({ ensembleName, references, aggregator });
 }
 
 export async function selectProvider(flags: Map<string, string>): Promise<ProviderSelection> {
@@ -448,6 +507,16 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
       provider: new AnthropicProvider({ apiKey: settings.anthropicKey || undefined }),
       model,
       source: explicit ? "explicit:anthropic" : "settings:anthropic",
+    };
+  }
+
+  if (preferred === "moa") {
+    // Pick an ensemble like any model; it fans out to references + aggregator.
+    const ensembleName = requestedModel ?? settings.lastMoaModel ?? "moa-council";
+    return {
+      provider: await buildMoaProvider(ensembleName),
+      model: ensembleName,
+      source: explicit ? "explicit:moa" : "settings:moa",
     };
   }
 
