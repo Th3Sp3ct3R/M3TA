@@ -113,6 +113,48 @@ export function terminalRowToAppRow(y: number, terminalRows: number, screenH: nu
   return y - Math.max(0, terminalRows - screenH);
 }
 
+// ─── Slate header geometry ────────────────────────────────────────────────────
+
+/** The slate header's row-1 model chip is a click target (opens the model
+ *  picker). Row 1 renders: ` ARES  {model} ▾` — col 1 pad, cols 2-5 wordmark,
+ *  2-space gap, then the chip through its ▾ caret. Derived from the SAME label
+ *  math the renderer uses so clicks land exactly on the glyphs. */
+export const SLATE_HEADER_MODEL_ROW = 1;
+export function slateModelSpan(model: string): ButtonSpan {
+  // Row 1 columns: " "(1) · ARES(2-5) · "  "(6-7) · model(8..7+w) · " " · ▾
+  const w = textWidth(model);
+  return { id: "models", start: 6, end: 9 + w };
+}
+
+// ─── Permission card geometry ─────────────────────────────────────────────────
+
+// The in-TUI permission prompt (a tool asked to act; the human decides). The
+// card sits directly ABOVE the status bar, so with the fixed bottom cluster
+// (toolbar row H · input rows H-1..H-3 · status row H-4 · card bottom border
+// H-5) its buttons row is always H-6 — deterministic, like the toolbar.
+export const PERM_BUTTONS: readonly ToolbarItem[] = [
+  { id: "allow_once", label: "[1] allow once" },
+  { id: "allow_always", label: "[2] always allow" },
+  { id: "deny", label: "[3] deny" },
+];
+export const PERM_BUTTON_GAP = "   ";
+export function permButtonsRow(screenH: number): number {
+  return screenH - 6;
+}
+/** Which permission button (id) sits under app-space (x, row)? null = miss.
+ *  Content starts at col 3 (border col 1 + paddingX 1). */
+export function permHitTest(x: number, row: number, screenH: number): string | null {
+  if (row !== permButtonsRow(screenH)) return null;
+  let col = 3;
+  const sep = textWidth(PERM_BUTTON_GAP);
+  for (const b of PERM_BUTTONS) {
+    const w = textWidth(b.label);
+    if (x >= col && x <= col + w - 1) return b.id;
+    col += w + sep;
+  }
+  return null;
+}
+
 // ─── Fullscreen modal geometry ────────────────────────────────────────────────
 
 // When a modal opens it REPLACES the main view — a fullscreen panel anchored at

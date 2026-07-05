@@ -6,6 +6,7 @@ import { modelContextWindow } from "./entry/sessionFactory.js";
 import { renderMarkdown, type MdLine, type MdSpan, type MdTheme } from "./mdRender.js";
 import { flameLine, moltenCursor, forgeStrike, type FxSpan, type FxPalette } from "./tuiFx.js";
 import { ChatMain, mapTone } from "./ui/chat/ChatMain.js";
+import { PermissionCard } from "./ui/chat/PermissionCard.js";
 import { SLATE } from "./ui/theme.js";
 import {
   diffHeaderLabel,
@@ -55,6 +56,9 @@ import {
   terminalRowToAppRow,
   textWidth,
   toolbarHitTest,
+  SLATE_HEADER_MODEL_ROW,
+  slateModelSpan,
+  permHitTest,
   ultraBadgeFrame,
   type SliderTokens,
 } from "./tuiChrome.js";
@@ -94,6 +98,21 @@ export interface InkChatOptions {
   handleCommand(line: string): Promise<InkCommandResult>;
   /** Structured model catalog per provider, for the ⌃M picker. */
   listModelOptions?(provider: string): Promise<Array<{ id: string; label?: string; hint?: string }>>;
+  /** Hands the TUI the live permission seam: the host routes the engine's
+   *  requestPermission through the handler registered here, so prompts render
+   *  as an IN-FRAME card (keys 1/2/3 or click) instead of a raw-stderr prompt
+   *  Ink instantly paints over — which hung turns forever. */
+  registerPermissionHandler?(
+    handler: (req: { toolName: string; reason: string; suggestion?: string }) => Promise<"allow_once" | "allow_always" | "deny">,
+  ): void;
+}
+
+/** One pending permission ask — the card renders it; a key/click resolves it. */
+interface PendingPermission {
+  toolName: string;
+  reason: string;
+  suggestion?: string;
+  resolve: (d: "allow_once" | "allow_always" | "deny") => void;
 }
 
 interface LogLine {
@@ -584,6 +603,31 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
   const [paletteSel, setPaletteSel] = useState(0);
   const [spin, setSpin] = useState(0);
   const [activity, setActivity] = useState<string | null>(null);
+  // When the current turn began — drives the live "working Ns" timer in slate.
+  const turnStartedAt = useRef<number | null>(null);
+  // ── In-frame permission prompts ──────────────────────────────────────────
+  // The engine's requestPermission lands here (via registerPermissionHandler);
+  // one card shows at a time, parallel asks queue behind it.
+  const [perm, setPerm] = useState<PendingPermission | null>(null);
+  const permRef = useRef<PendingPermission | null>(null);
+  const permQueue = useRef<PendingPermission[]>([]);
+  permRef.current = perm;
+  useEffect(() => {
+    options.registerPermissionHandler?.(
+      (req) =>
+        new Promise((resolve) => {
+          const pending: PendingPermission = { ...req, resolve };
+          if (permRef.current) permQueue.current.push(pending);
+          else setPerm(pending);
+        }),
+    );
+  }, [options]);
+  const decidePermission = useCallback((decision: "allow_once" | "allow_always" | "deny") => {
+    const current = permRef.current;
+    if (!current) return;
+    current.resolve(decision);
+    setPerm(permQueue.current.shift() ?? null);
+  }, []);
   // Fullscreen overlays — each REPLACES the main view (anchored at app row 1)
   // so every row is deterministic for the tuiChrome hit-tests.
   const [overlay, setOverlay] = useState<"models" | "effort" | "settings" | null>(null);
@@ -973,6 +1017,14 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
         collapseDiffCards();
         finalizeFleet();
         settleOrphanToolLines();
+        // A permission ask can't outlive its turn — deny + drain so no dead
+        // card lingers (its awaiter is gone; resolving is a harmless no-op).
+        if (permRef.current) {
+          permRef.current.resolve("deny");
+          for (const p of permQueue.current) p.resolve("deny");
+          permQueue.current = [];
+          setPerm(null);
+        }
         setStats((prev) => ({
           ...prev,
           turns: prev.turns + 1,
@@ -1009,6 +1061,7 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
       history.current.push(line);
       historyIndex.current = null;
       append("user", line, "send");
+      turnStartedAt.current = Date.now();
       setBusy(true);
       try {
         if (line.startsWith("/")) {
@@ -1205,6 +1258,22 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
       return;
     }
     if (event.kind === "down") {
+      // Permission card buttons (slate geometry: buttons row = screenH-6).
+      if (permRef.current && process.env.ARES_TUI !== "classic") {
+        const decision = permHitTest(event.x, appRow, layout.screenHeight);
+        if (decision) {
+          decidePermission(decision as "allow_once" | "allow_always" | "deny");
+          return;
+        }
+      }
+      // Slate header: the model chip (row 1, ` ARES  {model} ▾`) opens the picker.
+      if (process.env.ARES_TUI !== "classic" && appRow === SLATE_HEADER_MODEL_ROW) {
+        const span = slateModelSpan(snapshot.model);
+        if (event.x >= span.start && event.x <= span.end) {
+          toolbarAction("models");
+          return;
+        }
+      }
       const id = toolbarHitTest(event.x, appRow, layout.screenHeight, layout.screenWidth);
       if (id) toolbarAction(id);
     }
@@ -1226,6 +1295,23 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
     if (key.ctrl && value === "c") {
       app.exit(130);
       return;
+    }
+    // Permission card — the human's answer beats every other keybinding while
+    // a tool waits. 1/y allow once · 2/a always · 3/n/esc deny.
+    if (perm) {
+      if (value === "1" || value === "y") {
+        decidePermission("allow_once");
+        return;
+      }
+      if (value === "2" || value === "a") {
+        decidePermission("allow_always");
+        return;
+      }
+      if (value === "3" || value === "n" || key.escape) {
+        decidePermission("deny");
+        return;
+      }
+      return; // swallow everything else — the card owns the keyboard
     }
     // ⌃P command palette — fuzzy command picker (the desktop has one; now so does this).
     if (paletteOpen) {
@@ -1577,12 +1663,30 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
   if (process.env.ARES_TUI !== "classic") {
     const slateLines = visibleLines.map((l) => {
       const isTool = l.tone === "tool";
+      const running = isTool && l.startedAt != null && !l.result;
+      const resultText = l.result?.text ?? "";
+      const resultLines = resultText.split("\n").filter((s) => s.trim().length > 0);
+      // Done tool cards show the first result line as the head; the next few
+      // lines become the dim preview so rich outputs (weather, test runs) keep
+      // their substance without flooding the stream.
+      const extra = resultLines.slice(1, 5).map((s) => s.trim().slice(0, 160));
+      if (resultLines.length > 5) extra.push(`… +${resultLines.length - 5} more lines`);
+      const mapped = mapTone(l.tone);
       return {
-        tone: mapTone(l.tone),
-        text: isTool ? l.result?.text ?? l.text : l.text,
+        tone: mapped,
+        text: isTool ? (running ? l.text : resultLines[0] ?? l.text) : l.text,
         name: isTool ? l.meta || l.text.split(/\s+/)[0] : undefined,
         ok: l.result?.ok,
-        elapsed: l.result?.durationMs ? formatDuration(l.result.durationMs) : undefined,
+        running,
+        elapsed:
+          running && l.startedAt != null
+            ? formatDuration(Date.now() - l.startedAt)
+            : l.result?.durationMs
+              ? formatDuration(l.result.durationMs)
+              : undefined,
+        preview: !running && extra.length > 0 ? extra : undefined,
+        stream: l.meta === "stream",
+        md: l.tone === "assistant",
       };
     });
     const slateFleet =
@@ -1604,13 +1708,22 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
         msgs: stats.turns,
         tokens: stats.usage.inputTokens + stats.usage.outputTokens,
         total: stats.durationMs > 0 ? stats.durationMs / 1000 : undefined,
+        turnElapsed: busy && turnStartedAt.current != null ? (Date.now() - turnStartedAt.current) / 1000 : undefined,
+        tools: stats.tools,
         agents: fleet?.agents?.length,
       },
       busy,
       tick: spin,
       input,
       thinking: busy,
+      currentTool: activity && activity !== "responding" && activity !== "thinking" ? activity : undefined,
       fleet: slateFleet,
+      scrolled: scrollOffset,
+      todosNode: todos.length > 0 ? h(TodosStrip, { theme, todos }) : undefined,
+      paletteNode: paletteOpen ? h(CommandPalette, { theme, query: input, selected: paletteSel, width: layout.screenWidth }) : undefined,
+      permNode: perm
+        ? h(PermissionCard, { theme: SLATE, toolName: perm.toolName, reason: perm.reason, suggestion: perm.suggestion, tick: spin, width: layout.screenWidth })
+        : undefined,
       themeName: "slate",
       version: process.env.npm_package_version ?? "",
       width: layout.screenWidth,
@@ -1639,6 +1752,9 @@ function AresInkApp({ options }: { options: InkChatOptions }) {
     // Flex spacer: pins the bottom cluster (status → input → toolbar) to the
     // frame's true bottom, so the toolbar row = screenHeight for hit-testing.
     h(Box, { flexGrow: 1 }),
+    perm
+      ? h(PermissionCard, { theme: SLATE, toolName: perm.toolName, reason: perm.reason, suggestion: perm.suggestion, tick: spin, width: layout.screenWidth })
+      : null,
     h(StatusBar, { theme, snapshot, stats, busy, width: layout.screenWidth }),
     h(InputDeck, {
       theme,

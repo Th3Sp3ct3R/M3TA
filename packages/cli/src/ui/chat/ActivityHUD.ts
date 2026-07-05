@@ -47,13 +47,14 @@ export function ActivityHUD(props: {
 
   const kids: React.ReactNode[] = [];
 
-  // 1. thinking / current tool
+  // 1. thinking / current tool (living ellipsis — 1→2→3 dots)
   if (thinking && feed.length === 0 && !fleet) {
+    const dots = ".".repeat(1 + (Math.floor(tick / 6) % 3));
     if (currentTool) {
-      kids.push(h(Text, { key: "think", color: theme.active }, `⚡ Running ${currentTool}…`));
+      kids.push(h(Text, { key: "think", color: theme.active }, `⚡ Running ${currentTool}${dots}`));
     } else {
       const phase = THINK[Math.floor(tick / 25) % THINK.length];
-      kids.push(h(Text, { key: "think", color: pulse(tick) ? theme.primary : theme.secondary }, `✦ ${phase}…`));
+      kids.push(h(Text, { key: "think", color: pulse(tick) ? theme.primary : theme.secondary }, `✦ ${phase}${dots}`));
     }
   }
 

@@ -14,6 +14,9 @@ import { briefingLines, buildBriefing, buildContinuitySummary, buildWorldGraph, 
 import { ProviderSelection, TERMINAL_PROVIDERS, daemonModelCatalog, defaultTerminalModel, providerFamilyForSelection } from "./providers.js";
 import { ParsedArgs, cliRuntimeContext, printHelp } from "./runtime.js";
 import { LiveSession, createSession, createSessionWithSelection, handleReasoningCommand } from "./sessionFactory.js";
+import { promptPermission } from "./permissions.js";
+import type { ToolPermissionRequest } from "@ares/core";
+import type { PermissionPromptDecision } from "@ares/protocol";
 import { applyTerminalAutoRouting, applyTerminalRoutingCommand, checkpointDiffLines, checkpointLines, colorUnifiedDiff, contentFromUserInput, doctorSummaryLines, inkHelpLines, legacyProgressText, persistTerminalModelPreference, printResumed, printSessions, requireResumeSessionId, resolveResumeSessionId, resumedLines, rollbackLines, saveTheme, sessionsLines, setTerminalProviderKey, switchTerminalModel, terminalKeyLines, terminalModelCatalogLines, terminalSettingsLines, themeLines, undoLines, usageMeter } from "./terminalLines.js";
 import { finishTurn, mindSessionEnded, prepareUserTurn } from "./turnPipeline.js";
 
@@ -100,10 +103,22 @@ export async function launcherCommand(args: ParsedArgs): Promise<number> {
 }
 
 export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): Promise<number> {
+  // Permission seam: while Ink owns the terminal, the default raw-stderr
+  // prompt is instantly painted over — the engine then waits forever on a
+  // question nobody can see. The TUI registers an in-frame card handler here;
+  // until (or unless) it does, fall back to the classic prompt.
+  let inkPermissionHandler:
+    | ((req: { toolName: string; reason: string; suggestion?: string }) => Promise<PermissionPromptDecision>)
+    | null = null;
+  const requestPermission = (req: ToolPermissionRequest): Promise<PermissionPromptDecision> =>
+    inkPermissionHandler
+      ? inkPermissionHandler({ toolName: req.toolName, reason: req.reason, suggestion: req.suggestion })
+      : promptPermission(req);
+
   let live: LiveSession;
   try {
     const resumeTarget = resumeSessionId ?? (await resolveResumeSessionId(args.flags.get("resume")));
-    live = await createSession(args, resumeTarget);
+    live = await createSession(args, resumeTarget, requestPermission);
   } catch (err) {
     process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
     return 2;
@@ -120,6 +135,9 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
       snapshot,
       resumedLines: live.resumed ? resumedLines(live.resumed) : undefined,
       listModelOptions: (provider) => daemonModelCatalog(provider),
+      registerPermissionHandler: (handler) => {
+        inkPermissionHandler = handler;
+      },
       sendMessage: async (goal, onEvent) => {
         await applyTerminalAutoRouting(live, goal);
         await prepareUserTurn(live, goal);
@@ -224,7 +242,7 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
           const target = line.split(/\s+/, 2)[1] ?? "last";
           const sessionId = await requireResumeSessionId(target, live.context);
           live.agentRuntime?.stop();
-          live = await createSessionWithSelection(args, live.selection, sessionId);
+          live = await createSessionWithSelection(args, live.selection, sessionId, requestPermission);
           return { kind: "handled", lines: live.resumed ? resumedLines(live.resumed) : [`Resumed ${sessionId}`], snapshot: snapshot() };
         }
         if (line.startsWith("/workspace ")) {
@@ -234,7 +252,7 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
           if (!info?.isDirectory()) return { kind: "handled", lines: [`Not a directory: ${next}`], snapshot: snapshot() };
           live.agentRuntime?.stop();
           process.chdir(next);
-          live = await createSessionWithSelection(args, live.selection);
+          live = await createSessionWithSelection(args, live.selection, undefined, requestPermission);
           return { kind: "handled", lines: [`Active workspace is now ${live.context.workspace}`], snapshot: snapshot() };
         }
         if (line === "/reasoning" || line.startsWith("/reasoning ")) {

@@ -1839,9 +1839,22 @@ export class QueryEngine {
               // — the tool hasn't run yet, it's only waiting for a click. Pause
               // the clock across the prompt; the FULL deadline re-arms once the
               // decision lands, so the tool gets its real execution budget.
+              //
+              // But the wait is NOT infinite: if the host's prompt is broken or
+              // unanswerable (a real 23-minute hang traced here — the raw-stderr
+              // prompt was painted over by the TUI), a generous ceiling converts
+              // the eternal wedge into a correctable deny the model can react to.
               watchdog.pause();
               try {
-                const decision = await this.cfg.requestPermission!(requestWithId);
+                const waitMs = Number(process.env.ARES_PERMISSION_WAIT_MS) > 0 ? Number(process.env.ARES_PERMISSION_WAIT_MS) : 10 * 60_000;
+                let ceiling: ReturnType<typeof setTimeout> | undefined;
+                const decision = await Promise.race([
+                  this.cfg.requestPermission!(requestWithId),
+                  new Promise<PermissionPromptDecision>((resolve) => {
+                    ceiling = setTimeout(() => resolve("deny"), waitMs);
+                    ceiling.unref?.();
+                  }),
+                ]).finally(() => clearTimeout(ceiling));
                 emit({ type: "permission_response", id, decision });
                 return decision;
               } finally {

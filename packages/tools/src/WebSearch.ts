@@ -159,10 +159,11 @@ export function makeWebSearchTool(backend: SearchBackend = defaultSearchChain())
     safety: "read-only",
     concurrency: "parallel-safe",
     // Self-capping: every backend is bounded by SEARCH_BACKEND_TIMEOUT_MS, so the
-    // whole Brave→Tavily→SearXNG→DuckDuckGo chain is bounded too. Uncapped here so
-    // the engine's 20s read-only default doesn't pre-empt the chain mid-way
-    // and skip the DuckDuckGo floor a later backend would have answered.
-    watchdogTimeoutMs: 0,
+    // whole Brave→Tavily→SearXNG→DuckDuckGo chain is worst-case ~32s. 45s here
+    // clears that (the engine's 20s read-only default would pre-empt the chain
+    // mid-way) while restoring the backstop — an uncapped 0 meant any internal
+    // wedge hung the whole turn forever.
+    watchdogTimeoutMs: 45_000,
     inputZod: inputSchema,
     activityDescription: (i) => `Searching the web for ${truncate(i.query, 60)}`,
 

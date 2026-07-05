@@ -9,11 +9,11 @@ test("HUD: renders nothing when idle", () => {
   assert.equal(frame(h(ActivityHUD, { theme: SLATE, tick: 0 })), "");
 });
 
-test("HUD: thinking cycles phases; current tool shows ⚡", () => {
-  assert.match(strip(frame(h(ActivityHUD, { theme: SLATE, tick: 0, thinking: true }))), /✦ Analyzing…/);
-  assert.match(strip(frame(h(ActivityHUD, { theme: SLATE, tick: 25, thinking: true }))), /✦ Planning…/);
+test("HUD: thinking cycles phases with living dots; current tool shows ⚡", () => {
+  assert.match(strip(frame(h(ActivityHUD, { theme: SLATE, tick: 0, thinking: true }))), /✦ Analyzing\./);
+  assert.match(strip(frame(h(ActivityHUD, { theme: SLATE, tick: 25, thinking: true }))), /✦ Planning\.\./, "tick 25 → 2 dots");
   const tool = frame(h(ActivityHUD, { theme: SLATE, tick: 0, thinking: true, currentTool: "Bash" }));
-  assert.match(strip(tool), /⚡ Running Bash…/);
+  assert.match(strip(tool), /⚡ Running Bash\./);
   assert.ok(tool.includes(fg(SLATE.active)));
 });
 
