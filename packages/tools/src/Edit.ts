@@ -78,7 +78,7 @@ export interface EditOutput {
 export const EditTool = buildTool({
   name: "Edit",
   description:
-    "Replace exact text in a file (requires prior Read; tolerates CRLF/LF + trailing-whitespace drift). Single edit: old_string/new_string. Multi-site: pass `edits` — an ATOMIC, all-or-nothing batch applied in order (use this instead of many separate Edit calls on one file). Fails if an old_string is non-unique (set replace_all).",
+    "Replace exact text in a file (requires prior Read; tolerates CRLF/LF + trailing-whitespace drift). Single edit: old_string/new_string. Multi-site: pass `edits` — an ATOMIC, all-or-nothing batch applied in order (use this instead of many separate Edit calls on one file). Fails if an old_string is non-unique (set replace_all). Pick the SMALLEST old_string that is still unique — usually 2-4 adjacent lines with a distinctive token; over-long anchors are brittle to whitespace/edits, and single-line anchors are often non-unique.",
   safety: "workspace-write",
   concurrency: "exclusive",
   inputZod: inputSchema,

@@ -167,7 +167,11 @@ WHEN NOT TO USE:
 - One-off Grep with a known pattern
 - Simple edits in the current conversation
 
-Each subagent invocation is STATELESS. Make the prompt SELF-CONTAINED — the subagent cannot see your conversation. Tell it exactly what to investigate/build and what format to return in.
+Each subagent invocation is STATELESS. Make the prompt SELF-CONTAINED — the subagent cannot see your conversation. Brief it like a capable colleague with ZERO context on this task: state WHAT to do and WHY, hand over anything you already ruled out or discovered so it doesn't repeat your work, and say exactly what format to return in.
+
+Two more rules that decide whether delegation actually helps:
+- NEVER delegate the understanding. The subagent gathers evidence; YOU draw the conclusion. Don't write "investigate X and do what your findings suggest" — decide the direction yourself and give it a concrete objective. For a known lookup, hand it the exact command/pattern; for an open investigation, hand it the precise question.
+- Be explicit about WRITE vs. RESEARCH. Say whether the subagent should change files or only report back. A 'researcher' can't write; a 'general-purpose' can — pick deliberately, and if it may edit, tell it exactly what.
 
 Available subagent types:
 ${typeList}
