@@ -38,6 +38,20 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.14.3",
+    date: "July 2026",
+    title: "\"Done\" means proven",
+    tagline: "Ares can now send in an adversarial verifier that tries to break the work before calling it finished.",
+    highlights: [
+      {
+        icon: "🧪",
+        title: "It verifies against reality",
+        tag: "Safer",
+        blurb: "On non-trivial coding work, Ares can dispatch a verification specialist whose only job is to try to break the result — it runs the real build, tests, and edge-case probes, and it literally can't edit the code, so it can't fudge a pass. \"Done\" now means checked, not claimed.",
+      },
+    ],
+  },
+  {
     version: "0.14.2",
     date: "July 2026",
     title: "Model pages, not just rows",
