@@ -1,0 +1,228 @@
+name: Sync upstream (clout2buy/Ares → Th3Sp3ct3R/M3TA)
+
+# Pulls new commits from clout2buy/Ares (the upstream source-of-truth) and
+# opens a PR into Th3Sp3ct3R/M3TA (this fork). Direction is one-way:
+# upstream never receives anything from this repo.
+#
+# Triggers:
+#   - schedule: every 6 hours, catches upstream releases even if no webhook fires
+#   - workflow_dispatch: manual rerun from the Actions tab
+#
+# Required secrets (repo settings → Secrets and variables → Actions):
+#   GH_PAT  - a fine-grained PAT with Contents: Read & Write on this fork.
+#            Default GITHUB_TOKEN is intentionally avoided because it cannot
+#            push to protected branches or open PRs across forks reliably.
+#
+# Behavior:
+#   - Fast-forward merge when possible (no diverging local commits).
+#   - When this fork has diverged, open a "sync: upstream main @ <sha>" PR
+#     with --allow-unrelated-histories disabled and --no-ff so the merge
+#     commit makes the upstream source visible in the graph.
+#   - If the merge has textual conflicts, the PR is still opened but the
+#     workflow fails loudly with the conflict list so you can resolve locally.
+
+on:
+  schedule:
+    # Every 6 hours. GitHub Actions cron is UTC.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false   # never cancel a sync mid-flight
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Sync upstream into this fork
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (default branch)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/clout2buy/Ares.git
+          git remote -v
+
+      - name: Fetch upstream
+        run: git fetch upstream --prune --tags
+
+      - name: Compute divergence
+        id: diverge
+        run: |
+          set -euo pipefail
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          LOCAL_SHA=$(git rev-parse HEAD)
+          AHEAD=$(git rev-list --count upstream/main..HEAD || true)
+          BEHIND=$(git rev-list --count HEAD..upstream/main || true)
+
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "local_sha=${LOCAL_SHA}" >> "$GITHUB_OUTPUT"
+          echo "ahead=${AHEAD}" >> "$GITHUB_OUTPUT"
+          echo "behind=${BEHIND}" >> "$GITHUB_OUTPUT"
+
+          echo "Upstream HEAD: ${UPSTREAM_SHA}"
+          echo "Local HEAD:    ${LOCAL_SHA}"
+          echo "Local ahead of upstream:  ${AHEAD}"
+          echo "Local behind upstream:   ${BEHIND}"
+
+      - name: Configure git identity for the merge commit
+        run: |
+          git config user.name "Th3Sp3ct3R sync bot"
+          git config user.email "sync-bot@users.noreply.github.com"
+
+      - name: Detect fast-forward
+        id: ff
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.diverge.outputs.behind }}" -eq 0 ]; then
+            echo "fast_forward=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing to sync — local is already at or ahead of upstream."
+            exit 0
+          fi
+          if [ "${{ steps.diverge.outputs.ahead }}" -eq 0 ]; then
+            echo "fast_forward=true" >> "$GITHUB_OUTPUT"
+            echo "Local is strictly behind upstream — fast-forward is safe."
+          else
+            echo "fast_forward=false" >> "$GITHUB_OUTPUT"
+            echo "Local has diverged (ahead=${{ steps.diverge.outputs.ahead }}). Will open a merge PR."
+          fi
+
+      - name: Fast-forward merge into local main
+        if: steps.ff.outputs.fast_forward == 'true'
+        run: |
+          git merge --ff-only upstream/main
+          git push origin main
+          echo "Fast-forwarded Th3Sp3ct3R/M3TA main to upstream/main."
+
+      - name: Create sync branch for diverged merge
+        if: steps.ff.outputs.fast_forward == 'false' && steps.diverge.outputs.behind != '0'
+        id: branch
+        run: |
+          set -euo pipefail
+          UPSTREAM_SHA="${{ steps.diverge.outputs.upstream_sha }}"
+          SHORT="${UPSTREAM_SHA:0:7}"
+          BRANCH="sync/upstream-${SHORT}"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          git checkout -B "${BRANCH}" origin/main
+
+      - name: Attempt merge with no-ff
+        id: merge
+        if: steps.ff.outputs.fast_forward == 'false' && steps.diverge.outputs.behind != '0'
+        run: |
+          set -euo pipefail
+          set +e
+          git merge --no-ff --no-edit upstream/main
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "merge_status=conflict" >> "$GITHUB_OUTPUT"
+            echo "Merge produced textual conflicts. Aborting and opening a PR anyway so you can resolve on disk."
+            git merge --abort || true
+            # Re-create the branch at origin/main without the merge so the PR
+            # shows the diff between this fork and upstream.
+            git checkout --force origin/main
+          else
+            echo "merge_status=ok" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push sync branch
+        if: steps.ff.outputs.fast_forward == 'false' && steps.diverge.outputs.behind != '0'
+        run: git push origin "${{ steps.branch.outputs.branch }}" --force-with-lease
+
+      - name: Open or update sync PR
+        if: steps.ff.outputs.fast_forward == 'false' && steps.diverge.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          UPSTREAM_SHA: ${{ steps.diverge.outputs.upstream_sha }}
+          UPSTREAM_SHORT: ${{ steps.diverge.outputs.upstream_sha }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+          MERGE_STATUS: ${{ steps.merge.outputs.merge_status }}
+          AHEAD: ${{ steps.diverge.outputs.ahead }}
+          BEHIND: ${{ steps.diverge.outputs.behind }}
+        run: |
+          set -euo pipefail
+          SHORT="${UPSTREAM_SHA:0:7}"
+
+          if [ "$MERGE_STATUS" = "ok" ]; then
+            BODY=$(cat <<EOF
+          ## Upstream sync
+
+          Auto-merged \`clout2buy/Ares@${SHORT}\` into this fork.
+
+          - Commits behind upstream before sync: \`${BEHIND}\`
+          - Local commits ahead of upstream:    \`${AHEAD}\` (preserved via \`--no-ff\`)
+
+          ### Verify locally
+
+          \`\`\`bash
+          git fetch origin
+          git checkout ${BRANCH}
+          pnpm install --frozen-lockfile
+          pnpm build
+          pnpm check
+          pnpm test
+          \`\`\`
+
+          Once CI is green, merge this PR to bring the sync commit onto \`main\`.
+          EOF
+          )
+            TITLE="sync: upstream main @ ${SHORT}"
+          else
+            BODY=$(cat <<EOF
+          ## Upstream sync — manual merge required
+
+          \`clout2buy/Ares@${SHORT}\` cannot be merged cleanly into this fork.
+
+          - Local commits ahead of upstream: \`${AHEAD}\`
+          - Upstream commits to bring in:    \`${BEHIND}\`
+          - Status: textual conflict
+
+          ### Resolve locally
+
+          \`\`\`bash
+          git fetch upstream
+          git checkout ${BRANCH}
+          git merge --no-ff upstream/main
+          # resolve conflicts
+          pnpm install --frozen-lockfile
+          pnpm build
+          pnpm check
+          pnpm test
+          git push origin ${BRANCH}
+          \`\`\`
+
+          Then merge this PR.
+          EOF
+          )
+            TITLE="sync: upstream main @ ${SHORT} — manual merge required"
+          fi
+
+          # Reuse an open PR for the same upstream SHA if one exists, else open fresh.
+          EXISTING=$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing PR #${EXISTING}"
+            gh pr edit "$EXISTING" --title "$TITLE" --body "$BODY"
+          else
+            echo "Opening new sync PR"
+            gh pr create \
+              --head "${BRANCH}" \
+              --base main \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label "sync/upstream" \
+              --draft=false
+          fi
+
+      - name: Fail loudly on conflict
+        if: steps.merge.outputs.merge_status == 'conflict'
+        run: |
+          echo "::error::Upstream sync has conflicts. Resolve locally — see the opened PR."
+          exit 1
