@@ -8,18 +8,10 @@ name: Sync upstream (clout2buy/Ares → Th3Sp3ct3R/M3TA)
 #   - schedule: every 6 hours, catches upstream releases even if no webhook fires
 #   - workflow_dispatch: manual rerun from the Actions tab
 #
-# Required secrets (repo settings → Secrets and variables → Actions):
-#   GH_PAT  - a fine-grained PAT with Contents: Read & Write on this fork.
-#            Default GITHUB_TOKEN is intentionally avoided because it cannot
-#            push to protected branches or open PRs across forks reliably.
-#
-# Behavior:
-#   - Fast-forward merge when possible (no diverging local commits).
-#   - When this fork has diverged, open a "sync: upstream main @ <sha>" PR
-#     with --allow-unrelated-histories disabled and --no-ff so the merge
-#     commit makes the upstream source visible in the graph.
-#   - If the merge has textual conflicts, the PR is still opened but the
-#     workflow fails loudly with the conflict list so you can resolve locally.
+# Authentication:
+#   Uses GITHUB_TOKEN (auto-injected by GitHub Actions). No custom PAT needed.
+#   GITHUB_TOKEN has Contents + Pull Requests write on this repo, which is
+#   sufficient for a single-fork pull-style sync.
 
 on:
   schedule:
@@ -44,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GH_PAT }}
+          token: ${{ github.token }}
 
       - name: Add upstream remote
         run: |
@@ -140,7 +132,7 @@ jobs:
       - name: Open or update sync PR
         if: steps.ff.outputs.fast_forward == 'false' && steps.diverge.outputs.behind != '0'
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ github.token }}
           UPSTREAM_SHA: ${{ steps.diverge.outputs.upstream_sha }}
           UPSTREAM_SHORT: ${{ steps.diverge.outputs.upstream_sha }}
           BRANCH: ${{ steps.branch.outputs.branch }}
