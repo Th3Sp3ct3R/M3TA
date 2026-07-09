@@ -84,17 +84,57 @@ export function sanitizeForSpeech(input: string): string {
   return t.trim();
 }
 
+// ── Audio output: ONE format-agnostic contract for every voice engine ───────
+//
+// THE contract any TTS provider (built-in sidecar, a Piper/Kokoro/Coqui skill,
+// or an API like ElevenLabs/OpenAI) plugs into: return base64-encoded audio in
+// ANY standard container — WAV (any sample rate/bit depth), MP3, OGG/Opus,
+// FLAC, WebM — plus an advisory `mime`. That's it. Playback runs it through the
+// Web Audio API's decodeAudioData, which:
+//   • accepts all those formats at any sample rate (no 22050-vs-44100 games),
+//   • decodes an in-memory ArrayBuffer, so it is NOT subject to the CSP
+//     media-src blob: trap that silently killed <audio> playback,
+//   • surfaces decode failures loudly instead of a silent <audio> onerror.
+// A provider never has to care how the desktop plays sound — it just hands over
+// bytes. This is the stable seam so we never chase per-engine playback bugs again.
+
+// One shared AudioContext for the whole app (browsers cap the count). Started
+// suspended until a user gesture, so we resume it on the first interaction —
+// otherwise the very first spoken reply is silent.
+let sharedAudioCtx: AudioContext | null = null;
+function audioCtx(): AudioContext {
+  if (!sharedAudioCtx) {
+    const Ctor = (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext);
+    sharedAudioCtx = new Ctor();
+  }
+  if (sharedAudioCtx.state === "suspended") void sharedAudioCtx.resume();
+  return sharedAudioCtx;
+}
+if (typeof window !== "undefined") {
+  const wake = () => { try { audioCtx(); } catch { /* no Web Audio — browser-speech fallback covers it */ } };
+  window.addEventListener("pointerdown", wake, { once: true });
+  window.addEventListener("keydown", wake, { once: true });
+}
+
+function base64ToBytes(b64: string): ArrayBuffer {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
 // ── TTS client ─────────────────────────────────────────────────────────────
 
 interface TtsChunk { type: string; audio?: string; mime?: string; message?: string }
 
 /** A persistent /tts WebSocket with a serial audio-queue player. speak() streams
- *  one WAV per sentence and plays them in order; stop() is an immediate barge-in
- *  (cancel the server + drop the queue + halt the current clip). */
+ *  one clip per sentence and plays them in order; stop() is an immediate barge-in
+ *  (cancel the server + drop the queue + halt the current clip). All audio —
+ *  sidecar or provider skill — flows through the SAME Web Audio decode path. */
 export class TtsClient {
   private ws: WebSocket | null = null;
-  private queue: string[] = [];       // object URLs awaiting playback
-  private current: HTMLAudioElement | null = null;
+  private queue: ArrayBuffer[] = [];       // encoded audio bytes awaiting decode+play
+  private currentSource: AudioBufferSourceNode | null = null;
   private browserUtterance: SpeechSynthesisUtterance | null = null;
   private browserQueued = 0;
   private playing = false;
@@ -121,8 +161,7 @@ export class TtsClient {
         let m: TtsChunk;
         try { m = JSON.parse(e.data as string) as TtsChunk; } catch { return; }
         if (m.type === "audio" && m.audio) {
-          this.queue.push(b64ToUrl(m.audio, m.mime));
-          this.pump();
+          this.enqueueAudio(m.audio, m.mime);
         }
       };
       ws.onclose = () => { if (this.ws === ws) this.ws = null; };
@@ -132,24 +171,41 @@ export class TtsClient {
 
   private pump(): void {
     if (this.playing) return;
-    const url = this.queue.shift();
-    if (!url) {
-      if (!this.current && this.browserQueued === 0) this.onState?.(false);
+    const bytes = this.queue.shift();
+    if (!bytes) {
+      if (!this.currentSource && this.browserQueued === 0) this.onState?.(false);
       return;
     }
     this.playing = true;
     this.onState?.(true);
-    const a = new Audio(url);
-    this.current = a;
+    void this.playBytes(bytes);
+  }
+
+  /** Decode + play one encoded audio clip via Web Audio (format-agnostic). */
+  private async playBytes(bytes: ArrayBuffer): Promise<void> {
     const done = () => {
-      URL.revokeObjectURL(url);
       this.playing = false;
-      if (this.current === a) this.current = null;
+      this.currentSource = null;
       this.pump();
     };
-    a.onended = done;
-    a.onerror = done;
-    void a.play().catch(done);
+    try {
+      const ctx = audioCtx();
+      // decodeAudioData detaches its input, so decode a copy — keeps the queued
+      // buffer intact if we ever need to retry.
+      const buffer = await ctx.decodeAudioData(bytes.slice(0));
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+      src.onended = done;
+      this.currentSource = src;
+      src.start();
+    } catch (err) {
+      // A decode failure is a REAL problem (a provider returned audio the engine
+      // can't read) — log it instead of the old silent <audio> onerror that made
+      // "nothing plays" undebuggable. Then move on so one bad clip can't wedge the queue.
+      console.error("[voice] audio decode/playback failed:", err);
+      done();
+    }
   }
 
   private browserVoice(voice?: string): SpeechSynthesisVoice | undefined {
@@ -216,15 +272,15 @@ export class TtsClient {
    *  audio came from the built-in sidecar or a provider skill. */
   enqueueAudio(base64: string, mime?: string): void {
     if (!base64) return;
-    this.queue.push(b64ToUrl(base64, mime));
+    void mime; // advisory only — decodeAudioData sniffs the container itself.
+    this.queue.push(base64ToBytes(base64));
     this.pump();
   }
 
   /** Barge-in: silence everything now. */
   stop(): void {
-    this.queue.forEach((u) => URL.revokeObjectURL(u));
     this.queue = [];
-    if (this.current) { try { this.current.pause(); } catch { /* ignore */ } this.current = null; }
+    if (this.currentSource) { try { this.currentSource.stop(); } catch { /* already ended */ } this.currentSource = null; }
     if (this.browserUtterance) {
       try { window.speechSynthesis?.cancel(); } catch { /* ignore */ }
       this.browserUtterance = null;
@@ -240,13 +296,6 @@ export class TtsClient {
     try { this.ws?.close(); } catch { /* ignore */ }
     this.ws = null;
   }
-}
-
-function b64ToUrl(b64: string, mime?: string): string {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return URL.createObjectURL(new Blob([bytes], { type: mime || "audio/wav" }));
 }
 
 /** Fetch the sidecar's voice catalog (empty when it isn't running). */

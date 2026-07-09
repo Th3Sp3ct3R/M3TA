@@ -52,7 +52,7 @@ const inputSchema = z
       .array(z.string())
       .optional()
       .describe(
-        "Capabilities this skill SUPPLIES to Ares, so a toggled-on skill can override a built-in. Currently 'tts' (text-to-speech): a tts provider's handler must answer input {op:'voices'} → {voices:[{id,label}]} and {op:'tts', text, voice, speed} → {audio:<base64>, mime:'audio/wav'|'audio/mpeg'}. When this skill is enabled, Ares speaks through it instead of the built-in voice. Use for Piper/ElevenLabs/any voice engine.",
+        "Capabilities this skill SUPPLIES to Ares, so a toggled-on skill can override a built-in. Currently 'tts' (text-to-speech). THE TTS PROVIDER CONTRACT (stable — build any voice engine against it): the handler answers two ops. (1) input {op:'voices'} → {ok:true, voices:[{id,label,gender?,description?}], default?}. (2) input {op:'tts', text, voice, speed} → {ok:true, audio:'<base64>', mime:'<container>'}. `audio` is base64 of a WHOLE encoded audio file in ANY standard container — audio/wav (any sample rate/bit depth), audio/mpeg (mp3), audio/ogg (opus/vorbis), audio/flac, audio/webm. The desktop decodes it with the Web Audio API, so you do NOT resample, do NOT hand-patch WAV headers, and do NOT match a specific rate — just return the engine's native bytes + the right mime. On error return {ok:false, error}. This works identically for a local binary (Piper/Kokoro/Coqui) or an HTTP API (ElevenLabs/OpenAI/Azure) — fetch/spawn, base64 the response bytes, set mime. When enabled, Ares speaks through this instead of the built-in voice.",
       ),
     surfaces: z
       .array(z.object({ id: z.string(), label: z.string(), icon: z.string().optional(), input: z.unknown().optional(), hint: z.string().optional() }))

@@ -38,6 +38,32 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.21.3",
+    date: "July 2026",
+    title: "Voice you can actually hear",
+    tagline: "Spoken replies play for real now — through one audio engine that accepts any voice, local or API, so new voices just plug in.",
+    highlights: [
+      {
+        icon: "V",
+        title: "Voices actually play",
+        tag: "Safer",
+        blurb: "Spoken audio was being silently blocked by a security rule, so only the robotic built-in fallback made sound. It now plays through the real audio engine — your installed voices are finally audible.",
+      },
+      {
+        icon: "P",
+        title: "Any voice plugs in",
+        tag: "New",
+        blurb: "Every text-to-speech engine — Piper, Kokoro, ElevenLabs, OpenAI, whatever — now feeds one shared audio pipeline that accepts any common format at any quality. No more per-voice playback bugs.",
+      },
+      {
+        icon: "!",
+        title: "Fails loud, not silent",
+        tag: "Polished",
+        blurb: "If a voice ever returns audio the app can't read, it now says so in the logs instead of just going quiet, so problems are findable in seconds.",
+      },
+    ],
+  },
+  {
     version: "0.21.2",
     date: "July 2026",
     title: "Voice that feels live",
