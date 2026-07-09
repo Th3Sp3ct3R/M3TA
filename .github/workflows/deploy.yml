@@ -84,8 +84,10 @@ jobs:
             cd /srv/ares
             TAG="${{ inputs.image_tag || format('sha-{0}', github.sha) }}"
             sed -E -i "s|(image: registry\.digitalocean\.com/growthgod/ares:).*|\1${TAG}|" docker-compose.yml
-            docker compose pull -q
-            docker compose up -d
+            # --profile telegram so the bridge updates alongside garrison when a
+            # token is present; it's a no-op if the profile has no .env yet.
+            docker compose --profile telegram pull -q
+            docker compose --profile telegram up -d
             for i in $(seq 1 20); do
               sleep 3
               if curl -fsS http://127.0.0.1:7421/health > /dev/null; then
