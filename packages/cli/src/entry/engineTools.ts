@@ -9,7 +9,7 @@ import { loadUiSettings } from "../uiSettings.js";
 import { aresGatewayBase } from "./providers.js";
 import { makeTelegramSetupTool } from "../telegramSetupTool.js";
 import { makeTelegramRosterTool } from "../telegramRosterTool.js";
-import { BootstrapTool, MissionTool, RunSkillTool, SelfEvolveTool, SelfTool, SkillCraftTool } from "@ares/agent";
+import { BootstrapTool, MissionTool, RunSkillTool, SelfEvolveTool, SelfTool, SkillCraftTool, makeSkillHubTool } from "@ares/agent";
 import { QueryEngineDispatcher, acquireCapability, createGoal, listGoals, listAcquisitions, listCapabilities, newGoalId, novelDeltaCurve, reliabilityOf, runGoalToCompletion, saveGoal, loadStandingOrders, addStandingOrder, removeStandingOrder, renderStandingOrders, type StandingOrder, type Goal, type AcquisitionKind, type VerificationSpec } from "@ares/operator";
 import { MemoryRouter, MemoryStore, withConsolidationLock } from "@ares/mind";
 import { makeBrowserTool } from "./browserBridge.js";
@@ -124,6 +124,13 @@ export async function buildEngineTools(
     }),
     enrich,
   ) as EngineTool;
+  const skillHubTool = adaptToolForEngine(
+    makeSkillHubTool({
+      gatewayBase: settings ? aresGatewayBase(settings) : "https://www.doingteam.com",
+      gatewayToken: settings?.aresGatewayToken || process.env.ARES_GATEWAY_TOKEN,
+    }),
+    enrich,
+  ) as EngineTool;
   const operatorWorkerTools = [...workerTools, livingMindTool, browserTool];
   const operatorTool = adaptToolForEngine(
     makeOperatorChatTool({
@@ -134,7 +141,7 @@ export async function buildEngineTools(
     }),
     enrich,
   ) as EngineTool;
-  return [...workerTools, livingMindTool, standingOrderTool, operatorTool, browserTool, conductorTool, codingBackendTool];
+  return [...workerTools, livingMindTool, standingOrderTool, operatorTool, browserTool, conductorTool, codingBackendTool, skillHubTool];
 }
 
 const livingMindInput = z
@@ -368,6 +375,10 @@ function makeOperatorChatTool(opts: {
             workspace: ctx.workspace,
             tools: opts.workerTools,
             systemPrompt: buildSystemPrompt(opts.runtime.permissionMode, opts.context),
+            // This dispatcher runs INSIDE an interactive tool call — bubble the
+            // Worker's permission prompts to the live session instead of the
+            // hard "no prompt available" death (workspace-escape fleet killer).
+            requestPermission: ctx.requestPermission,
           });
           final = await runGoalToCompletion(
             {
@@ -413,6 +424,8 @@ function makeOperatorChatTool(opts: {
           workspace: ctx.workspace,
           tools: opts.workerTools,
           systemPrompt: buildSystemPrompt(opts.runtime.permissionMode, opts.context),
+          // Interactive context — bubble Worker permission prompts (see acquire).
+          requestPermission: ctx.requestPermission,
         });
         const result: Goal[] = [];
         for (const goal of targets) {

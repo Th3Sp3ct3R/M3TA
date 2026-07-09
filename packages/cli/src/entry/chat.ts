@@ -13,7 +13,7 @@ import { onLifecycle } from "@ares/agent";
 import { briefingLines, buildBriefing, buildContinuitySummary, buildWorldGraph, checkpointDiffCommand, checkpointsCommand, continuityLines, doctorCommand, loginCommand, rollbackCommand, worldGraphLines } from "./introspect.js";
 import { ProviderSelection, TERMINAL_PROVIDERS, daemonModelCatalog, defaultTerminalModel, providerFamilyForSelection } from "./providers.js";
 import { ParsedArgs, cliRuntimeContext, printHelp } from "./runtime.js";
-import { LiveSession, createSession, createSessionWithSelection, handleReasoningCommand } from "./sessionFactory.js";
+import { LiveSession, createSession, createSessionWithSelection, guardVisionForTurn, handleReasoningCommand } from "./sessionFactory.js";
 import { promptPermission } from "./permissions.js";
 import type { ToolPermissionRequest } from "@ares/core";
 import type { PermissionPromptDecision } from "@ares/protocol";
@@ -48,7 +48,9 @@ export async function runCommand(args: ParsedArgs): Promise<number> {
   });
   await prepareUserTurn(live, goal);
   let finalStatus: "completed" | "interrupted" | "failed" = "completed";
-  for await (const event of live.session.sendContent(await contentFromUserInput(goal, live.context.workspace))) {
+  const turnContent = await contentFromUserInput(goal, live.context.workspace);
+  guardVisionForTurn(live, turnContent);
+  for await (const event of live.session.sendContent(turnContent)) {
     if (event.type === "tool_end" && event.touchedFiles?.length) {
       live.verifier.scheduleFor(event.touchedFiles);
     }
@@ -156,7 +158,9 @@ export async function chatCommand(args: ParsedArgs, resumeSessionId?: string): P
         await applyTerminalAutoRouting(live, goal);
         await prepareUserTurn(live, goal);
         let finalStatus: "completed" | "interrupted" | "failed" = "completed";
-        for await (const event of live.session.sendContent(await contentFromUserInput(goal, live.context.workspace))) {
+        const turnContent = await contentFromUserInput(goal, live.context.workspace);
+        guardVisionForTurn(live, turnContent);
+        for await (const event of live.session.sendContent(turnContent)) {
           if (event.type === "tool_end" && event.touchedFiles?.length) {
             live.verifier.scheduleFor(event.touchedFiles);
           }
@@ -523,7 +527,9 @@ async function renderTurn(live: LiveSession, goal: string): Promise<void> {
   let wroteText = false;
   let wroteThinking = false;
   let finalStatus: "completed" | "interrupted" | "failed" = "completed";
-  for await (const event of live.session.sendContent(await contentFromUserInput(goal, live.context.workspace))) {
+  const turnContent = await contentFromUserInput(goal, live.context.workspace);
+  guardVisionForTurn(live, turnContent);
+  for await (const event of live.session.sendContent(turnContent)) {
     if (event.type === "text_delta") {
       if (wroteThinking) {
         process.stderr.write("\n");

@@ -183,6 +183,15 @@ export interface QueryEngineConfig {
    */
   recallFailureFix?(input: { tool: string; signature: string; error: string }): Promise<string | null>;
   requestPermission?(request: ToolPermissionRequest): Promise<PermissionPromptDecision>;
+  /**
+   * When false, a PermissionDeniedError from a tool is an ORDINARY error result
+   * the model can route around, instead of interrupting the whole turn.
+   * Interactive sessions keep the default (true): the user said no, stop.
+   * Child engines (subagents, operator forks) set false — one denied
+   * out-of-workspace path used to kill an entire researcher fleet with
+   * "(subagent produced no text output)" (bug report 96ca5473).
+   */
+  permissionDenialInterrupts?: boolean;
   beforeToolUseCheckpoint?(request: {
     toolUseId: string;
     toolName: string;
@@ -1144,7 +1153,7 @@ export class QueryEngine {
         const rawBudgetAttempts = contextBudgetAttempts(this.cfg.contextBudgetTokens ?? 0);
         const budgetAttempts = rawBudgetAttempts.map((b) => (b > 0 ? Math.max(1, Math.floor(b / this.tokenScale)) : b));
         let modelStarted = false;
-        for (let attempt = 0; attempt < budgetAttempts.length; attempt++) {
+        budgetLoop: for (let attempt = 0; attempt < budgetAttempts.length; attempt++) {
           // S1 — transient-failure retry. A retriable provider error (529
           // overloaded, 429, network blip, stream stall) that lands BEFORE any
           // model output is no longer a dead turn: back off and re-issue the
@@ -1286,6 +1295,19 @@ export class QueryEngine {
               let waitMs = Math.max(transientBackoffMs(transientRetry), streamError.retryAfterMs ?? 0);
               let note = `provider hiccup (${streamError.code}); retrying in ${(waitMs / 1000).toFixed(1)}s — attempt ${transientRetry}/${MAX_TRANSIENT_RETRIES}`;
               if (isStallError(streamError)) {
+                // Two consecutive stalls at the same window size usually mean the
+                // provider is choking on the PROMPT itself (deepseek/ollama-cloud
+                // stall silently on very large prompts) — re-issuing the same size
+                // just burns another 90s of dead air. Shrink the history window
+                // and go again instead (bug report 4a8ac088: 90s×2+ of silence).
+                if (transientRetry >= 2 && !sawCommittedOutput && attempt < budgetAttempts.length - 1) {
+                  yield {
+                    type: "system_reminder_injected",
+                    text: `Provider stalled ${transientRetry} times at this prompt size; retrying with a smaller recent-history window (${budgetAttempts[attempt + 1].toLocaleString()} tokens).`,
+                    source: "compaction",
+                  };
+                  continue budgetLoop;
+                }
                 // The effort-dial cutoff: a stall already burned its wait — retry
                 // promptly, one reasoning notch down (never below "low"), so the
                 // turn completes at reduced effort instead of spinning forever.
@@ -1857,7 +1879,7 @@ export class QueryEngine {
           // error result and the batch keeps draining.
           outcomes[index] = {
             toolUseId: use.id,
-            interrupted: isPermissionDeniedError(err),
+            interrupted: this.cfg.permissionDenialInterrupts !== false && isPermissionDeniedError(err),
             result: { type: "tool_result", tool_use_id: use.id, content: message, is_error: true },
           };
         } finally {
@@ -2091,7 +2113,7 @@ export class QueryEngine {
       }
       return {
         toolUseId: use.id,
-        interrupted: isPermissionDeniedError(err),
+        interrupted: this.cfg.permissionDenialInterrupts !== false && isPermissionDeniedError(err),
         result: {
           type: "tool_result",
           tool_use_id: use.id,
@@ -2997,14 +3019,32 @@ function describeActivity(toolName: string, input: unknown): string {
     case "Browser": {
       const action = str(i.action);
       const u = str(i.url);
-      if (action === "open") return u ? `Opening ${hostOf(u)}` : "Opening a page";
+      // Honest targets: local files and the in-app engine are NOT "the web".
+      const embedded = str(i.engine) === "embedded" || (!u && !!str(i.html));
+      const target = (() => {
+        if (!u) return embedded ? "your page in the Ares window" : "a page";
+        try {
+          const parsed = new URL(u.includes("://") ? u : `https://${u}`);
+          if (parsed.protocol === "file:") return `local file ${decodeURIComponent(parsed.pathname.split("/").pop() ?? "")}`.trim();
+          if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") return `local app ${parsed.host}`;
+          return parsed.host.replace(/^www\./, "") || u;
+        } catch {
+          return u;
+        }
+      })();
+      if (action === "open") return `Opening ${target}`;
+      if (action === "preview") return `Previewing ${target}`;
       if (action === "tree") return "Reading the page";
-      if (action === "screenshot" || action === "filmstrip") return "Capturing the screen";
+      if (action === "screenshot" || action === "filmstrip") return embedded ? "Reading the in-app page" : "Capturing the screen";
       if (action === "fill") return str(i.label) ? `Filling “${str(i.label)}”` : "Filling a field";
+      if (action === "fill_selector") return str(i.selector) ? `Typing into ${str(i.selector)}` : "Filling a field";
       if (action === "click") return str(i.name) ? `Clicking “${str(i.name)}”` : "Clicking a control";
+      if (action === "click_text") return str(i.query) ? `Clicking “${str(i.query)}”` : "Clicking a control";
+      if (action === "console") return "Reading the console";
+      if (action === "eval") return "Testing in the page";
       if (action === "state") return "Checking the page state";
       if (action === "close") return "Closing the browser";
-      return "Browsing the web";
+      return embedded ? "Using the in-app browser" : "Browsing the web";
     }
     case "ComputerUse": {
       const action = str(i.action);
