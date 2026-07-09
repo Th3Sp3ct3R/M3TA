@@ -172,32 +172,46 @@ export async function acquireBrowserPage(pw: any, opts: AcquireOptions): Promise
   }
 
   let lastError: unknown;
-  for (const attempt of browserLaunchAttempts(opts.executablePath)) {
-    try {
-      const context = await pw.chromium.launchPersistentContext(opts.userDataDir, {
-        headless: opts.headless,
-        viewport: opts.viewport,
-        // Real-browser posture so sites (esp. video — YouTube/Netflix) actually
-        // work instead of throwing "Something went wrong":
-        //  • chromiumSandbox:true   → drops the "--no-sandbox unsupported flag"
-        //    banner and restores the normal, sandboxed media pipeline.
-        //  • ignoreDefaultArgs      → strip Playwright's "--enable-automation",
-        //    the flag YouTube's player checks to refuse playback.
-        //  • AutomationControlled   → hide navigator.webdriver so anti-bot and
-        //    DRM (Widevine) treat the session as a real human's browser.
-        chromiumSandbox: true,
-        ignoreDefaultArgs: ["--enable-automation"],
-        args: ["--disable-blink-features=AutomationControlled"],
-        ...attempt.options,
-      });
-      const page = context.pages()[0] ?? (await context.newPage());
-      return { page, strategy: `launch:${attempt.label}`, close: async () => { await context.close(); } };
-    } catch (error) {
-      lastError = error;
+  const tryLaunchLadder = async (userDataDir: string, label: string): Promise<AcquiredPage | null> => {
+    for (const attempt of browserLaunchAttempts(opts.executablePath)) {
+      try {
+        const context = await pw.chromium.launchPersistentContext(userDataDir, {
+          headless: opts.headless,
+          viewport: opts.viewport,
+          // Real-browser posture so sites (esp. video — YouTube/Netflix) actually
+          // work instead of throwing "Something went wrong":
+          //  • chromiumSandbox:true   → drops the "--no-sandbox unsupported flag"
+          //    banner and restores the normal, sandboxed media pipeline.
+          //  • ignoreDefaultArgs      → strip Playwright's "--enable-automation",
+          //    the flag YouTube's player checks to refuse playback.
+          //  • AutomationControlled   → hide navigator.webdriver so anti-bot and
+          //    DRM (Widevine) treat the session as a real human's browser.
+          chromiumSandbox: true,
+          ignoreDefaultArgs: ["--enable-automation"],
+          args: ["--disable-blink-features=AutomationControlled"],
+          ...attempt.options,
+        });
+        const page = context.pages()[0] ?? (await context.newPage());
+        return { page, strategy: `launch:${attempt.label}${label}`, close: async () => { await context.close(); } };
+      } catch (error) {
+        lastError = error;
+      }
     }
-  }
+    return null;
+  };
+  const withProfile = await tryLaunchLadder(opts.userDataDir, "");
+  if (withProfile) return withProfile;
+  // Every strategy failing IDENTICALLY usually isn't four missing browsers —
+  // it's the shared persistent profile (SingletonLock from a crashed run, a
+  // corrupt dir, or the user's real Edge already holding it). A fresh throwaway
+  // profile loses cookies but turns "BROWSER_UNAVAILABLE, 5 tool failures per
+  // session" into a working browser (recurring failure across user machines).
+  const freshDir = path.join(os.tmpdir(), `ares-browser-fresh-${process.pid}-${Date.now()}`);
+  const fresh = await tryLaunchLadder(freshDir, ":fresh-profile");
+  if (fresh) return fresh;
   throw new Error(
-    `BROWSER_UNAVAILABLE: no CDP endpoint reachable and no Edge/Chrome/Chromium runtime could launch. Last error: ${String(lastError)}`,
+    `BROWSER_UNAVAILABLE: no CDP endpoint reachable and no Edge/Chrome/Chromium runtime could launch (tried the persistent profile AND a fresh temp profile). ` +
+      `Likely causes: no Chrome/Edge installed and no bundled Chromium (run \`npx playwright install chromium\`), or an antivirus blocking launches. Last error: ${String(lastError)}`,
   );
 }
 

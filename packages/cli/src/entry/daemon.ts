@@ -27,9 +27,9 @@ import { gateToolPermission } from "../policyGate.js";
 import { embeddedBridge } from "./browserBridge.js";
 import { garrisonCommand } from "./garrisonCmd.js";
 import { cleanCommandId, normalizePermissionDecision } from "./permissions.js";
-import { aresGatewayBase, daemonModelCatalog, fetchAresGatewayMe, fetchCustomOpenAiModels, postAresGatewayReport, providerFamilyForSelection, selectProvider } from "./providers.js";
+import { aresGatewayBase, daemonModelCatalog, fetchAresGatewayMe, fetchCustomOpenAiModels, postAresGatewayReport, providerFamilyForSelection, selectProvider, type ProviderSelection } from "./providers.js";
 import { ParsedArgs, cliVersion } from "./runtime.js";
-import { LiveSession, chatContextBudget, createSession, createSessionWithSelection, handleReasoningCommand, isProviderFatalError, makeSpanSummarizer, pickHealthyFallback, resolveReasoningLevel } from "./sessionFactory.js";
+import { LiveSession, chatContextBudget, createSession, createSessionWithSelection, handleReasoningCommand, isProviderFatalError, makeSpanSummarizer, modelLikelyHasVision, pickHealthyFallback, pickVisionFallback, resolveReasoningLevel } from "./sessionFactory.js";
 import { startGatewayMirror } from "./telegramWiring.js";
 import { contentFromUserInput, undoLines } from "./terminalLines.js";
 import { buildSystemPrompt, finishTurn, gatherGitRunFacts, mindSessionEnded, prepareUserTurn } from "./turnPipeline.js";
@@ -1770,8 +1770,45 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           // best-effort — never block a turn on attribution
         }
         const turnState = { status: "completed" as "completed" | "interrupted" | "failed", fatalProvider: null as string | null };
+        // Restore the user's pinned model after a one-turn vision escalation.
+        let revertSelection: ProviderSelection | null = null;
+        let escalatedSelection: ProviderSelection | null = null;
         try {
           await prepareUserTurn(entry.live, goal);
+          // ── Vision guard: never ship a pasted image to a blind model. ──
+          // A pinned text-only model (deepseek et al) used to receive the image
+          // blocks anyway and answer "can't view the image" or guess blind
+          // (sess_e4c6022d). If this turn carries images and the active model
+          // lacks vision, escalate JUST this turn to a vision-capable provider
+          // (never off the Ares Gateway), or tell the model to be honest.
+          const turnContent = await contentFromUserInput(goal, entry.live.context.workspace);
+          const hasImages = turnContent.some((block) => block.type === "image");
+          if (hasImages && !modelLikelyHasVision(entry.live.selection.model)) {
+            const pinned = entry.live.selection;
+            const visionSel = await pickVisionFallback(pinned, liveDeadProviders()).catch(() => null);
+            if (visionSel) {
+              await entry.live.session.setProvider(visionSel.provider, visionSel.model, {
+                contextBudgetTokens: chatContextBudget(visionSel),
+                summarizeSpan: makeSpanSummarizer(visionSel, (usage) =>
+                  entry.live.session.recordAuxiliaryUsage("compaction", visionSel.provider.name, visionSel.model, usage),
+                ),
+              });
+              entry.live.selection = visionSel;
+              revertSelection = pinned;
+              escalatedSelection = visionSel;
+              tagEmit(sid, {
+                type: "system_reminder_injected",
+                source: "instructions",
+                text: `Image attached — ${pinned.model} can't see images, so this turn runs on ${visionSel.provider.name}/${visionSel.model}. Your model choice is restored next turn.`,
+              });
+              tagEmit(sid, { type: "route_resolved", model: visionSel.model, provider: visionSel.provider.name, lane: entry.lane ?? "chat", source: "assigned" });
+            } else {
+              entry.live.queueSystemReminder(
+                `The user attached an image, but the current model (${pinned.model}) cannot see images and no vision-capable provider is configured. Say so plainly, describe what you'd need (a vision model — e.g. Claude, GPT-4o, or Gemini — selected in the model picker), and work from the user's text only. Do NOT guess at the image's contents.`,
+                "instructions",
+              );
+            }
+          }
           const streamOnce = async (gen: AsyncGenerator<unknown>) => {
             for await (const event of gen) {
               const ev = event as { type: string; status?: "completed" | "interrupted" | "failed"; error?: { code?: string; message?: string }; touchedFiles?: string[] };
@@ -1786,7 +1823,7 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
               tagEmit(sid, event as Record<string, unknown>);
             }
           };
-          await streamOnce(entry.live.session.sendContent(await contentFromUserInput(goal, entry.live.context.workspace)));
+          await streamOnce(entry.live.session.sendContent(turnContent));
 
           // Self-healing fallback: if the turn died because the current provider
           // is unauthenticated / out of balance / unreachable, walk healthy
@@ -1846,6 +1883,24 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           tagEmit(command.sessionId, { type: "error", error: { code: "turn_throw", message: err instanceof Error ? err.message : String(err), retriable: false } });
           tagEmit(command.sessionId, { type: "turn_end", status: "failed", usage: {}, durationMs: 0 });
         } finally {
+          // A vision escalation was for THIS turn only — hand the conversation
+          // back to the user's pinned model. If the failover loop replaced the
+          // model mid-turn (provider death), its choice wins — don't revert onto
+          // a pin that may itself be part of the problem.
+          if (revertSelection && escalatedSelection && entry.live.selection === escalatedSelection) {
+            try {
+              const pinned = revertSelection;
+              await entry.live.session.setProvider(pinned.provider, pinned.model, {
+                contextBudgetTokens: chatContextBudget(pinned),
+                summarizeSpan: makeSpanSummarizer(pinned, (usage) =>
+                  entry.live.session.recordAuxiliaryUsage("compaction", pinned.provider.name, pinned.model, usage),
+                ),
+              });
+              entry.live.selection = pinned;
+            } catch {
+              // keep the vision model rather than kill the session
+            }
+          }
           entry.turnActive = false;
           activeTurns--;
         }

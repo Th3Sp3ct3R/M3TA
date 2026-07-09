@@ -368,6 +368,10 @@ function makeOperatorChatTool(opts: {
             workspace: ctx.workspace,
             tools: opts.workerTools,
             systemPrompt: buildSystemPrompt(opts.runtime.permissionMode, opts.context),
+            // This dispatcher runs INSIDE an interactive tool call — bubble the
+            // Worker's permission prompts to the live session instead of the
+            // hard "no prompt available" death (workspace-escape fleet killer).
+            requestPermission: ctx.requestPermission,
           });
           final = await runGoalToCompletion(
             {
@@ -413,6 +417,8 @@ function makeOperatorChatTool(opts: {
           workspace: ctx.workspace,
           tools: opts.workerTools,
           systemPrompt: buildSystemPrompt(opts.runtime.permissionMode, opts.context),
+          // Interactive context — bubble Worker permission prompts (see acquire).
+          requestPermission: ctx.requestPermission,
         });
         const result: Goal[] = [];
         for (const goal of targets) {

@@ -752,7 +752,11 @@ function foldEvent(s: SessionVm, e: AresEvent): SessionVm {
       const text = e.text ?? "";
       const NOISE = new Set(["memory", "recall", "dream", "heartbeat", "hook", "skill", "compaction", "undo"]);
       const isStartupNoise = src === "instructions" && /^(Loaded |Foreground request)/i.test(text);
-      if (NOISE.has(src) || isStartupNoise) break;
+      // Compaction-source RETRY notices are the user's only signal during the
+      // provider-too-large / stall-shrink ladder — hiding them left minutes of
+      // unexplained dead air (bug 4a8ac088). Let those through, dim.
+      const isRetryStatus = /retrying with a smaller recent-history window/i.test(text);
+      if ((NOISE.has(src) && !isRetryStatus) || isStartupNoise) break;
       const tone = src === "verifier" ? "warn" : "dim";
       items.push({ kind: "notice", key: nextKey(), text: compact(text, 400), tone });
       break;
@@ -3969,7 +3973,9 @@ function BugReportModal({
       <div className="palette bugReport" onClick={(e) => e.stopPropagation()}>
         <header className="bugReportHead">
           <strong>🐛 Report a bug</strong>
-          <em>{sessionTitle}</em>
+          {/* Label the session name — a bare truncated first-message ("hey") floating
+             top-right reads as a random keyword (bug report dac60375). */}
+          <em title={`The session being reported: ${sessionTitle}`}>Session: “{sessionTitle}”</em>
         </header>
         <p className="bugReportBlurb">
           This uploads the <b>whole chat</b> — every message, all generated code, every tool call and its
