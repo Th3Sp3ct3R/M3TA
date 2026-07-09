@@ -15,6 +15,10 @@
 services:
   garrison:
     image: registry.digitalocean.com/growthgod/ares:latest
+    # Pin the daemon to the ppq.ai "custom" provider (key + base URL live
+    # AES-encrypted in the /data vault). Without this the daemon defaults to
+    # Ollama Cloud, which the droplet can't reach → turns fail "fetch failed".
+    command: ["node", "packages/cli/dist/entry.js", "garrison", "serve", "--provider", "custom", "--model", "gpt-4o-mini"]
     restart: unless-stopped
     ports:
       - "127.0.0.1:7421:7421"
@@ -32,6 +36,13 @@ services:
     # immediately without one and would flap on every deploy. Start it with:
     #   docker compose --profile telegram up -d
     profiles: ["telegram"]
+    # Secrets (ARES_TELEGRAM_BOT_TOKEN, ARES_TELEGRAM_ALLOWED_CHATS) live in
+    # /srv/ares/.env on the droplet — NEVER committed (this repo is public).
+    env_file: [.env]
+    # The bridge is an outbound WS client, not an HTTP server — the image's
+    # /health healthcheck would always fail here, so disable it for this service.
+    healthcheck:
+      disable: true
     # --url points the bridge at the garrison service over the compose network
     # (default is ws://127.0.0.1). Auth token is shared via the /data volume.
     command: ["node", "packages/cli/dist/entry.js", "telegram", "serve", "--url", "ws://garrison:7421"]
