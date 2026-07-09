@@ -9,7 +9,7 @@ import { loadUiSettings } from "../uiSettings.js";
 import { aresGatewayBase } from "./providers.js";
 import { makeTelegramSetupTool } from "../telegramSetupTool.js";
 import { makeTelegramRosterTool } from "../telegramRosterTool.js";
-import { BootstrapTool, MissionTool, RunSkillTool, SelfEvolveTool, SelfTool, SkillCraftTool } from "@ares/agent";
+import { BootstrapTool, MissionTool, RunSkillTool, SelfEvolveTool, SelfTool, SkillCraftTool, makeSkillHubTool } from "@ares/agent";
 import { QueryEngineDispatcher, acquireCapability, createGoal, listGoals, listAcquisitions, listCapabilities, newGoalId, novelDeltaCurve, reliabilityOf, runGoalToCompletion, saveGoal, loadStandingOrders, addStandingOrder, removeStandingOrder, renderStandingOrders, type StandingOrder, type Goal, type AcquisitionKind, type VerificationSpec } from "@ares/operator";
 import { MemoryRouter, MemoryStore, withConsolidationLock } from "@ares/mind";
 import { makeBrowserTool } from "./browserBridge.js";
@@ -124,6 +124,13 @@ export async function buildEngineTools(
     }),
     enrich,
   ) as EngineTool;
+  const skillHubTool = adaptToolForEngine(
+    makeSkillHubTool({
+      gatewayBase: settings ? aresGatewayBase(settings) : "https://www.doingteam.com",
+      gatewayToken: settings?.aresGatewayToken || process.env.ARES_GATEWAY_TOKEN,
+    }),
+    enrich,
+  ) as EngineTool;
   const operatorWorkerTools = [...workerTools, livingMindTool, browserTool];
   const operatorTool = adaptToolForEngine(
     makeOperatorChatTool({
@@ -134,7 +141,7 @@ export async function buildEngineTools(
     }),
     enrich,
   ) as EngineTool;
-  return [...workerTools, livingMindTool, standingOrderTool, operatorTool, browserTool, conductorTool, codingBackendTool];
+  return [...workerTools, livingMindTool, standingOrderTool, operatorTool, browserTool, conductorTool, codingBackendTool, skillHubTool];
 }
 
 const livingMindInput = z

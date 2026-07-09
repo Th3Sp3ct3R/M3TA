@@ -2187,6 +2187,20 @@ function App() {
           }
           return true;
         }
+        case "skillhub_list":
+        case "skillhub_installed":
+        case "skillhub_published":
+          // Bridge to the SkillHub browser component via a window event (avoids
+          // threading hub state through the settings tree). Refresh the local
+          // skills list after an install so a freshly-pulled skill shows at once.
+          window.dispatchEvent(new CustomEvent(`ares:${e.type}`, { detail: e }));
+          if (e.type === "skillhub_installed" && (e as { ok?: boolean }).ok) daemonCmd({ type: "skills_list" });
+          if (e.type === "skillhub_published") {
+            const ok = (e as { ok?: boolean }).ok === true;
+            setSkillToast({ name: "SkillHub", text: ok ? "Published to the SkillHub 🎉" : `Publish failed: ${(e as { error?: string }).error ?? "unknown"}`, ok });
+            window.setTimeout(() => setSkillToast(null), 4500);
+          }
+          return true;
         case "usage_stats":
           setUsageStats((e.stats as UsageStats | null) ?? null);
           return true;
@@ -7101,20 +7115,27 @@ function Settings({
                         <strong>
                           {s.name}
                           <span className="skillCat">{s.category}</span>
+                          {(s.provides ?? []).map((p) => <span key={p} className="skillCat provides">{p}</span>)}
                         </strong>
                         <span>{s.description}</span>
                       </div>
-                      <button
-                        className="toggle"
-                        data-on={s.enabled ? "1" : "0"}
-                        onClick={() => onDaemonCommand({ type: "skill_toggle", name: s.name, enabled: !s.enabled })}
-                      >
-                        <i />
-                      </button>
+                      <div className="skillRowActions">
+                        <button className="btn tiny ghost" title="Publish this skill to the SkillHub" onClick={() => onDaemonCommand({ type: "skillhub_publish", name: s.name })}>
+                          ⬆ Upload
+                        </button>
+                        <button
+                          className="toggle"
+                          data-on={s.enabled ? "1" : "0"}
+                          onClick={() => onDaemonCommand({ type: "skill_toggle", name: s.name, enabled: !s.enabled })}
+                        >
+                          <i />
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
               )}
+              <div className="skillHubSection"><SkillHubBrowser onDaemonCommand={onDaemonCommand} /></div>
             </div>
           ) : null}
 
@@ -7332,6 +7353,84 @@ const SERVICE_PROVIDERS = [
   { id: "linkedin", label: "LinkedIn", desc: "Profile & connections" },
   { id: "dropbox", label: "Dropbox", desc: "Files & sharing" },
 ];
+
+interface HubSkillMeta { id: string; name: string; description: string; author?: string; provides?: string[]; downloads?: number }
+
+// SkillHub browser — search the doingteam registry and install skills. Gated on
+// `reachable` (from the daemon's probe) so it stays a quiet "coming soon" line
+// until the backend is live rather than dead-ending. Talks to the daemon via
+// commands + window-event responses (bridged in the app-level handler).
+function SkillHubBrowser({ onDaemonCommand }: { onDaemonCommand: (cmd: Record<string, unknown>) => void }) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<HubSkillMeta[]>([]);
+  const [reachable, setReachable] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [installing, setInstalling] = useState<string | null>(null);
+  const [note, setNote] = useState<string>("");
+
+  useEffect(() => {
+    const onList = (e: Event) => {
+      const d = (e as CustomEvent).detail as { reachable?: boolean; skills?: HubSkillMeta[] };
+      setReachable(d.reachable ?? false);
+      setResults(Array.isArray(d.skills) ? d.skills : []);
+      setBusy(false);
+    };
+    const onInstalled = (e: Event) => {
+      const d = (e as CustomEvent).detail as { ok?: boolean; name?: string; error?: string };
+      setInstalling(null);
+      setNote(d.ok ? `Installed ${d.name} — enable it above.` : `Install failed: ${d.error ?? "unknown"}`);
+      window.setTimeout(() => setNote(""), 4000);
+    };
+    window.addEventListener("ares:skillhub_list", onList);
+    window.addEventListener("ares:skillhub_installed", onInstalled);
+    return () => { window.removeEventListener("ares:skillhub_list", onList); window.removeEventListener("ares:skillhub_installed", onInstalled); };
+  }, []);
+
+  // Probe once on mount.
+  useEffect(() => { setBusy(true); onDaemonCommand({ type: "skillhub_list", text: "" }); }, [onDaemonCommand]);
+
+  const search = () => { setBusy(true); onDaemonCommand({ type: "skillhub_list", text: query }); };
+  const install = (id: string) => { setInstalling(id); onDaemonCommand({ type: "skillhub_install", id }); };
+
+  if (reachable === false) {
+    return <p className="paneHint">🌐 SkillHub — the shared skill registry on doingteam. Not live yet; when it is, you'll browse and one-click install community skills right here.</p>;
+  }
+  return (
+    <div className="skillHub">
+      <div className="skillHubHead">
+        <strong>🌐 SkillHub</strong>
+        <span className="paneHint">Browse & install skills the community published.</span>
+      </div>
+      <div className="skillHubSearch">
+        <input className="txt" placeholder="Search skills — e.g. spotify, weather, video…" value={query}
+          onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") search(); }} />
+        <button className="btn" onClick={search} disabled={busy}>{busy ? "…" : "Search"}</button>
+      </div>
+      {note ? <div className="skillHubNote">{note}</div> : null}
+      {results.length === 0 ? (
+        <div className="paneEmpty">{busy ? "Searching the hub…" : "No skills found. Try another search."}</div>
+      ) : (
+        <div className="skillHubGrid">
+          {results.map((s) => (
+            <div key={s.id} className="skillHubCard">
+              <div className="skillHubCardHead">
+                <strong>{s.name}</strong>
+                {(s.provides ?? []).map((p) => <span key={p} className="skillHubTag">{p}</span>)}
+              </div>
+              <p>{s.description}</p>
+              <div className="skillHubCardFoot">
+                <span>{s.author ? `by ${s.author}` : ""}{typeof s.downloads === "number" ? ` · ${s.downloads}↓` : ""}</span>
+                <button className="btn tiny" onClick={() => install(s.id)} disabled={installing === s.id}>
+                  {installing === s.id ? "Installing…" : "Install"}
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // The active-skills dock — a floating, animated tray. Core voice controls (a
 // living orb reflecting idle/listening/speaking, quick on/off, conversation

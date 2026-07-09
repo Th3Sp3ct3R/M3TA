@@ -18,7 +18,7 @@ import { prepareEngineBinary } from "../engineBinary.js";
 import { captureScreen } from "../screenCapture.js";
 import { ConsciousnessWatch, WATCHER_VOICE_PROMPT } from "../watch.js";
 import { recordConsciousnessObservation } from "../consciousnessContext.js";
-import { aresAgentHome, onLifecycle, runSkill } from "@ares/agent";
+import { aresAgentHome, onLifecycle, runSkill, skillHubProbe, skillHubList, skillHubGet, skillHubPublish, installHubSkill, readLocalSkillFiles } from "@ares/agent";
 import { QueryEngineDispatcher, OperatorBackgroundLoop, deriveLeash, domainOf, isOperatorPaused, listGoals, loadStandingOrders, materializeDueStandingOrders, type StandingOrder } from "@ares/operator";
 import { MemoryStore, reflectOnRun, detectWorkspaceProjectId, loadProjectState, buildConversationDigest, mergeDurableFacts, CONVERSATION_REFLECT_SYSTEM, DURABLE_FACTS_SCHEMA_HINT, type DurableFact } from "@ares/mind";
 import { OAUTH_PROVIDERS, PROVIDER_LABELS, startOAuthFlow, connectedProviders, getProviderConfig, setCredential, hasCredential, deleteCredential, clientIdName, clientSecretName, runAresAccountSignin, probeAresOauth } from "@ares/core";
@@ -1579,6 +1579,41 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           error: run.ok ? undefined : (run.error ?? "skill failed"),
           durationMs: Date.now() - started,
         }) + "\n");
+        continue;
+      }
+      if (command.type === "skillhub_list") {
+        const gwSettings = await loadUiSettings();
+        const base = aresGatewayBase(gwSettings);
+        const reachable = await skillHubProbe(base);
+        const skills = reachable ? await skillHubList(base, typeof command.text === "string" ? command.text : "").catch(() => []) : [];
+        process.stdout.write(JSON.stringify({ type: "skillhub_list", reachable, skills }) + "\n");
+        continue;
+      }
+      if (command.type === "skillhub_install") {
+        const gwSettings = await loadUiSettings();
+        const base = aresGatewayBase(gwSettings);
+        const id = typeof command.id === "string" ? command.id : "";
+        const files = id ? await skillHubGet(base, id).catch(() => null) : null;
+        if (!files) {
+          process.stdout.write(JSON.stringify({ type: "skillhub_installed", ok: false, error: "skill not found on the hub" }) + "\n");
+          continue;
+        }
+        const res = await installHubSkill(live.context.home, files).then((r) => ({ ok: true as const, ...r })).catch((e) => ({ ok: false as const, error: e instanceof Error ? e.message : String(e) }));
+        process.stdout.write(JSON.stringify({ type: "skillhub_installed", ...res }) + "\n");
+        continue;
+      }
+      if (command.type === "skillhub_publish") {
+        const gwSettings = await loadUiSettings();
+        const base = aresGatewayBase(gwSettings);
+        const token = gwSettings.aresGatewayToken || process.env.ARES_GATEWAY_TOKEN || "";
+        const name = typeof command.name === "string" ? command.name : "";
+        const files = name ? await readLocalSkillFiles(live.context.home, name).catch(() => null) : null;
+        if (!files) {
+          process.stdout.write(JSON.stringify({ type: "skillhub_published", ok: false, error: "local skill not found" }) + "\n");
+          continue;
+        }
+        const res = await skillHubPublish(base, token, files);
+        process.stdout.write(JSON.stringify({ type: "skillhub_published", ...res }) + "\n");
         continue;
       }
       if (command.type === "usage_stats") {
