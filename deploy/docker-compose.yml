@@ -28,6 +28,10 @@ services:
 
   telegram:
     image: registry.digitalocean.com/growthgod/ares:latest
+    # Off by default until a bot token is seeded (ENG-136): the bridge exits
+    # immediately without one and would flap on every deploy. Start it with:
+    #   docker compose --profile telegram up -d
+    profiles: ["telegram"]
     # --url points the bridge at the garrison service over the compose network
     # (default is ws://127.0.0.1). Auth token is shared via the /data volume.
     command: ["node", "packages/cli/dist/entry.js", "telegram", "serve", "--url", "ws://garrison:7421"]
