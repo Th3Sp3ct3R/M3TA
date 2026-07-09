@@ -1,0 +1,44 @@
+# Ares on the droplet. Source of truth for /srv/ares/docker-compose.yml.
+#
+#   docker compose up -d          # start / apply
+#   docker compose logs -f garrison
+#
+# Exposure model: the garrison container listens on 0.0.0.0 INSIDE its
+# namespace, but the host mapping pins it to 127.0.0.1 — reach it via
+# Tailscale + SSH tunnel, never a public interface. The telegram bridge is
+# pure outbound long-polling (verified: zero listening sockets) and needs
+# no port mapping at all.
+#
+# The image tag is rewritten by the deploy workflow to an immutable
+# sha-<commit> tag; `latest` is only the bootstrap default.
+
+services:
+  garrison:
+    image: registry.digitalocean.com/growthgod/ares:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7421:7421"
+    volumes:
+      - /srv/ares/home:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  telegram:
+    image: registry.digitalocean.com/growthgod/ares:latest
+    # --url points the bridge at the garrison service over the compose network
+    # (default is ws://127.0.0.1). Auth token is shared via the /data volume.
+    command: ["node", "packages/cli/dist/entry.js", "telegram", "serve", "--url", "ws://garrison:7421"]
+    restart: unless-stopped
+    depends_on:
+      garrison:
+        condition: service_healthy
+    volumes:
+      - /srv/ares/home:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

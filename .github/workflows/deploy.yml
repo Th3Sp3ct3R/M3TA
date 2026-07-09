@@ -1,0 +1,99 @@
+name: Deploy (DigitalOcean)
+
+# Every green push to main builds an immutable image (sha-<commit>) and rolls
+# it onto the ares-garrison droplet. Rollback: run this workflow manually with
+# image_tag set to any previous sha-… tag (skips build, ~1 minute).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Existing image tag to deploy/roll back to (skips build)"
+        required: false
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false # never kill a deploy mid-flight
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: registry.digitalocean.com/growthgod
+  IMAGE: registry.digitalocean.com/growthgod/ares
+
+jobs:
+  test:
+    name: Test gate
+    if: ${{ !inputs.image_tag }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: node --test tests/*.test.mjs
+
+  build-push:
+    name: Build & push image
+    if: ${{ !inputs.image_tag }}
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to DOCR
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: ${{ secrets.DO_REGISTRY_TOKEN }}
+          password: ${{ secrets.DO_REGISTRY_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to droplet
+    needs: [build-push]
+    if: ${{ always() && (needs.build-push.result == 'success' || inputs.image_tag) }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: deploy
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd /srv/ares
+            TAG="${{ inputs.image_tag || format('sha-{0}', github.sha) }}"
+            sed -E -i "s|(image: registry\.digitalocean\.com/growthgod/ares:).*|\1${TAG}|" docker-compose.yml
+            docker compose pull -q
+            docker compose up -d
+            for i in $(seq 1 20); do
+              sleep 3
+              if curl -fsS http://127.0.0.1:7421/health > /dev/null; then
+                echo "healthy on tag ${TAG}"
+                docker image prune -f > /dev/null
+                exit 0
+              fi
+            done
+            echo "HEALTHCHECK FAILED for ${TAG}"
+            docker compose logs --tail 100 garrison
+            exit 1
