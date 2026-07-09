@@ -96,6 +96,7 @@ export class TtsClient {
   private queue: string[] = [];       // object URLs awaiting playback
   private current: HTMLAudioElement | null = null;
   private browserUtterance: SpeechSynthesisUtterance | null = null;
+  private browserQueued = 0;
   private playing = false;
   private seq = 0;
   private onState?: (speaking: boolean) => void;
@@ -133,7 +134,7 @@ export class TtsClient {
     if (this.playing) return;
     const url = this.queue.shift();
     if (!url) {
-      if (!this.current) this.onState?.(false);
+      if (!this.current && this.browserQueued === 0) this.onState?.(false);
       return;
     }
     this.playing = true;
@@ -175,20 +176,23 @@ export class TtsClient {
     }
     return new Promise((resolve, reject) => {
       const utterance = new SpeechSynthesisUtterance(text);
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        this.browserQueued = Math.max(0, this.browserQueued - 1);
+        if (this.browserUtterance === utterance) this.browserUtterance = null;
+        this.onState?.(this.browserQueued > 0 || this.playing || this.queue.length > 0);
+        if (error) reject(error);
+        else resolve();
+      };
       const selected = this.browserVoice(voice);
       if (selected) utterance.voice = selected;
       utterance.rate = Math.min(2, Math.max(0.5, speed || 1));
       utterance.onstart = () => this.onState?.(true);
-      utterance.onend = () => {
-        if (this.browserUtterance === utterance) this.browserUtterance = null;
-        this.onState?.(false);
-        resolve();
-      };
-      utterance.onerror = () => {
-        if (this.browserUtterance === utterance) this.browserUtterance = null;
-        this.onState?.(false);
-        reject(new Error("browser speech synthesis failed"));
-      };
+      utterance.onend = () => finish();
+      utterance.onerror = () => finish(new Error("browser speech synthesis failed"));
+      this.browserQueued += 1;
       this.browserUtterance = utterance;
       synth.speak(utterance);
     });
@@ -225,6 +229,7 @@ export class TtsClient {
       try { window.speechSynthesis?.cancel(); } catch { /* ignore */ }
       this.browserUtterance = null;
     }
+    this.browserQueued = 0;
     this.playing = false;
     try { this.ws?.send(JSON.stringify({ type: "cancel" })); } catch { /* ignore */ }
     this.onState?.(false);
@@ -276,6 +281,8 @@ export interface UseTtsOptions {
  *  disabled, `stop` is the barge-in used by conversation mode + manual stop. */
 export function useTts(opts: UseTtsOptions) {
   const clientRef = useRef<TtsClient | null>(null);
+  const providerQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const speechEpochRef = useRef(0);
   const [speaking, setSpeaking] = useState(false);
   const optsRef = useRef(opts);
   optsRef.current = opts;
@@ -288,7 +295,11 @@ export function useTts(opts: UseTtsOptions) {
 
   // Disabling voice mid-utterance stops it immediately.
   useEffect(() => {
-    if (!opts.enabled) clientRef.current?.stop();
+    if (!opts.enabled) {
+      speechEpochRef.current += 1;
+      providerQueueRef.current = Promise.resolve();
+      clientRef.current?.stop();
+    }
   }, [opts.enabled]);
 
   const speak = useCallback((text: string) => {
@@ -301,18 +312,40 @@ export function useTts(opts: UseTtsOptions) {
       // Provider skill: sanitize, hand it the clean text, play what it returns.
       const clean = sanitizeForSpeech(text);
       if (!clean) return;
-      void o.provider(clean, o.voice, o.speed ?? 1)
-        .then((out) => {
-          if (out?.audio) client.enqueueAudio(out.audio, out.mime);
-          else void client.speak(clean, selectedVoice, o.speed ?? 1).catch(() => {});
-        })
-        .catch(() => { void client.speak(clean, selectedVoice, o.speed ?? 1).catch(() => {}); });
+      const epoch = speechEpochRef.current;
+      const run = providerQueueRef.current.then(async () => {
+        const latest = optsRef.current;
+        const currentClient = clientRef.current;
+        if (!currentClient || !latest.enabled || epoch !== speechEpochRef.current) return;
+        const voice = latest.voice || selectedVoice;
+        const speed = latest.speed ?? 1;
+        const provider = latest.provider;
+        if (!provider) {
+          await currentClient.speak(clean, voice || DEFAULT_BUILTIN_VOICE, speed).catch(() => {});
+          return;
+        }
+        try {
+          const out = await provider(clean, latest.voice, speed);
+          if (!clientRef.current || !optsRef.current.enabled || epoch !== speechEpochRef.current) return;
+          if (out?.audio) clientRef.current.enqueueAudio(out.audio, out.mime);
+          else await clientRef.current.speak(clean, voice || DEFAULT_BUILTIN_VOICE, speed).catch(() => {});
+        } catch {
+          if (clientRef.current && optsRef.current.enabled && epoch === speechEpochRef.current) {
+            await clientRef.current.speak(clean, voice || DEFAULT_BUILTIN_VOICE, speed).catch(() => {});
+          }
+        }
+      });
+      providerQueueRef.current = run.catch(() => {});
       return;
     }
     void client.speak(text, selectedVoice, o.speed ?? 1).catch(() => {});
   }, []);
 
-  const stop = useCallback(() => clientRef.current?.stop(), []);
+  const stop = useCallback(() => {
+    speechEpochRef.current += 1;
+    providerQueueRef.current = Promise.resolve();
+    clientRef.current?.stop();
+  }, []);
   const playAudio = useCallback((audio: string, mime?: string) => clientRef.current?.enqueueAudio(audio, mime), []);
 
   return { speak, stop, playAudio, speaking };

@@ -225,6 +225,95 @@ function hasNativeBridge(): boolean {
   }
 }
 
+const STREAM_SPEECH_SENTENCE_MIN = 16;
+const STREAM_SPEECH_RELAXED_MIN = 72;
+const STREAM_SPEECH_HARD_MAX = 180;
+
+function codeBlockSummary(body: string, lang: string): string {
+  const lines = body.split(/\r?\n/).filter((line) => line.trim()).length;
+  const label = lang ? `${lang} code block` : "code block";
+  return ` (${label}, ${lines} line${lines === 1 ? "" : "s"}) `;
+}
+
+function normalizeCompletedSpeechFences(raw: string, force = false): string {
+  let out = "";
+  let pos = 0;
+  while (pos < raw.length) {
+    const start = raw.indexOf("```", pos);
+    if (start < 0) {
+      out += raw.slice(pos);
+      break;
+    }
+    out += raw.slice(pos, start);
+    const headerStart = start + 3;
+    const newline = raw.indexOf("\n", headerStart);
+    const close = raw.indexOf("```", headerStart);
+    const hasHeaderLine = newline >= 0 && (close < 0 || newline < close);
+    const headerEnd = hasHeaderLine ? newline : headerStart;
+    const bodyStart = hasHeaderLine ? newline + 1 : headerStart;
+    const lang = raw.slice(headerStart, headerEnd).trim().split(/\s+/)[0] ?? "";
+    if (close < 0) {
+      if (force) out += codeBlockSummary(raw.slice(bodyStart), lang);
+      else out += raw.slice(start);
+      break;
+    }
+    out += codeBlockSummary(raw.slice(bodyStart, close), lang);
+    pos = close + 3;
+  }
+  return out;
+}
+
+function firstUnclosedFence(raw: string): number {
+  let pos = 0;
+  while (pos < raw.length) {
+    const start = raw.indexOf("```", pos);
+    if (start < 0) return -1;
+    const close = raw.indexOf("```", start + 3);
+    if (close < 0) return start;
+    pos = close + 3;
+  }
+  return -1;
+}
+
+function boundaryAfter(text: string, min: number): number {
+  const sentence = /[.!?…]["')\]]?\s+/g;
+  for (let match = sentence.exec(text); match; match = sentence.exec(text)) {
+    const end = match.index + match[0].length;
+    if (end >= min) return end;
+  }
+  const paragraph = /\n{2,}/g;
+  for (let match = paragraph.exec(text); match; match = paragraph.exec(text)) {
+    const end = match.index + match[0].length;
+    if (end >= min) return end;
+  }
+  return 0;
+}
+
+function relaxedBoundary(text: string): number {
+  if (text.length < STREAM_SPEECH_RELAXED_MIN) return 0;
+  const phrase = /[,;:]\s+/g;
+  for (let match = phrase.exec(text); match; match = phrase.exec(text)) {
+    const end = match.index + match[0].length;
+    if (end >= STREAM_SPEECH_RELAXED_MIN) return end;
+  }
+  const target = Math.min(text.length, STREAM_SPEECH_HARD_MAX);
+  const beforeTarget = text.slice(0, target).search(/\s+\S*$/);
+  if (beforeTarget >= STREAM_SPEECH_RELAXED_MIN) return beforeTarget;
+  const afterMin = text.slice(STREAM_SPEECH_RELAXED_MIN).search(/\s/);
+  return afterMin >= 0 ? STREAM_SPEECH_RELAXED_MIN + afterMin + 1 : 0;
+}
+
+function takeStreamSpeechChunk(raw: string, force = false, relaxed = false): { chunk: string; rest: string } {
+  const normalized = normalizeCompletedSpeechFences(raw, force);
+  const fenceAt = firstUnclosedFence(normalized);
+  const held = fenceAt >= 0 ? normalized.slice(fenceAt) : "";
+  const speakable = fenceAt >= 0 ? normalized.slice(0, fenceAt) : normalized;
+  if (force) return { chunk: speakable.trim(), rest: held };
+  const boundary = boundaryAfter(speakable, STREAM_SPEECH_SENTENCE_MIN) || (relaxed ? relaxedBoundary(speakable) : 0);
+  if (!boundary) return { chunk: "", rest: normalized };
+  return { chunk: speakable.slice(0, boundary).trim(), rest: speakable.slice(boundary) + held };
+}
+
 // ─── View model ────────────────────────────────────────────────────────────
 
 type ReasoningLevel = "low" | "medium" | "high" | "max";
@@ -1756,9 +1845,10 @@ function App() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  // Accumulates the active session's assistant text for the current turn, spoken
-  // on turn_end. A ref (not state) so streaming never re-renders the whole app.
+  // Buffers only the active session's assistant text, then flushes natural
+  // phrases to TTS while tokens stream. A ref avoids chat-wide re-renders.
   const spokenBuf = useRef("");
+  const spokenFlushTimer = useRef<number | null>(null);
   const [view, setView] = useState<"chat" | "artifacts" | "helm">("chat");
   const [sessionQuery, setSessionQuery] = useState("");
   const [garrisonOpen, setGarrisonOpen] = useState(false);
@@ -1921,6 +2011,48 @@ function App() {
   const voiceRef = useRef(voice);
   voiceRef.current = voice;
 
+  const clearSpokenFlushTimer = () => {
+    if (spokenFlushTimer.current !== null) {
+      window.clearTimeout(spokenFlushTimer.current);
+      spokenFlushTimer.current = null;
+    }
+  };
+
+  const flushSpokenBuffer = (force = false, relaxed = false) => {
+    if (force) clearSpokenFlushTimer();
+    let guard = 0;
+    while (guard < 8) {
+      const { chunk, rest } = takeStreamSpeechChunk(spokenBuf.current, force, relaxed);
+      spokenBuf.current = rest;
+      if (!chunk) break;
+      voiceRef.current.speak(chunk);
+      guard += 1;
+      if (!force && !relaxed) continue;
+      if (!force) break;
+    }
+  };
+
+  const scheduleSpokenFlush = () => {
+    if (spokenFlushTimer.current !== null) return;
+    spokenFlushTimer.current = window.setTimeout(() => {
+      spokenFlushTimer.current = null;
+      flushSpokenBuffer(false, true);
+      if (spokenBuf.current.trim()) scheduleSpokenFlush();
+    }, 700);
+  };
+
+  const appendSpokenDelta = (text: string) => {
+    if (!text) return;
+    spokenBuf.current += text;
+    flushSpokenBuffer(false, false);
+    if (spokenBuf.current.trim()) scheduleSpokenFlush();
+  };
+
+  const resetSpokenStream = () => {
+    clearSpokenFlushTimer();
+    spokenBuf.current = "";
+  };
+
   // ── Conversation mode ─────────────────────────────────────────────────────
   // Full-duplex hands-free: after Ares finishes SPEAKING a reply, auto-open the
   // mic; the transcript is sent as the next message; a new send barges in. One
@@ -1930,12 +2062,13 @@ function App() {
   const convoRef = useRef<{ cancel: () => void } | null>(null);
   const sendRef = useRef<(t: string) => void>(() => {});
   const prevSpeaking = useRef(false);
+  const activeBusy = active?.busy ?? false;
   useEffect(() => {
     // Fire when speech just ENDED (true→false) while convo mode is on & idle.
     const justFinishedSpeaking = prevSpeaking.current && !voice.speaking;
     prevSpeaking.current = voice.speaking;
     if (!convoMode || !prefs.voiceEnabled) return;
-    if (!justFinishedSpeaking || convoListening) return;
+    if (!justFinishedSpeaking || convoListening || activeBusy) return;
     let cancelled = false;
     setConvoListening(true);
     void sidecarListen().then((handle) => {
@@ -1951,7 +2084,7 @@ function App() {
       }, 8000);
     }).catch(() => setConvoListening(false));
     return () => { cancelled = true; };
-  }, [voice.speaking, convoMode, prefs.voiceEnabled, convoListening]);
+  }, [voice.speaking, convoMode, prefs.voiceEnabled, convoListening, activeBusy]);
   // Leaving convo mode stops any listen in progress.
   useEffect(() => {
     if (!convoMode && convoRef.current) { convoRef.current.cancel(); convoRef.current = null; setConvoListening(false); }
@@ -2373,15 +2506,12 @@ function App() {
       if (!sid || sid === activeRef.current) {
         if ((ev.type === "text_delta" || ev.type === "thinking_delta") && ev.text) pushTokenFlow(ev.text.length);
         else if (ev.type === "tool_use_input_delta" && ev.deltaJson) pushTokenFlow(ev.deltaJson.length);
-        // Voice: gather the reply's spoken text and read it on turn end. Only the
-        // session you're looking at speaks; thinking + tool noise never do.
+        // Voice: speak natural phrases while reply text streams. Only the session
+        // you're looking at speaks; thinking + tool noise never do.
         if (prefs.voiceEnabled) {
-          if (ev.type === "text_delta" && ev.text) spokenBuf.current += ev.text;
-          else if (ev.type === "turn_end") {
-            const say = spokenBuf.current;
-            spokenBuf.current = "";
-            if (say.trim()) voiceRef.current.speak(say);
-          }
+          if (ev.type === "turn_start") resetSpokenStream();
+          else if (ev.type === "text_delta" && ev.text) appendSpokenDelta(ev.text);
+          else if (ev.type === "turn_end") flushSpokenBuffer(true, true);
         }
       }
       const elsewhere = document.hidden || (!!sid && sid !== activeRef.current);
@@ -2512,7 +2642,7 @@ function App() {
     // Barge-in: sending a new message cuts any reply still being spoken, and
     // resets the spoken buffer so the next turn starts clean.
     voiceRef.current.stop();
-    spokenBuf.current = "";
+    resetSpokenStream();
     // Slash command: "/mcp" (or /connectors) opens the connector Directory
     // instead of sending a message — the one-word way in the user asked for.
     if (/^\/(mcp|connectors?)$/i.test(trimmed)) {
@@ -2748,7 +2878,7 @@ function App() {
   const setVoiceEnabled = (on: boolean) => {
     const p = { ...prefs, voiceEnabled: on };
     setPrefs(p); savePrefs(p);
-    if (!on) { setConvoMode(false); voiceRef.current.stop(); }
+    if (!on) { setConvoMode(false); voiceRef.current.stop(); resetSpokenStream(); }
   };
   // Fetch skills for the tray whenever the daemon attaches.
   useEffect(() => { if (native) daemonCmd({ type: "skills_list" }); }, [native, daemonCmd]);
@@ -3124,7 +3254,7 @@ function App() {
           listening={convoListening}
           convoMode={convoMode}
           onToggleConvo={setConvoMode}
-          onStopVoice={() => voiceRef.current.stop()}
+          onStopVoice={() => { voiceRef.current.stop(); resetSpokenStream(); }}
           providerLabel={ttsProviderSkill ? `via ${ttsProviderSkill.name}` : "built-in · local"}
           skills={skills}
           onSurface={runSurface}

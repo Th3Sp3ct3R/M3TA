@@ -38,11 +38,17 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
-    version: "0.21.1",
+    version: "0.21.2",
     date: "July 2026",
-    title: "Voice that actually speaks",
-    tagline: "TTS skills now override correctly, test buttons play audio, and built-in speech falls back instead of going silent.",
+    title: "Voice that feels live",
+    tagline: "Ares now starts speaking while replies stream, TTS skills override correctly, test buttons play audio, and built-in speech falls back instead of going silent.",
     highlights: [
+      {
+        icon: "L",
+        title: "Live spoken replies",
+        tag: "Polished",
+        blurb: "Ares starts speaking natural phrases as words appear instead of waiting for the whole answer to finish.",
+      },
       {
         icon: "V",
         title: "Skills can speak",
