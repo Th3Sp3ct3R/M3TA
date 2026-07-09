@@ -57,6 +57,7 @@ tauri/dist/
 # Local research/scratch
 .scan-openclaw/
 .claude/
+.codebase-memory/
 
 # Misc
 *.tgz

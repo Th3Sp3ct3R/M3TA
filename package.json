@@ -20,6 +20,7 @@
     "link:cli": "pnpm build && pnpm link --global",
     "verify": "pnpm lint && pnpm test",
     "clean": "node scripts/clean.mjs",
+    "codex-life:check": "node scripts/codex-life-check.mjs",
     "desktop:installer": "pnpm build && pnpm --filter ares-tauri build",
     "voice:tts": "powershell -ExecutionPolicy Bypass -File scripts/voice-tts.ps1"
   },

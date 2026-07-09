@@ -295,7 +295,7 @@ function holoMaterials() {
   // wireframe — reads as a real engineered part, not a mesh soup.
   const edge = new THREE.LineBasicMaterial({ color: ACCENT.clone().lerp(new THREE.Color("#ffffff"), 0.25), transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false });
   const surface = new THREE.MeshPhongMaterial({ color: ACCENT, emissive: ACCENT.clone().multiplyScalar(0.3), transparent: true, opacity: 0.17, shininess: 90, depthWrite: false, blending: THREE.AdditiveBlending });
-  const glow = new THREE.MeshBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.06, blending: THREE.AdditiveBlending, depthWrite: false });
+  const glow = new THREE.MeshBasicMaterial({ color: ACCENT, wireframe: true, transparent: true, opacity: 0.06, blending: THREE.AdditiveBlending, depthWrite: false });
   return { edge, surface, glow };
 }
 
