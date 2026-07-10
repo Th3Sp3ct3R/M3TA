@@ -51,16 +51,31 @@ class EmbeddedBrowserBridge {
 
 export const embeddedBridge = new EmbeddedBrowserBridge();
 
+const browserStep = z
+  .object({
+    action: z.enum(["open", "click", "click_text", "fill", "fill_selector", "eval"]),
+    url: z.string().optional(),
+    role: z.string().optional(),
+    name: z.string().optional(),
+    label: z.string().optional(),
+    value: z.string().optional(),
+    query: z.string().optional(),
+    selector: z.string().optional(),
+    js: z.string().optional(),
+  })
+  .strict();
+
 const browserInput = z
   .object({
     action: z
-      .enum(["open", "preview", "tree", "screenshot", "fill", "fill_selector", "click", "click_text", "console", "eval", "state", "close", "filmstrip"])
+      .enum(["open", "act", "tabs", "attach", "preview", "tree", "screenshot", "fill", "fill_selector", "click", "click_text", "console", "eval", "state", "close", "filmstrip"])
       .describe(
         "Browser action. DOM-first web actions: open/tree/fill/click/screenshot/state/close. " +
         "PREVIEW & VERIFY (drives a VISIBLE browser with an animated cursor so the owner watches Ares test the UI): " +
         "'preview' opens a URL visibly; 'click_text' clicks a button/link/tab by visible text or CSS selector; " +
         "'fill_selector' types into a CSS selector; 'console' reads console logs/errors after acting; " +
-        "'eval' runs JS in the page to inspect state or call a function.",
+        "'eval' runs JS in the page to inspect state or call a function. " +
+        "Use 'act' with steps for a complete multi-control job; it executes the sequence and returns one final visual verification instead of burning a model round-trip per click.",
       ),
     url: z.string().optional().describe("URL for open/preview (e.g. http://localhost:1420)."),
     label: z.string().optional().describe("Accessible label for fill."),
@@ -80,6 +95,7 @@ const browserInput = z
     headless: z.boolean().optional().describe("Run headless (invisible). DEFAULT true for plain web tasks — the owner does NOT want to watch navigation. The 'preview' action overrides this to VISIBLE so the owner can watch the UI test. Pass false to watch any action."),
     note: z.string().optional().describe("Optional note attached to screenshot frames."),
     limit: z.number().int().min(1).max(100).optional().describe("Maximum tree/filmstrip/console entries returned."),
+    steps: z.array(browserStep).min(1).max(24).optional().describe("act: ordered DOM-first actions to execute as one transaction, followed by one screenshot and page-state verification."),
   })
   .strict();
 
@@ -90,7 +106,10 @@ interface BrowserToolOutput {
   filmstripDir: string;
 }
 
-export function makeBrowserTool(context: CliRuntimeContext) {
+export function makeBrowserTool(
+  context: CliRuntimeContext,
+  createBrowser: typeof createPlaywrightBrowser = createPlaywrightBrowser,
+) {
   let browser: BrowserConnector | null = null;
   let filmstrip: Filmstrip | null = null;
   let sequence = 0;
@@ -99,6 +118,19 @@ export function makeBrowserTool(context: CliRuntimeContext) {
   let frameSink: ((jpegBase64: string) => void) | null = null;
 
   const ensureBrowser = async (headless?: boolean): Promise<BrowserConnector> => {
+    if (browser) {
+      try {
+        await browser.state();
+      } catch (error) {
+        // Users routinely close the visible preview window. Retaining that dead
+        // connector made every subsequent action fail with "Target page,
+        // context or browser has been closed". Re-acquire transparently on the
+        // next call; unrelated state errors still surface honestly.
+        if (!isClosedBrowserError(error)) throw error;
+        await browser.close().catch(() => undefined);
+        browser = null;
+      }
+    }
     if (!browser) {
       // CAPTCHA handoff: a challenge surfaces through the SAME Gate as approvals
       // (so it renders on Telegram/UI). The owner solves it in their CDP-attached
@@ -117,7 +149,7 @@ export function makeBrowserTool(context: CliRuntimeContext) {
             return decision.verb === "deny" ? "skip" : "solved";
           }
         : undefined;
-      browser = await createPlaywrightBrowser({
+      browser = await createBrowser({
         headless: headless ?? true,
         onChallenge,
         onFrame: (jpeg) => frameSink?.(jpeg),
@@ -138,23 +170,34 @@ export function makeBrowserTool(context: CliRuntimeContext) {
   return buildTool({
     name: "Browser",
     description:
-      "Ares's DOM-first eyes and hands for the web. Use APIs/MCP/CLI first when better, then this browser connector to open pages, inspect the accessibility tree, fill forms, click controls, screenshot, and record visual proof. Run HEADLESS by default (the owner does not want to see the browser) — only open it visibly (headless:false) when they explicitly ask to watch. When the task is to find/show images, gather the image URLs and put them in your reply; the chat renders image URLs as inline pictures. VERIFYING AN HTML APP YOU BUILT: write it to a .html file, then `preview` it (pass `html` to render it via a temp file, or pass a file `url`) and `screenshot` to SEE it — this is reliable; do NOT burn turns on the embedded engine's inline render. `eval` runs in the page's GLOBAL scope — it CANNOT read `let`/`const` declared inside a <script> block, so don't probe those; expose state on `window.*` (e.g. `window.app = state`) or read the DOM. After a `click`/`click_text`, `screenshot` again to confirm the change actually landed.",
+      "Ares's DOM-first eyes and hands for the web — the ONLY tool for anything inside a web page. It drives CDP/Playwright input without touching the owner's OS mouse. Before opening a duplicate page it reuses a matching attached tab; use tabs/attach when the owner names an already-open tab. For multi-field or multi-click work use one act call with ordered steps, then inspect its final screenshot; do not spend one model call per click. Use APIs/MCP/CLI first when better. ComputerUse is forbidden for browser content. Run headless by default, visible only when the owner asks to watch or an authenticated Ares browser is needed. For visual verification use real screenshots; accessibility text alone cannot verify canvas/WebGL. Self-contained HTML must inline JS/CSS because offline webviews block CDN scripts.",
     safety: "workspace-write",
     concurrency: "exclusive",
     inputZod: browserInput,
     activityDescription: (i) => {
-      const host = (u?: string) => {
-        if (!u) return "a page";
+      // Label honestly: opening a local file or driving the in-app page is NOT
+      // "Browsing the web" — that wording made users think Ares went to the
+      // internet instead of opening their file (bug report 4c5f1efc).
+      const embedded = i.engine === "embedded" || (!i.url && !!i.html);
+      const target = (u?: string) => {
+        if (!u) return embedded ? "your page in the Ares window" : "a page";
         try {
-          return new URL(u.includes("://") ? u : `https://${u}`).host.replace(/^www\./, "");
+          const parsed = new URL(u.includes("://") ? u : `https://${u}`);
+          if (parsed.protocol === "file:")
+            return `local file ${decodeURIComponent(parsed.pathname.split("/").pop() ?? "")}`.trim();
+          if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") return `local app ${parsed.host}`;
+          return parsed.host.replace(/^www\./, "") || u;
         } catch {
           return u;
         }
       };
-      if (i.action === "open") return `Opening ${host(i.url)}`;
-      if (i.action === "preview") return `Previewing ${host(i.url)}`;
+      if (i.action === "open") return `Opening ${target(i.url)}`;
+      if (i.action === "act") return `Completing ${i.steps?.length ?? 0} browser actions`;
+      if (i.action === "tabs") return "Listing controllable browser tabs";
+      if (i.action === "attach") return `Attaching to ${i.query ?? i.url ?? "an open tab"}`;
+      if (i.action === "preview") return `Previewing ${target(i.url)}`;
       if (i.action === "tree") return "Reading the page";
-      if (i.action === "screenshot" || i.action === "filmstrip") return "Capturing the screen";
+      if (i.action === "screenshot" || i.action === "filmstrip") return embedded ? "Reading the in-app page" : "Capturing the screen";
       if (i.action === "fill") return i.label ? `Filling “${i.label}”` : "Filling a field";
       if (i.action === "fill_selector") return i.selector ? `Typing into ${i.selector}` : "Filling a field";
       if (i.action === "click") return i.name ? `Clicking “${i.name}”` : "Clicking a control";
@@ -163,11 +206,14 @@ export function makeBrowserTool(context: CliRuntimeContext) {
       if (i.action === "eval") return "Testing in the page";
       if (i.action === "state") return "Checking the page state";
       if (i.action === "close") return "Closing the browser";
-      return "Browsing the web";
+      return embedded ? "Using the in-app browser" : "Browsing the web";
     },
 
     async call(i, ctx): Promise<{ output: BrowserToolOutput; display: string; images?: Array<{ mediaType: string; data: string }> }> {
       const strip = ensureFilmstrip();
+      const emitTarget = (state: { url?: string; title?: string }) => {
+        if (state.url) ctx?.emitProgress?.({ kind: "browser_target", url: state.url, title: state.title ?? "" });
+      };
       // Route the browser's live frames into THIS turn's UI panel (the embedded
       // browser the owner watches). Cleared when the call ends.
       frameSink = ctx?.emitProgress
@@ -202,11 +248,30 @@ export function makeBrowserTool(context: CliRuntimeContext) {
         }
         if (i.action === "console") {
           const r = await embeddedBridge.exec("console", { onlyErrors: i.onlyErrors });
+          if (!r.ok) throw new Error(r.error ?? "embedded console failed");
           const logs = (r.result as unknown[]) ?? [];
           return done("ok", logs, `${logs.length} console entr${logs.length === 1 ? "y" : "ies"}`);
         }
-        // tree / screenshot / state / snapshot → the page snapshot
+        // tree / screenshot / state / snapshot → the page's DOM-text snapshot.
         const r = await embeddedBridge.exec("snapshot");
+        // A dead bridge used to fall through as status:"ok" with an undefined
+        // result in ~1ms — the model then "verified" pages it never saw.
+        if (!r.ok) throw new Error(r.error ?? "embedded snapshot failed");
+        if (i.action === "screenshot") {
+          // The embedded engine has NO pixel capture. Never dress a DOM-text
+          // dump up as a screenshot: canvas/WebGL/chart content is invisible in
+          // text, so "status ok" here let models claim charts rendered when all
+          // four canvases were blank (bug f0bbee26). Degrade loudly instead.
+          return done(
+            "degraded",
+            {
+              warning:
+                "TEXT SNAPSHOT ONLY — the embedded engine cannot capture pixels. Canvas/WebGL/chart content is INVISIBLE here; do NOT claim anything rendered correctly based on this. To actually see the page, use action:'preview' with the playwright engine (pass the html or a file url) — that returns a real screenshot.",
+              snapshot: r.result,
+            },
+            "text snapshot only — no pixels (use playwright preview to SEE the page)",
+          );
+        }
         return done("ok", r.result, "snapshot");
       }
 
@@ -230,6 +295,63 @@ export function makeBrowserTool(context: CliRuntimeContext) {
       // 'preview' drives a VISIBLE browser so the owner watches Ares test the UI.
       const br = await ensureBrowser(i.action === "preview" ? false : i.headless);
 
+      if (i.action === "tabs") {
+        if (!br.tabs) throw new Error("tab discovery is not supported by this browser connector");
+        const result = await br.tabs();
+        return { output: { action: i.action, status: "ok", result, filmstripDir: filmstripDir(strip) }, display: `${result.length} controllable tab(s)` };
+      }
+
+      if (i.action === "attach") {
+        const query = i.query ?? i.url;
+        if (!query) throw new Error("Browser attach requires query or url");
+        if (!br.attachToExisting || !(await br.attachToExisting(query))) throw new Error(`no controllable open tab matched "${query}"`);
+        const result = await br.state();
+        emitTarget(result);
+        return { output: { action: i.action, status: "ok", result, filmstripDir: filmstripDir(strip) }, display: `attached to ${result.title ?? result.url}` };
+      }
+
+      if (i.action === "act") {
+        if (!i.steps?.length) throw new Error("Browser act requires steps");
+        const completed: Array<{ step: number; action: string; state?: unknown; result?: unknown }> = [];
+        for (let index = 0; index < i.steps.length; index += 1) {
+          const step = i.steps[index];
+          try {
+            if (step.action === "open") {
+              if (!step.url) throw new Error("open needs url");
+              await br.attachToExisting?.(step.url).catch(() => false);
+              await br.navigate(step.url);
+            } else if (step.action === "click") {
+              if (!step.role || !step.name) throw new Error("click needs role and name");
+              await br.clickByRole(step.role, step.name);
+            } else if (step.action === "click_text") {
+              if (!step.query || !br.clickByText) throw new Error("click_text needs query and connector support");
+              await br.clickByText(step.query);
+            } else if (step.action === "fill") {
+              if (!step.label || step.value === undefined) throw new Error("fill needs label and value");
+              await br.fillByLabel(step.label, step.value);
+            } else if (step.action === "fill_selector") {
+              if (!step.selector || step.value === undefined || !br.fillBySelector) throw new Error("fill_selector needs selector, value, and connector support");
+              await br.fillBySelector(step.selector, step.value);
+            } else {
+              if (!step.js || !br.evaluate) throw new Error("eval needs js and connector support");
+              completed.push({ step: index + 1, action: step.action, result: await br.evaluate(step.js) });
+              continue;
+            }
+            completed.push({ step: index + 1, action: step.action, state: await br.state() });
+          } catch (error) {
+            throw new Error(`browser act stopped at step ${index + 1}/${i.steps.length} (${step.action}): ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        const [shot, state] = await Promise.all([br.screenshot(), br.state()]);
+        emitTarget(state);
+        const frame = await strip.record({ action: `act ${i.steps.length} steps`, url: state.url, screenshot: shot, note: i.note });
+        return {
+          output: { action: i.action, status: "ok", result: { completed, state, frame: frame.frame }, filmstripDir: filmstripDir(strip) },
+          display: `completed ${i.steps.length} browser actions · verified ${state.title ?? state.url}`,
+          images: [{ mediaType: `image/${shot.format ?? "png"}`, data: shot.bytes }],
+        };
+      }
+
       if (i.action === "tree") {
         const result = (await br.accessibilityTree()).slice(0, i.limit ?? 80);
         return {
@@ -240,6 +362,7 @@ export function makeBrowserTool(context: CliRuntimeContext) {
 
       if (i.action === "state") {
         const result = await br.state();
+        emitTarget(result);
         return {
           output: { action: i.action, status: "ok", result, filmstripDir: filmstripDir(strip) },
           display: `${result.title ?? "(untitled)"} ${result.url}`,
@@ -248,6 +371,7 @@ export function makeBrowserTool(context: CliRuntimeContext) {
 
       if (i.action === "screenshot") {
         const [shot, state] = await Promise.all([br.screenshot(), br.state()]);
+        emitTarget(state);
         const frame = await strip.record({ action: "manual screenshot", url: state.url, screenshot: shot, note: i.note });
         return {
           output: { action: i.action, status: "ok", result: frame, filmstripDir: filmstripDir(strip) },
@@ -273,6 +397,7 @@ export function makeBrowserTool(context: CliRuntimeContext) {
         if (!url) throw new Error("Browser preview requires `url` (or `html` to render inline)");
         await br.navigate(url);
         const [shot, state] = await Promise.all([br.screenshot(), br.state()]);
+        emitTarget(state);
         const frame = await strip.record({ action: "preview", url: state.url, screenshot: shot, note: i.note });
         return {
           output: { action: i.action, status: "ok", result: { ...state, frame: frame.frame }, filmstripDir: filmstripDir(strip) },
@@ -286,6 +411,7 @@ export function makeBrowserTool(context: CliRuntimeContext) {
         if (!br.clickByText) throw new Error("click_text not supported by this browser");
         await br.clickByText(i.query);
         const [shot, state] = await Promise.all([br.screenshot(), br.state()]);
+        emitTarget(state);
         await strip.record({ action: `click ${i.query}`, url: state.url, screenshot: shot });
         return {
           output: { action: i.action, status: "ok", result: state, filmstripDir: filmstripDir(strip) },
@@ -327,8 +453,12 @@ export function makeBrowserTool(context: CliRuntimeContext) {
       const idemPrefix = `browser:${process.pid}:${Date.now()}:${sequence++}`;
       if (i.action === "open") {
         if (!i.url) throw new Error("Browser open requires url");
+        // If CDP can see a matching user/Ares tab, bind to it before navigating.
+        // This preserves that tab's authenticated context and avoids duplicates.
+        await br.attachToExisting?.(i.url).catch(() => false);
         const effect = navigateEffect(br, i.url, { filmstrip: strip, idemPrefix });
         const result = await runEffect(effect, rails);
+        emitTarget(await br.state());
         return {
           output: { action: i.action, status: result.status, result, filmstripDir: filmstripDir(strip) },
           display: `open ${i.url}: ${result.status}`,
@@ -355,6 +485,12 @@ export function makeBrowserTool(context: CliRuntimeContext) {
       };
     },
   });
+}
+
+function isClosedBrowserError(error: unknown): boolean {
+  return /target (?:page|context|browser) has been closed|browser has been closed|page has been closed/i.test(
+    error instanceof Error ? error.message : String(error),
+  );
 }
 
 /**
