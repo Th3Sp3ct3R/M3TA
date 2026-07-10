@@ -114,7 +114,7 @@ export class OpenRouterProvider implements Provider {
         error: {
           code: `http_${response.status}`,
           message: `OpenRouter returned ${response.status}: ${text.slice(0, 500)}`,
-          retriable: response.status === 429 || response.status >= 500,
+          retriable: response.status === 408 || response.status === 409 || response.status === 425 || response.status === 429 || response.status >= 500,
           retryAfterMs: parseRetryAfterMs(response.headers),
         },
       };
@@ -348,6 +348,7 @@ function buildChatBody(model: string, req: ProviderRequest, flavor: OpenAIChatFl
             type: "function",
             function: { name: t.name, description: t.description, parameters: t.input_schema },
           })),
+          tool_choice: req.toolChoice === "any" ? "required" : "auto",
         }
       : {}),
     ...(reasoningEnabled(req.reasoningLevel)
@@ -525,6 +526,7 @@ export interface OpenRouterModel {
   name: string;
   contextLength?: number;
   promptPrice?: string;
+  completionPrice?: string;
   description?: string;
   supportedParameters?: string[];
   inputModalities?: string[];
@@ -573,6 +575,7 @@ export async function fetchOpenRouterModels(opts: { baseUrl?: string; fetchImpl?
     name: typeof r.name === "string" ? r.name : String(r.id),
     contextLength: typeof r.context_length === "number" ? r.context_length : undefined,
     promptPrice: typeof (r.pricing as Record<string, unknown> | undefined)?.prompt === "string" ? String((r.pricing as Record<string, unknown>).prompt) : undefined,
+    completionPrice: typeof (r.pricing as Record<string, unknown> | undefined)?.completion === "string" ? String((r.pricing as Record<string, unknown>).completion) : undefined,
     description: typeof r.description === "string" ? r.description : undefined,
     supportedParameters: Array.isArray(r.supported_parameters)
       ? r.supported_parameters.filter((value): value is string => typeof value === "string")

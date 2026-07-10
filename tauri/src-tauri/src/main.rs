@@ -47,9 +47,35 @@ struct DaemonState {
 }
 
 /// The local Kokoro voice sidecar (voice_service/server.py) — auto-started with
-/// the app so spoken replies "just work", and killed on close.
+/// the app so spoken replies "just work", and killed on close. First run
+/// self-provisions the Python venv + deps so "Hey Ares" needs zero manual setup.
 struct VoiceState {
-    child: Mutex<Option<Child>>,
+    child: Arc<Mutex<Option<Child>>>,
+    /// (phase, detail) — "idle" | "setup" | "starting" | "running" | "error" | "missing".
+    phase: Arc<Mutex<(String, String)>>,
+    setup_running: Arc<Mutex<bool>>,
+    /// Bumped on every stop/restart so stale exit-watchers stand down.
+    generation: Arc<AtomicU64>,
+    /// Per-launch shared secret the sidecar requires on every WS/HTTP request.
+    /// Without it, any web page could reach ws://127.0.0.1:8765 and drive the
+    /// mic/TTS; the webview learns the token via ares_voice_status.
+    token: String,
+}
+
+/// A random 128-bit hex token. RandomState is seeded from the OS CSPRNG on each
+/// construction, so hashing distinct values yields unpredictable output — enough
+/// to gate a loopback service against a blind same-machine web attacker.
+fn random_token() -> String {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mk = || {
+        let state = std::collections::hash_map::RandomState::new();
+        let mut h = state.build_hasher();
+        std::time::SystemTime::now().hash(&mut h);
+        std::process::id().hash(&mut h);
+        std::thread::current().id().hash(&mut h);
+        h.finish()
+    };
+    format!("{:016x}{:016x}", mk(), mk())
 }
 
 struct AresRuntime {
@@ -486,12 +512,63 @@ fn ares_open_url(url: String) -> Result<(), String> {
     }
 }
 
+/// Open a forged artifact in the user's default browser. Only existing files
+/// are accepted; arguments are passed directly to the OS (never through a shell).
+#[tauri::command]
+fn ares_open_path(path: String) -> Result<(), String> {
+    let target = PathBuf::from(path);
+    if !target.is_file() {
+        return Err("artifact does not exist".to_string());
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let wide: Vec<u16> = target.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+        let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+        let result = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), wide.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL as i32) };
+        if result as isize <= 32 { return Err("failed to launch artifact".to_string()); }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    { Command::new("open").arg(&target).spawn().map_err(|e| format!("failed to launch artifact: {e}"))?; Ok(()) }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    { Command::new("xdg-open").arg(&target).spawn().map_err(|e| format!("failed to launch artifact: {e}"))?; Ok(()) }
+}
+
+/// Every command `type` the daemon's loop actually handles. The webview can
+/// only ask for one of these — an unknown/forged type is rejected here instead
+/// of being piped into daemon stdin verbatim (defense in depth: the webview is
+/// trusted, but a compromised page or injected artifact script shouldn't get a
+/// raw line into the engine).
+const ALLOWED_DAEMON_COMMANDS: &[&str] = &[
+    "anthropic_login_finish", "anthropic_login_start", "bug_report",
+    "openai_login_start", "openai_auth_status",
+    "consciousness_cancel", "consciousness_disable", "consciousness_enable",
+    "consciousness_killswitch", "consciousness_look_away", "consciousness_resume",
+    "consciousness_status", "discover_custom_models", "engine_config", "exit",
+    "gateway_connect", "gateway_signin", "gateway_status", "interrupt",
+    "mcp_connect", "mcp_disconnect", "mcp_list", "mcp_search", "mcp_toggle",
+    "mcp_tools", "model_catalog", "model_switch", "oauth_disconnect",
+    "oauth_set_credentials", "oauth_start", "oauth_status", "ollama_pull",
+    "openrouter_key", "operator_autotick", "operator_control", "operator_status",
+    "permission", "permission_response", "provider_key", "reasoning", "routing",
+    "routing_mode", "session_delete", "session_history", "session_rename",
+    "sessions_list", "set_permissions", "skill_invoke", "skill_toggle",
+    "skillhub_install", "skillhub_list", "skillhub_publish", "skills_list",
+    "steer", "undo", "usage_stats", "webview_result",
+];
+
 #[tauri::command]
 fn ares_daemon_command(command: Value, state: State<DaemonState>) -> Result<(), String> {
     if !command.is_object() {
         return Err("daemon command must be an object".to_string());
     }
-    write_daemon_command(state.inner(), command)
+    match command.get("type").and_then(Value::as_str) {
+        Some(t) if ALLOWED_DAEMON_COMMANDS.contains(&t) => write_daemon_command(state.inner(), command),
+        Some(t) => Err(format!("unknown daemon command: {t}")),
+        None => Err("daemon command requires a string 'type'".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -791,74 +868,430 @@ fn stop_existing_daemon(state: &DaemonState) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn voice_python(root: &Path) -> std::ffi::OsString {
-    let venv = root
-        .join(".ares")
-        .join("voice-venv")
-        .join("Scripts")
-        .join("python.exe");
-    if venv.exists() {
-        venv.into_os_string()
+fn voice_venv_python(root: &Path) -> PathBuf {
+    let venv = root.join(".ares").join("voice-venv");
+    if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
     } else {
-        std::ffi::OsString::from("python")
+        venv.join("bin").join("python")
     }
 }
 
-#[cfg(not(windows))]
-fn voice_python(root: &Path) -> std::ffi::OsString {
-    let venv = root
-        .join(".ares")
-        .join("voice-venv")
-        .join("bin")
-        .join("python");
-    if venv.exists() {
-        venv.into_os_string()
-    } else {
-        std::ffi::OsString::from("python3")
-    }
+fn voice_log_path(root: &Path) -> PathBuf {
+    root.join(".ares").join("voice-sidecar.log")
 }
 
-/// Spawn voice_service/server.py headlessly. Best-effort: if Python / the venv /
-/// the script is missing, or the port is already taken by a manual sidecar, the
-/// child simply exits and chat is unaffected.
-fn start_voice_sidecar(app: &tauri::AppHandle, state: &VoiceState) {
-    if let Ok(guard) = state.child.lock() {
+/// Update the voice phase and push it to the webview so the dock can narrate
+/// setup progress live ("installing the voice engine…") instead of the old
+/// dead-silent Stdio::null() spawn.
+fn voice_emit(
+    app: &tauri::AppHandle,
+    phase_arc: &Arc<Mutex<(String, String)>>,
+    phase: &str,
+    detail: &str,
+) {
+    if let Ok(mut guard) = phase_arc.lock() {
+        *guard = (phase.to_string(), detail.to_string());
+    }
+    let _ = app.emit("ares:voice-status", json!({ "phase": phase, "detail": detail }));
+}
+
+/// Find a usable system Python for bootstrapping the venv. Kokoro (the TTS
+/// engine) requires >=3.10,<3.13, so interpreters in that band are tried
+/// FIRST — the newest system python (3.13+) installs everything except the
+/// premium voice, which is exactly the crash-looped venv we're avoiding.
+fn find_system_python() -> Option<(String, Vec<String>)> {
+    let candidates: &[(&str, &[&str])] = if cfg!(windows) {
+        &[
+            ("py", &["-3.12"] as &[&str]),
+            ("py", &["-3.11"]),
+            ("py", &["-3.10"]),
+            ("py", &["-3"]),
+            ("python", &[]),
+            ("python3", &[]),
+        ]
+    } else {
+        &[
+            ("python3.12", &[] as &[&str]),
+            ("python3.11", &[]),
+            ("python3.10", &[]),
+            ("python3", &[]),
+            ("python", &[]),
+        ]
+    };
+    for (bin, args) in candidates {
+        let mut cmd = Command::new(bin);
+        cmd.args(*args)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        if matches!(cmd.status(), Ok(s) if s.success()) {
+            return Some((bin.to_string(), args.iter().map(|a| a.to_string()).collect()));
+        }
+    }
+    None
+}
+
+/// Run a bootstrap step with stdout/stderr appended to voice-sidecar.log so
+/// failures are diagnosable (the old path discarded everything).
+fn voice_run_logged(mut cmd: Command, log_path: &Path) -> bool {
+    if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        if let Ok(clone) = f.try_clone() {
+            cmd.stdout(Stdio::from(f)).stderr(Stdio::from(clone));
+        }
+    }
+    cmd.stdin(Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    matches!(cmd.status(), Ok(s) if s.success())
+}
+
+/// Spawn voice_service/server.py with output captured to the log, and watch
+/// for unexpected exits so the UI can say "the engine died" instead of the
+/// wake toggle silently sitting at offline forever.
+fn spawn_voice_server(
+    app: &tauri::AppHandle,
+    child_arc: &Arc<Mutex<Option<Child>>>,
+    phase_arc: &Arc<Mutex<(String, String)>>,
+    gen_arc: &Arc<AtomicU64>,
+    root: &Path,
+) {
+    if let Ok(guard) = child_arc.lock() {
         if guard.is_some() {
             return;
         }
     }
-    let Some(runtime) = resolve_ares_runtime(Some(app)) else {
-        return;
+    let script = root.join("voice_service").join("server.py");
+    let _ = fs::create_dir_all(root.join(".ares"));
+    let log_path = voice_log_path(root);
+    let venv_py = voice_venv_python(root);
+    let python: std::ffi::OsString = if venv_py.exists() {
+        venv_py.into_os_string()
+    } else if cfg!(windows) {
+        std::ffi::OsString::from("python")
+    } else {
+        std::ffi::OsString::from("python3")
     };
-    let script = runtime.app_root.join("voice_service").join("server.py");
-    if !script.exists() {
-        return;
-    }
-    let mut command = Command::new(voice_python(&runtime.app_root));
-    command.arg(&script).current_dir(&runtime.app_root);
+    let mut command = Command::new(python);
+    command.arg(&script).current_dir(root);
     #[cfg(windows)]
-    {
-        command.creation_flags(CREATE_NO_WINDOW);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.stdin(Stdio::null());
+    match fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(f) => {
+            match f.try_clone() {
+                Ok(clone) => {
+                    command.stdout(Stdio::from(f)).stderr(Stdio::from(clone));
+                }
+                Err(_) => {
+                    command.stdout(Stdio::null()).stderr(Stdio::from(f));
+                }
+            };
+        }
+        Err(_) => {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
     }
-    command
+    match command.spawn() {
+        Ok(child) => {
+            if let Ok(mut guard) = child_arc.lock() {
+                *guard = Some(child);
+            }
+            voice_emit(app, phase_arc, "running", "");
+            let generation = gen_arc.load(Ordering::SeqCst);
+            let child_watch = child_arc.clone();
+            let phase_watch = phase_arc.clone();
+            let gen_watch = gen_arc.clone();
+            let app_watch = app.clone();
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(2));
+                if gen_watch.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                let exited = {
+                    let mut guard = match child_watch.lock() {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    match guard.as_mut() {
+                        Some(child) => match child.try_wait() {
+                            Ok(Some(_)) => {
+                                *guard = None;
+                                true
+                            }
+                            Ok(None) => false,
+                            Err(_) => return,
+                        },
+                        None => return,
+                    }
+                };
+                if exited {
+                    if gen_watch.load(Ordering::SeqCst) == generation {
+                        voice_emit(
+                            &app_watch,
+                            &phase_watch,
+                            "error",
+                            "The voice engine stopped unexpectedly — check .ares/voice-sidecar.log, or hit Repair to reinstall it.",
+                        );
+                    }
+                    return;
+                }
+            });
+        }
+        Err(err) => {
+            voice_emit(
+                app,
+                phase_arc,
+                "error",
+                &format!("Couldn't launch the voice engine ({err}). Hit Repair to rebuild it."),
+            );
+        }
+    }
+}
+
+/// Quick venv sanity: can it import the CORE deps the server needs to boot?
+/// (kokoro is deliberately not checked — TTS degrades, the server still runs.)
+fn voice_venv_healthy(root: &Path) -> bool {
+    let py = voice_venv_python(root);
+    if !py.exists() {
+        return false;
+    }
+    let mut cmd = Command::new(py);
+    cmd.args(["-c", "import fastapi, uvicorn, numpy, faster_whisper, sounddevice"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Ok(child) = command.spawn() {
-        if let Ok(mut guard) = state.child.lock() {
-            *guard = Some(child);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    matches!(cmd.status(), Ok(s) if s.success())
+}
+
+/// Make voice work with zero manual steps: healthy venv → start the sidecar;
+/// missing OR BROKEN venv → (re)provision in the background (venv + pip),
+/// narrating progress to the UI, then start it. `force` wipes the venv first
+/// (the Repair button) — a venv that half-installed (e.g. built with Python
+/// 3.13, which kokoro refuses) used to crash-loop forever; now it rebuilds.
+fn ensure_voice_ready(app: &tauri::AppHandle, state: &VoiceState, force: bool) {
+    let Some(runtime) = resolve_ares_runtime(Some(app)) else {
+        voice_emit(app, &state.phase, "missing", "Ares runtime not found — voice is unavailable.");
+        return;
+    };
+    let root = runtime.app_root;
+    let script = root.join("voice_service").join("server.py");
+    if !script.exists() {
+        voice_emit(
+            app,
+            &state.phase,
+            "missing",
+            "The voice service files aren't included in this install.",
+        );
+        return;
+    }
+    {
+        let Ok(mut running) = state.setup_running.lock() else { return };
+        if *running {
+            return;
+        }
+        *running = true;
+    }
+    let app2 = app.clone();
+    let child_arc = state.child.clone();
+    let phase_arc = state.phase.clone();
+    let gen_arc = state.generation.clone();
+    let setup_flag = state.setup_running.clone();
+    // Everything (including the health probe — it launches python) runs off
+    // the main thread so app startup never blocks on the voice stack.
+    thread::spawn(move || {
+        let done = || {
+            if let Ok(mut running) = setup_flag.lock() {
+                *running = false;
+            }
+        };
+        let venv_dir = root.join(".ares").join("voice-venv");
+        if !force && voice_venv_healthy(&root) {
+            voice_emit(&app2, &phase_arc, "starting", "Starting the local voice engine…");
+            spawn_voice_server(&app2, &child_arc, &phase_arc, &gen_arc, &root);
+            done();
+            return;
+        }
+        let _ = fs::create_dir_all(root.join(".ares"));
+        let log_path = voice_log_path(&root);
+        if venv_dir.exists() {
+            voice_emit(&app2, &phase_arc, "setup", "Repairing the voice engine's Python environment…");
+            if fs::remove_dir_all(&venv_dir).is_err() {
+                voice_emit(
+                    &app2,
+                    &phase_arc,
+                    "error",
+                    "Couldn't remove the broken voice environment (.ares/voice-venv) — close anything using it, then hit Repair.",
+                );
+                done();
+                return;
+            }
+        }
+        voice_emit(&app2, &phase_arc, "setup", "Checking for Python (3.10–3.12 preferred)…");
+        let Some((py_bin, py_args)) = find_system_python() else {
+            voice_emit(
+                &app2,
+                &phase_arc,
+                "error",
+                "Python 3 isn't installed. Grab 3.12 from python.org (check “Add to PATH”), then hit Repair — Ares handles the rest.",
+            );
+            done();
+            return;
+        };
+        voice_emit(&app2, &phase_arc, "setup", "Creating the voice engine's Python environment…");
+        let mut venv_cmd = Command::new(&py_bin);
+        venv_cmd.args(&py_args).args(["-m", "venv"]).arg(&venv_dir).current_dir(&root);
+        if !voice_run_logged(venv_cmd, &log_path) {
+            voice_emit(
+                &app2,
+                &phase_arc,
+                "error",
+                "Couldn't create the Python environment — see .ares/voice-sidecar.log, then hit Repair.",
+            );
+            done();
+            return;
+        }
+        let mut pip_cmd = Command::new(voice_venv_python(&root));
+        pip_cmd.args(["-m", "pip", "install", "--upgrade", "pip"]).current_dir(&root);
+        let _ = voice_run_logged(pip_cmd, &log_path);
+        // Core first (wake word + dictation + the server itself), then the
+        // premium TTS separately: kokoro requires Python >=3.10,<3.13, and one
+        // refused wheel must not take down the entire voice stack.
+        voice_emit(
+            &app2,
+            &phase_arc,
+            "setup",
+            "Installing the voice engine (Whisper + server) — first run only, this can take a few minutes…",
+        );
+        let mut core_cmd = Command::new(voice_venv_python(&root));
+        core_cmd
+            .args(["-m", "pip", "install", "fastapi>=0.115", "uvicorn[standard]>=0.30", "numpy>=1.26", "soundfile>=0.12", "faster-whisper>=1.0", "sounddevice>=0.4"])
+            .current_dir(&root);
+        if !voice_run_logged(core_cmd, &log_path) {
+            voice_emit(
+                &app2,
+                &phase_arc,
+                "error",
+                "Installing the voice engine failed — see .ares/voice-sidecar.log, then hit Repair to retry.",
+            );
+            done();
+            return;
+        }
+        voice_emit(&app2, &phase_arc, "setup", "Installing the premium voice (Kokoro TTS)…");
+        let mut tts_cmd = Command::new(voice_venv_python(&root));
+        tts_cmd.args(["-m", "pip", "install", "kokoro>=0.9"]).current_dir(&root);
+        if !voice_run_logged(tts_cmd, &log_path) {
+            // Non-fatal: wake word + dictation work; replies use the fallback voice.
+            let _ = fs::OpenOptions::new().create(true).append(true).open(&log_path).map(|mut f| {
+                use std::io::Write as _;
+                let _ = writeln!(f, "[setup] kokoro install failed (needs Python 3.10-3.12) - continuing without premium TTS");
+            });
+        }
+        voice_emit(&app2, &phase_arc, "starting", "Starting the local voice engine…");
+        spawn_voice_server(&app2, &child_arc, &phase_arc, &gen_arc, &root);
+        done();
+    });
+}
+
+/// Never launch cut off: if the window is bigger than the monitor's usable
+/// area (small laptop, heavy DPI scaling) shrink it to fit, and if any edge
+/// ended up offscreen re-center it. Runs once at startup.
+fn clamp_window_to_monitor(window: &tauri::WebviewWindow) {
+    let Ok(Some(monitor)) = window.current_monitor() else { return };
+    let scale = monitor.scale_factor();
+    let mon_pos = *monitor.position();
+    let mon_size = *monitor.size();
+    // Leave room for the Windows taskbar (~48 logical px) — Monitor::size()
+    // is the full panel, not the work area.
+    let margin = (48.0 * scale) as i32;
+    let avail_w = mon_size.width as i32;
+    let avail_h = mon_size.height as i32 - margin;
+    if avail_w <= 0 || avail_h <= 0 {
+        return;
+    }
+    let Ok(mut size) = window.outer_size() else { return };
+    let mut resized = false;
+    if size.width as i32 > avail_w {
+        size.width = avail_w as u32;
+        resized = true;
+    }
+    if size.height as i32 > avail_h {
+        size.height = avail_h as u32;
+        resized = true;
+    }
+    if resized {
+        let _ = window.set_size(tauri::PhysicalSize::new(size.width, size.height));
+    }
+    if let Ok(pos) = window.outer_position() {
+        let out = pos.x < mon_pos.x
+            || pos.y < mon_pos.y
+            || pos.x + size.width as i32 > mon_pos.x + avail_w
+            || pos.y + size.height as i32 > mon_pos.y + avail_h;
+        if out || resized {
+            let cx = mon_pos.x + ((avail_w - size.width as i32) / 2).max(0);
+            let cy = mon_pos.y + ((avail_h - size.height as i32) / 2).max(0);
+            let _ = window.set_position(tauri::PhysicalPosition::new(cx, cy));
         }
     }
 }
 
 fn stop_voice_sidecar(state: &VoiceState) {
+    // Bump the generation FIRST so the exit-watcher knows this death is ours.
+    state.generation.fetch_add(1, Ordering::SeqCst);
     if let Ok(mut guard) = state.child.lock() {
         if let Some(mut child) = guard.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
     }
+}
+
+#[tauri::command]
+fn ares_voice_status(app: tauri::AppHandle, state: State<VoiceState>) -> Value {
+    let running = {
+        match state.child.lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                Some(child) => matches!(child.try_wait(), Ok(None)),
+                None => false,
+            },
+            Err(_) => false,
+        }
+    };
+    let (phase, detail) = state
+        .phase
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| ("idle".into(), String::new()));
+    let (venv, log_path) = match resolve_ares_runtime(Some(&app)) {
+        Some(runtime) => (
+            voice_venv_python(&runtime.app_root).exists(),
+            voice_log_path(&runtime.app_root).to_string_lossy().to_string(),
+        ),
+        None => (false, String::new()),
+    };
+    json!({
+        "running": running,
+        "phase": phase,
+        "detail": detail,
+        "venv": venv,
+        "logPath": log_path,
+        // The per-launch secret the webview must attach to every sidecar
+        // request — the loopback-service auth gate.
+        "token": state.token,
+    })
+}
+
+/// "Repair voice" — kill whatever is there, WIPE the venv, and re-provision
+/// from scratch. (Respawning a half-installed venv just crash-loops again.)
+#[tauri::command]
+fn ares_voice_setup(app: tauri::AppHandle, state: State<VoiceState>) {
+    stop_voice_sidecar(state.inner());
+    ensure_voice_ready(&app, state.inner(), true);
 }
 
 fn main() {
@@ -892,7 +1325,11 @@ fn main() {
             generation: Arc::new(AtomicU64::new(0)),
         })
         .manage(VoiceState {
-            child: Mutex::new(None),
+            child: Arc::new(Mutex::new(None)),
+            phase: Arc::new(Mutex::new(("idle".into(), String::new()))),
+            setup_running: Arc::new(Mutex::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
+            token: random_token(),
         })
         .setup(|app| {
             let handle = app.handle().clone();
@@ -900,9 +1337,17 @@ fn main() {
             if let Some(window) = app.get_webview_window("main") {
                 hide_windows_accent_border(&window);
             }
-            // Auto-start the local voice sidecar so spoken replies work out of the box.
+            if let Some(window) = app.get_webview_window("main") {
+                clamp_window_to_monitor(&window);
+            }
+            // Auto-start the local voice sidecar so spoken replies work out of
+            // the box — provisioning the Python venv + deps itself on first
+            // run, and rebuilding a broken venv automatically. The per-launch
+            // auth token goes into our env so the spawned sidecar inherits it
+            // and the webview can read it back via ares_voice_status.
             if let Some(voice) = app.try_state::<VoiceState>() {
-                start_voice_sidecar(&handle, voice.inner());
+                env::set_var("ARES_VOICE_TOKEN", &voice.token);
+                ensure_voice_ready(&handle, voice.inner(), false);
             }
             app.listen("tauri://close-requested", move |_| {
                 // Reap the daemon AND the Garrison gateway/bridge (stop_existing_daemon
@@ -934,6 +1379,7 @@ fn main() {
             ares_set_provider_key,
             ares_daemon_command,
             ares_open_url,
+            ares_open_path,
             ares_permission_response,
             ares_forge_write,
             ares_export_log,
@@ -941,7 +1387,9 @@ fn main() {
             ares_stop_daemon,
             ares_window_minimize,
             ares_window_toggle_maximize,
-            ares_window_close
+            ares_window_close,
+            ares_voice_status,
+            ares_voice_setup
         ])
         .build(tauri::generate_context!())
         .expect("error while building Ares Tauri app")

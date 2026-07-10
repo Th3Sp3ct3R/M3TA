@@ -1,6 +1,6 @@
 // Extracted from entry.ts — providers.
 
-import { MockEchoProvider, OpenAIResponsesProvider, OpenRouterProvider, DeepSeekProvider, AnthropicProvider, DEFAULT_ANTHROPIC_MODEL, OllamaCloudPool, DEFAULT_OLLAMA_SLOTS, OLLAMA_CLOUD_MODELS, fetchDeepSeekModels, fetchOpenRouterModels, fetchAnthropicModels, loadAuthToken, MoaProvider, type MoaMember, type Provider } from "@ares/core";
+import { MockEchoProvider, OpenAIResponsesProvider, OpenRouterProvider, DeepSeekProvider, AnthropicProvider, DEFAULT_ANTHROPIC_MODEL, OllamaCloudPool, DEFAULT_OLLAMA_SLOTS, OLLAMA_CLOUD_MODELS, fetchOllamaLibraryModels, fetchDeepSeekModels, fetchOpenRouterModels, fetchAnthropicModels, loadAuthToken, MoaProvider, type MoaMember, type Provider } from "@ares/core";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
 import { type SubModelPool } from "@ares/tools";
@@ -42,6 +42,13 @@ interface DaemonModelOption {
   capabilities?: string[];
   /** Rich prose (OpenRouter) for the discovery cards. */
   description?: string;
+  /** Structured stats for the discovery panel (the hint string keeps a packed
+   *  copy for old clients, but the UI wants real numbers). */
+  contextLength?: number;
+  pricing?: { input?: number; output?: number };
+  /** Ollama library meta: human pull count + relative updated age. */
+  pulls?: string;
+  updated?: string;
 }
 
 export const TERMINAL_PROVIDERS = ["ollama", "openai", "anthropic", "deepseek", "openrouter", "ares", "custom", "moa", "mock"] as const;
@@ -85,18 +92,22 @@ export const ROUTE_LANES = ["chat", "coding", "research", "tool-use"] as const;
 
 const STATIC_MODEL_CATALOG: Record<"openai" | "anthropic" | "mock", DaemonModelOption[]> = {
   openai: [
-    { id: "gpt-5.5", hint: "flagship deep reasoning", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
-    { id: "gpt-5.5-codex", hint: "agentic coding tuned", group: "OpenAI", capabilities: ["tools", "reasoning"] },
-    { id: "gpt-5.1", hint: "previous flagship", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
-    { id: "gpt-5.1-codex", hint: "coding tuned", group: "OpenAI", capabilities: ["tools", "reasoning"] },
-    { id: "gpt-5", hint: "stable baseline", group: "OpenAI", capabilities: ["tools", "reasoning"] },
-    { id: "gpt-5-mini", hint: "fast + cheap", group: "OpenAI", capabilities: ["tools"] },
+    { id: "gpt-5.6-terra", label: "5.6 Terra", hint: "flagship — deep reasoning + agents", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "gpt-5.6-sol", label: "5.6 Sol", hint: "5.6 — high reasoning", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "gpt-5.6-luna", label: "5.6 Luna", hint: "5.6 — fast, efficient reasoning", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "gpt-5.5", label: "5.5", hint: "previous flagship", group: "OpenAI", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "gpt-5.4", label: "5.4", hint: "stable baseline", group: "OpenAI", capabilities: ["tools", "reasoning"] },
+    { id: "gpt-5.4-mini", label: "5.4 Mini", hint: "fast + cheap", group: "OpenAI", capabilities: ["tools"] },
+    { id: "gpt-5.3-codex-spark", label: "5.3 Codex Spark", hint: "agentic coding tuned", group: "OpenAI", capabilities: ["tools", "reasoning"] },
   ],
   anthropic: [
-    { id: "claude-fable-5", hint: "flagship adaptive thinking", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
-    { id: "claude-opus-4-8", hint: "deep reasoning workhorse · 1M context", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
-    { id: "claude-sonnet-4-6", hint: "balanced speed / depth", group: "Anthropic", capabilities: ["tools", "reasoning"] },
-    { id: "claude-haiku-4-5-20251001", hint: "fast + cheap", group: "Anthropic", capabilities: ["tools"] },
+    { id: "claude-fable-5", label: "Claude Fable 5", hint: "flagship · adaptive extended thinking", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-sonnet-5", label: "Claude Sonnet 5", hint: "frontier Sonnet · coding + agents", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-opus-4-8", label: "Claude Opus 4.8", hint: "deep reasoning workhorse · 1M context", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-opus-4-7", label: "Claude Opus 4.7", hint: "prior Opus · deep reasoning", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-opus-4-6", label: "Claude Opus 4.6", hint: "earlier Opus", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", hint: "balanced speed / depth", group: "Anthropic", capabilities: ["tools", "reasoning", "vision"] },
+    { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", hint: "fastest · cheap + capable", group: "Anthropic", capabilities: ["tools", "vision"] },
   ],
   mock: [{ id: "mock-echo", hint: "offline echo provider for UI testing", group: "Mock", capabilities: [] }],
 };
@@ -321,6 +332,11 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
       ],
       // OpenRouter ships a rich blurb per model — the heart of the discovery UI.
       description: model.description?.trim() || undefined,
+      contextLength: model.contextLength || undefined,
+      pricing: {
+        input: model.promptPrice != null ? Number(model.promptPrice) * 1e6 : undefined,
+        output: model.completionPrice != null ? Number(model.completionPrice) * 1e6 : undefined,
+      },
     }));
   }
 
@@ -367,6 +383,7 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
     const apiKey = settings.ollamaApiKey || process.env.OLLAMA_API_KEY || "";
     const response = await fetch("https://ollama.com/api/tags", {
       headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(8_000),
     }).catch(() => null);
     if (response?.ok) {
       const payload = await response.json() as {
@@ -388,6 +405,31 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
         });
       }
     }
+  }
+
+  // The FULL public library (ollama.com/library) — every model, pulled or not,
+  // with the same blurb/pulls/updated meta the website shows. Degrades to
+  // nothing on network failure; never blocks the rest of the catalog.
+  const library = await fetchOllamaLibraryModels().catch(() => []);
+  for (const entry of library) {
+    if (entry.capabilities.includes("embedding")) continue; // not chat-pickable
+    const caps = [
+      ...(entry.capabilities.includes("tools") ? ["tools"] : []),
+      ...(entry.capabilities.includes("thinking") ? ["reasoning"] : []),
+      ...(entry.capabilities.includes("vision") ? ["vision"] : []),
+    ];
+    put({
+      // Cloud-hosted library models run as name:cloud; local-only ones by name
+      // (which works once pulled — the UI shows pulled state).
+      id: entry.cloud ? `${entry.name}:cloud` : entry.name,
+      label: entry.name,
+      hint: [entry.pulls ? `${entry.pulls} pulls` : "", entry.tagCount ? `${entry.tagCount} tag${entry.tagCount === 1 ? "" : "s"}` : "", entry.updated ? `updated ${entry.updated}` : ""].filter(Boolean).join(" · "),
+      group: entry.cloud ? "Ollama Library · cloud" : "Ollama Library",
+      capabilities: caps,
+      description: entry.description,
+      pulls: entry.pulls,
+      updated: entry.updated,
+    });
   }
 
   return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
