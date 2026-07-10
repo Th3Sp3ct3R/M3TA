@@ -38,6 +38,174 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.22.1",
+    date: "July 2026",
+    title: "Voice that tells you what's wrong",
+    tagline: "Your voice skills actually get used, Hey Ares says when it can't hear, and nothing about voice fails silently anymore.",
+    highlights: [
+      {
+        icon: "V",
+        title: "Your voice skills get used",
+        tag: "Safer",
+        blurb: "A voice picked for an old engine was silently breaking every call to your voice skill and dropping to the robot voice. The app now only sends voices your skill knows — and if a skill fails, it tells you why instead of going quiet.",
+      },
+      {
+        icon: "👂",
+        title: "Hey Ares speaks up",
+        tag: "Polished",
+        blurb: "The wake word now shows its real status — listening, starting, or a clear note when the local voice engine is offline with exactly how to start it. And it works independently of the speak-replies toggle.",
+      },
+      {
+        icon: "S",
+        title: "More voice skills recognized",
+        tag: "Polished",
+        blurb: "Skills named things like piper_tts, or whose docs mention Piper/Kokoro/ElevenLabs, are auto-detected as voice providers — no manifest line needed.",
+      },
+    ],
+  },
+  {
+    version: "0.22.0",
+    date: "July 2026",
+    title: "Hey Ares",
+    tagline: "Say the word and just talk — hands-free wake word, auto-send when you stop speaking, voice previews, and read-aloud anywhere.",
+    highlights: [
+      {
+        icon: "👂",
+        title: "“Hey Ares” wake word",
+        tag: "New",
+        blurb: "Turn it on and just say it — Ares wakes, listens, and sends your message the moment you stop talking. Fully local and private; no button, no clicking.",
+      },
+      {
+        icon: "⏱",
+        title: "Sends when you stop talking",
+        tag: "New",
+        blurb: "Conversation mode and the mic now detect the end of your sentence — no fixed timer, no waiting, no hanging. Caps guarantee it never stalls listening forever.",
+      },
+      {
+        icon: "▶",
+        title: "Hear voices before you pick",
+        tag: "Polished",
+        blurb: "Every voice in the Voice Hub has a play button, and when a voice skill is active you pick from ITS voices — no more choosing blind.",
+      },
+      {
+        icon: "🔊",
+        title: "Speak anything, follow along",
+        tag: "New",
+        blurb: "Select any reply text to get a Speak button; a subtle caption shows the sentence being spoken; and when a background task finishes while you're away, Ares says so out loud.",
+      },
+    ],
+  },
+  {
+    version: "0.21.4",
+    date: "July 2026",
+    title: "Voice that finishes the thought",
+    tagline: "Spoken replies now play all the way through, and start noticeably faster.",
+    highlights: [
+      {
+        icon: "F",
+        title: "Finishes every reply",
+        tag: "Safer",
+        blurb: "Multi-sentence replies no longer cut off partway — Ares stays 'speaking' across the whole answer instead of dropping the last sentences in the gap between them.",
+      },
+      {
+        icon: ">",
+        title: "Starts faster",
+        tag: "Faster",
+        blurb: "The first sentence speaks right away, then the rest are synthesized in bigger batches — far fewer round-trips to the voice engine, so a lot less lag.",
+      },
+    ],
+  },
+  {
+    version: "0.21.3",
+    date: "July 2026",
+    title: "Voice you can actually hear",
+    tagline: "Spoken replies play for real now — through one audio engine that accepts any voice, local or API, so new voices just plug in.",
+    highlights: [
+      {
+        icon: "V",
+        title: "Voices actually play",
+        tag: "Safer",
+        blurb: "Spoken audio was being silently blocked by a security rule, so only the robotic built-in fallback made sound. It now plays through the real audio engine — your installed voices are finally audible.",
+      },
+      {
+        icon: "P",
+        title: "Any voice plugs in",
+        tag: "New",
+        blurb: "Every text-to-speech engine — Piper, Kokoro, ElevenLabs, OpenAI, whatever — now feeds one shared audio pipeline that accepts any common format at any quality. No more per-voice playback bugs.",
+      },
+      {
+        icon: "!",
+        title: "Fails loud, not silent",
+        tag: "Polished",
+        blurb: "If a voice ever returns audio the app can't read, it now says so in the logs instead of just going quiet, so problems are findable in seconds.",
+      },
+    ],
+  },
+  {
+    version: "0.21.2",
+    date: "July 2026",
+    title: "Voice that feels live",
+    tagline: "Ares now starts speaking while replies stream, TTS skills override correctly, test buttons play audio, and built-in speech falls back instead of going silent.",
+    highlights: [
+      {
+        icon: "L",
+        title: "Live spoken replies",
+        tag: "Polished",
+        blurb: "Ares starts speaking natural phrases as words appear instead of waiting for the whole answer to finish.",
+      },
+      {
+        icon: "V",
+        title: "Skills can speak",
+        tag: "Safer",
+        blurb: "Ares now recognizes voice skills even when the manifest forgot the capability line, so enabled TTS skills are used for spoken replies.",
+      },
+      {
+        icon: "A",
+        title: "No silent fallback",
+        tag: "Safer",
+        blurb: "If the local voice service is missing or down, Ares falls back to WebView speech instead of doing nothing.",
+      },
+      {
+        icon: "T",
+        title: "Test means sound",
+        tag: "Polished",
+        blurb: "Voice skill buttons now play the returned audio, so testing a configured voice produces sound instead of only a toast.",
+      },
+    ],
+  },
+  {
+    version: "0.21.0",
+    date: "July 2026",
+    title: "Voice, skills, and a big stability pass",
+    tagline: "Ares can talk and listen, skills became first-class extensions with their own UI and a shared hub, and a stack of session-killing bugs are gone.",
+    highlights: [
+      {
+        icon: "V",
+        title: "Ares speaks and listens",
+        tag: "New",
+        blurb: "Turn on Voice and Ares reads its replies aloud (emoji, markdown, and code stripped out); the mic now uses a local, offline speech engine. Conversation mode is full hands-free — it speaks, listens, and you can talk right over it.",
+      },
+      {
+        icon: "S",
+        title: "Skills that plug in",
+        tag: "New",
+        blurb: "Skills can now provide capabilities (bring your own text-to-speech voice) and add their own buttons to a floating tray. A SkillHub lets you browse, one-click install, and publish community skills.",
+      },
+      {
+        icon: "!",
+        title: "No more bricked sessions",
+        tag: "Safer",
+        blurb: "A tool-pairing bug that could 400 every message after a context limit is fixed and self-heals; pasted images no longer go to a model that can't see them; and the browser 'live' view actually streams now.",
+      },
+      {
+        icon: "#",
+        title: "A window that behaves",
+        tag: "Polished",
+        blurb: "The UI reflows instead of clipping when you shrink it, the Forge panel stops covering the chat when you drag it, and previewed apps behave like they do standalone.",
+      },
+    ],
+  },
+  {
     version: "0.20.1",
     date: "July 2026",
     title: "Ares through the harness",

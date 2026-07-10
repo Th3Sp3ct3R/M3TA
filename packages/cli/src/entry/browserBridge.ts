@@ -138,23 +138,31 @@ export function makeBrowserTool(context: CliRuntimeContext) {
   return buildTool({
     name: "Browser",
     description:
-      "Ares's DOM-first eyes and hands for the web. Use APIs/MCP/CLI first when better, then this browser connector to open pages, inspect the accessibility tree, fill forms, click controls, screenshot, and record visual proof. Run HEADLESS by default (the owner does not want to see the browser) — only open it visibly (headless:false) when they explicitly ask to watch. When the task is to find/show images, gather the image URLs and put them in your reply; the chat renders image URLs as inline pictures. VERIFYING AN HTML APP YOU BUILT: write it to a .html file, then `preview` it (pass `html` to render it via a temp file, or pass a file `url`) and `screenshot` to SEE it — this is reliable; do NOT burn turns on the embedded engine's inline render. `eval` runs in the page's GLOBAL scope — it CANNOT read `let`/`const` declared inside a <script> block, so don't probe those; expose state on `window.*` (e.g. `window.app = state`) or read the DOM. After a `click`/`click_text`, `screenshot` again to confirm the change actually landed.",
+      "Ares's DOM-first eyes and hands for the web. Use APIs/MCP/CLI first when better, then this browser connector to open pages, inspect the accessibility tree, fill forms, click controls, screenshot, and record visual proof. Run HEADLESS by default (the owner does not want to see the browser) — only open it visibly (headless:false) when they explicitly ask to watch. When the task is to find/show images, gather the image URLs and put them in your reply; the chat renders image URLs as inline pictures. VERIFYING AN HTML APP YOU BUILT: write it to a .html file, then `preview` it (pass `html` to render it via a temp file, or pass a file `url`) and `screenshot` to SEE it — this is reliable; do NOT burn turns on the embedded engine's inline render. BUILDING HTML PAGES/DASHBOARDS: make them fully self-contained — inline ALL JS/CSS; never load libraries from a CDN (<script src=\"https://cdn...\">). The embedded webview and offline machines block remote scripts, so CDN-backed charts render as blank canvases while the rest of the page looks fine. Draw charts with inline SVG or hand-rolled canvas code instead of Chart.js-from-CDN. `eval` runs in the page's GLOBAL scope — it CANNOT read `let`/`const` declared inside a <script> block, so don't probe those; expose state on `window.*` (e.g. `window.app = state`) or read the DOM. After a `click`/`click_text`, `screenshot` again to confirm the change actually landed. A text 'snapshot' is NOT visual proof: canvas/WebGL content is invisible in it — only a real screenshot (pixels) verifies rendering.",
     safety: "workspace-write",
     concurrency: "exclusive",
     inputZod: browserInput,
     activityDescription: (i) => {
-      const host = (u?: string) => {
-        if (!u) return "a page";
+      // Label honestly: opening a local file or driving the in-app page is NOT
+      // "Browsing the web" — that wording made users think Ares went to the
+      // internet instead of opening their file (bug report 4c5f1efc).
+      const embedded = i.engine === "embedded" || (!i.url && !!i.html);
+      const target = (u?: string) => {
+        if (!u) return embedded ? "your page in the Ares window" : "a page";
         try {
-          return new URL(u.includes("://") ? u : `https://${u}`).host.replace(/^www\./, "");
+          const parsed = new URL(u.includes("://") ? u : `https://${u}`);
+          if (parsed.protocol === "file:")
+            return `local file ${decodeURIComponent(parsed.pathname.split("/").pop() ?? "")}`.trim();
+          if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") return `local app ${parsed.host}`;
+          return parsed.host.replace(/^www\./, "") || u;
         } catch {
           return u;
         }
       };
-      if (i.action === "open") return `Opening ${host(i.url)}`;
-      if (i.action === "preview") return `Previewing ${host(i.url)}`;
+      if (i.action === "open") return `Opening ${target(i.url)}`;
+      if (i.action === "preview") return `Previewing ${target(i.url)}`;
       if (i.action === "tree") return "Reading the page";
-      if (i.action === "screenshot" || i.action === "filmstrip") return "Capturing the screen";
+      if (i.action === "screenshot" || i.action === "filmstrip") return embedded ? "Reading the in-app page" : "Capturing the screen";
       if (i.action === "fill") return i.label ? `Filling “${i.label}”` : "Filling a field";
       if (i.action === "fill_selector") return i.selector ? `Typing into ${i.selector}` : "Filling a field";
       if (i.action === "click") return i.name ? `Clicking “${i.name}”` : "Clicking a control";
@@ -163,7 +171,7 @@ export function makeBrowserTool(context: CliRuntimeContext) {
       if (i.action === "eval") return "Testing in the page";
       if (i.action === "state") return "Checking the page state";
       if (i.action === "close") return "Closing the browser";
-      return "Browsing the web";
+      return embedded ? "Using the in-app browser" : "Browsing the web";
     },
 
     async call(i, ctx): Promise<{ output: BrowserToolOutput; display: string; images?: Array<{ mediaType: string; data: string }> }> {
@@ -202,11 +210,30 @@ export function makeBrowserTool(context: CliRuntimeContext) {
         }
         if (i.action === "console") {
           const r = await embeddedBridge.exec("console", { onlyErrors: i.onlyErrors });
+          if (!r.ok) throw new Error(r.error ?? "embedded console failed");
           const logs = (r.result as unknown[]) ?? [];
           return done("ok", logs, `${logs.length} console entr${logs.length === 1 ? "y" : "ies"}`);
         }
-        // tree / screenshot / state / snapshot → the page snapshot
+        // tree / screenshot / state / snapshot → the page's DOM-text snapshot.
         const r = await embeddedBridge.exec("snapshot");
+        // A dead bridge used to fall through as status:"ok" with an undefined
+        // result in ~1ms — the model then "verified" pages it never saw.
+        if (!r.ok) throw new Error(r.error ?? "embedded snapshot failed");
+        if (i.action === "screenshot") {
+          // The embedded engine has NO pixel capture. Never dress a DOM-text
+          // dump up as a screenshot: canvas/WebGL/chart content is invisible in
+          // text, so "status ok" here let models claim charts rendered when all
+          // four canvases were blank (bug f0bbee26). Degrade loudly instead.
+          return done(
+            "degraded",
+            {
+              warning:
+                "TEXT SNAPSHOT ONLY — the embedded engine cannot capture pixels. Canvas/WebGL/chart content is INVISIBLE here; do NOT claim anything rendered correctly based on this. To actually see the page, use action:'preview' with the playwright engine (pass the html or a file url) — that returns a real screenshot.",
+              snapshot: r.result,
+            },
+            "text snapshot only — no pixels (use playwright preview to SEE the page)",
+          );
+        }
         return done("ok", r.result, "snapshot");
       }
 

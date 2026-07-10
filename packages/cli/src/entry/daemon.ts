@@ -18,7 +18,7 @@ import { prepareEngineBinary } from "../engineBinary.js";
 import { captureScreen } from "../screenCapture.js";
 import { ConsciousnessWatch, WATCHER_VOICE_PROMPT } from "../watch.js";
 import { recordConsciousnessObservation } from "../consciousnessContext.js";
-import { aresAgentHome, onLifecycle } from "@ares/agent";
+import { aresAgentHome, onLifecycle, runSkill, skillHubProbe, skillHubList, skillHubGet, skillHubPublish, installHubSkill, readLocalSkillFiles } from "@ares/agent";
 import { QueryEngineDispatcher, OperatorBackgroundLoop, deriveLeash, domainOf, isOperatorPaused, listGoals, loadStandingOrders, materializeDueStandingOrders, type StandingOrder } from "@ares/operator";
 import { MemoryStore, reflectOnRun, detectWorkspaceProjectId, loadProjectState, buildConversationDigest, mergeDurableFacts, CONVERSATION_REFLECT_SYSTEM, DURABLE_FACTS_SCHEMA_HINT, type DurableFact } from "@ares/mind";
 import { OAUTH_PROVIDERS, PROVIDER_LABELS, startOAuthFlow, connectedProviders, getProviderConfig, setCredential, hasCredential, deleteCredential, clientIdName, clientSecretName, runAresAccountSignin, probeAresOauth } from "@ares/core";
@@ -27,9 +27,9 @@ import { gateToolPermission } from "../policyGate.js";
 import { embeddedBridge } from "./browserBridge.js";
 import { garrisonCommand } from "./garrisonCmd.js";
 import { cleanCommandId, normalizePermissionDecision } from "./permissions.js";
-import { aresGatewayBase, daemonModelCatalog, fetchAresGatewayMe, fetchCustomOpenAiModels, postAresGatewayReport, providerFamilyForSelection, selectProvider } from "./providers.js";
+import { aresGatewayBase, daemonModelCatalog, fetchAresGatewayMe, fetchCustomOpenAiModels, postAresGatewayReport, providerFamilyForSelection, selectProvider, type ProviderSelection } from "./providers.js";
 import { ParsedArgs, cliVersion } from "./runtime.js";
-import { LiveSession, chatContextBudget, createSession, createSessionWithSelection, handleReasoningCommand, isProviderFatalError, makeSpanSummarizer, pickHealthyFallback, resolveReasoningLevel } from "./sessionFactory.js";
+import { LiveSession, chatContextBudget, createSession, createSessionWithSelection, handleReasoningCommand, isProviderFatalError, makeSpanSummarizer, modelLikelyHasVision, pickHealthyFallback, pickVisionFallback, resolveReasoningLevel } from "./sessionFactory.js";
 import { startGatewayMirror } from "./telegramWiring.js";
 import { contentFromUserInput, undoLines } from "./terminalLines.js";
 import { buildSystemPrompt, finishTurn, gatherGitRunFacts, mindSessionEnded, prepareUserTurn } from "./turnPipeline.js";
@@ -80,6 +80,11 @@ interface DaemonInputCommand {
   action?: string;
   /** operator_control halt reason (freeform, logged with the kill-switch flag file). */
   reason?: string;
+  /** skill_invoke payload — JSON handed to the skill's handler(input, ctx). */
+  input?: unknown;
+  /** skill_invoke correlation id — echoed back in skill_result so the UI can
+   *  match a response to the exact call (TTS utterances, surface clicks). */
+  invokeId?: string;
 }
 
 const ROUTING_LANES = ["chat", "coding", "research", "tool-use"] as const;
@@ -172,12 +177,100 @@ export function applyEngineConfigEnv(cfg: import("../uiSettings.js").EngineConfi
   if (cfg.operatorTickMinutes) process.env.ARES_OPERATOR_TICK_MS = String(cfg.operatorTickMinutes * 60_000);
 }
 
+/** A UI surface a skill contributes — a button (and, later, toggles/panels)
+ *  that the app renders in the active-skills tray. Clicking it invokes the
+ *  skill itself with `input` (the whole security model: a surface can only run
+ *  its own skill). */
+interface SkillSurface {
+  id: string;
+  label: string;
+  icon?: string;
+  kind?: "button" | "toggle";
+  /** JSON passed to the skill's handler when the surface is activated. */
+  input?: unknown;
+  /** Optional hint shown on hover. */
+  hint?: string;
+}
+
 interface DaemonSkillInfo {
   name: string;
   description: string;
   status: string;
   category: string;
   enabled: boolean;
+  /** Capabilities this skill supplies (e.g. ["tts"]) — Ares routes the matching
+   *  built-in through the toggled-on provider skill instead. */
+  provides: string[];
+  /** UI buttons this skill contributes to the active-skills tray. */
+  surfaces: SkillSurface[];
+}
+
+/** Parse a `surfaces:` value (JSON array) into validated SkillSurface[]. Tolerant:
+ *  a malformed value yields no surfaces rather than breaking the whole list. */
+export function parseSurfaces(raw: string): SkillSurface[] {
+  if (!raw || !raw.trim().startsWith("[")) return [];
+  let arr: unknown;
+  try {
+    arr = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(arr)) return [];
+  const out: SkillSurface[] = [];
+  for (const item of arr) {
+    if (!item || typeof item !== "object") continue;
+    const s = item as Record<string, unknown>;
+    const id = typeof s.id === "string" ? s.id : "";
+    const label = typeof s.label === "string" ? s.label : "";
+    if (!id || !label) continue;
+    out.push({
+      id,
+      label,
+      icon: typeof s.icon === "string" ? s.icon : undefined,
+      kind: s.kind === "toggle" ? "toggle" : "button",
+      input: s.input,
+      hint: typeof s.hint === "string" ? s.hint : undefined,
+    });
+    if (out.length >= 12) break; // a tray, not a dashboard
+  }
+  return out;
+}
+
+export function inferSkillProvides(entryName: string, skillMd: string, surfaces: SkillSurface[], declared: string[]): string[] {
+  const provides = new Set(declared.map((s) => s.trim()).filter(Boolean));
+  const surfaceProvidesTts = surfaces.some((surface) => {
+    const input = surface.input;
+    return !!input && typeof input === "object" && (input as Record<string, unknown>).op === "tts";
+  });
+  const bodyClaimsTts =
+    /\bprovides\s+(?:the\s+)?['"`]?tts['"`]?\s+capability\b/i.test(skillMd) ||
+    /\btext[- ]to[- ]speech\b/i.test(skillMd) ||
+    // Known voice engines named in the manifest are as clear a signal as any.
+    /\b(piper|kokoro|elevenlabs|coqui)\b/i.test(skillMd);
+  // "tts" anywhere in the skill's NAME (piper_tts, tts-eleven, my_tts…) — users
+  // name their voice skills exactly this way and expect them to just be used.
+  const nameSignalsTts = /(^|[_-])tts([_-]|$)/i.test(entryName);
+
+  // A hand-authored voice provider should not fail silently because its
+  // frontmatter omitted one line. The explicit `provides:` field still wins,
+  // but a tts-ish name, a TTS surface, or a clear manifest body claim are
+  // enough for the desktop to route speech through the provider.
+  if (!provides.has("tts") && (nameSignalsTts || surfaceProvidesTts || bodyClaimsTts)) {
+    provides.add("tts");
+  }
+  // Same courtesy for speech-to-text providers (whisper.cpp, Deepgram, …):
+  // a transcribe surface, an stt name, or a clear body claim registers them.
+  const surfaceProvidesStt = surfaces.some((surface) => {
+    const input = surface.input;
+    return !!input && typeof input === "object" && (input as Record<string, unknown>).op === "transcribe";
+  });
+  const bodyClaimsStt =
+    /\bprovides\s+(?:the\s+)?['"`]?stt['"`]?\s+capability\b/i.test(skillMd) ||
+    /\bspeech[- ]to[- ]text\b/i.test(skillMd);
+  if (!provides.has("stt") && (entryName === "stt" || surfaceProvidesStt || bodyClaimsStt)) {
+    provides.add("stt");
+  }
+  return [...provides];
 }
 
 /** List skills under ~/.ares/skills, parsing SKILL.md frontmatter + enabled set. */
@@ -200,12 +293,24 @@ async function daemonSkillsList(home: string): Promise<DaemonSkillInfo[]> {
     if (!text) continue;
     const fm = text.match(/^---\n([\s\S]*?)\n---/);
     const field = (key: string) => fm?.[1].match(new RegExp(`^${key}:\\s*(.+)$`, "m"))?.[1]?.trim() ?? "";
+    // `provides` is a comma list of capability ids; `surfaces` is a JSON array
+    // on one line (the single-line frontmatter reader can't do nested YAML). A
+    // separate surfaces.json in the skill dir is also honored (nicer to author).
+    const declaredProvides = field("provides").split(",").map((s) => s.trim()).filter(Boolean);
+    let surfaces = parseSurfaces(field("surfaces"));
+    if (surfaces.length === 0) {
+      const sj = await readFile(path.join(skillsDir, entry.name, "surfaces.json"), "utf8").catch(() => "");
+      if (sj) surfaces = parseSurfaces(sj);
+    }
+    const provides = inferSkillProvides(entry.name, text, surfaces, declaredProvides);
     skills.push({
       name: entry.name,
       description: field("description") || "Local skill.",
       status: field("status") || "ready",
       category: field("category") || "general",
       enabled: !disabled.has(entry.name),
+      provides,
+      surfaces,
     });
   }
   skills.sort((a, b) => a.name.localeCompare(b.name));
@@ -1483,6 +1588,72 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
         process.stdout.write(JSON.stringify({ type: "skill_toggle_set", name, enabled }) + "\n");
         continue;
       }
+      if (command.type === "skill_invoke") {
+        // One generic path for BOTH a tray surface-button click and a capability
+        // call (e.g. TTS through a provider skill). The app never runs arbitrary
+        // skills — it can only invoke what's already installed + enabled, and a
+        // surface can only run its own skill.
+        const name = typeof command.name === "string" ? command.name.trim() : "";
+        const invokeId = typeof command.invokeId === "string" ? command.invokeId : undefined;
+        if (!name) {
+          process.stdout.write(JSON.stringify({ type: "daemon_error", error: "skill_invoke requires name" }) + "\n");
+          continue;
+        }
+        const settings = await loadUiSettings();
+        if ((settings.disabledSkills ?? []).includes(name)) {
+          process.stdout.write(JSON.stringify({ type: "skill_result", invokeId, name, ok: false, error: `skill '${name}' is disabled` }) + "\n");
+          continue;
+        }
+        const started = Date.now();
+        const run = await runSkill({ home: live.context.home, name, input: command.input, timeoutMs: 60_000 }).catch(
+          (err) => ({ ok: false, result: undefined, error: err instanceof Error ? err.message : String(err) }) as { ok: boolean; result?: unknown; error?: string },
+        );
+        process.stdout.write(JSON.stringify({
+          type: "skill_result",
+          invokeId,
+          name,
+          ok: run.ok,
+          result: run.ok ? run.result : undefined,
+          error: run.ok ? undefined : (run.error ?? "skill failed"),
+          durationMs: Date.now() - started,
+        }) + "\n");
+        continue;
+      }
+      if (command.type === "skillhub_list") {
+        const gwSettings = await loadUiSettings();
+        const base = aresGatewayBase(gwSettings);
+        const reachable = await skillHubProbe(base);
+        const skills = reachable ? await skillHubList(base, typeof command.text === "string" ? command.text : "").catch(() => []) : [];
+        process.stdout.write(JSON.stringify({ type: "skillhub_list", reachable, skills }) + "\n");
+        continue;
+      }
+      if (command.type === "skillhub_install") {
+        const gwSettings = await loadUiSettings();
+        const base = aresGatewayBase(gwSettings);
+        const id = typeof command.id === "string" ? command.id : "";
+        const files = id ? await skillHubGet(base, id).catch(() => null) : null;
+        if (!files) {
+          process.stdout.write(JSON.stringify({ type: "skillhub_installed", ok: false, error: "skill not found on the hub" }) + "\n");
+          continue;
+        }
+        const res = await installHubSkill(live.context.home, files).then((r) => ({ ok: true as const, ...r })).catch((e) => ({ ok: false as const, error: e instanceof Error ? e.message : String(e) }));
+        process.stdout.write(JSON.stringify({ type: "skillhub_installed", ...res }) + "\n");
+        continue;
+      }
+      if (command.type === "skillhub_publish") {
+        const gwSettings = await loadUiSettings();
+        const base = aresGatewayBase(gwSettings);
+        const token = gwSettings.aresGatewayToken || process.env.ARES_GATEWAY_TOKEN || "";
+        const name = typeof command.name === "string" ? command.name : "";
+        const files = name ? await readLocalSkillFiles(live.context.home, name).catch(() => null) : null;
+        if (!files) {
+          process.stdout.write(JSON.stringify({ type: "skillhub_published", ok: false, error: "local skill not found" }) + "\n");
+          continue;
+        }
+        const res = await skillHubPublish(base, token, files);
+        process.stdout.write(JSON.stringify({ type: "skillhub_published", ...res }) + "\n");
+        continue;
+      }
       if (command.type === "usage_stats") {
         const days = Number(command.days) > 0 ? Math.floor(Number(command.days)) : 30;
         const stats = await daemonUsageStats(live.context.workspace, days).catch(() => null);
@@ -1770,8 +1941,45 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           // best-effort — never block a turn on attribution
         }
         const turnState = { status: "completed" as "completed" | "interrupted" | "failed", fatalProvider: null as string | null };
+        // Restore the user's pinned model after a one-turn vision escalation.
+        let revertSelection: ProviderSelection | null = null;
+        let escalatedSelection: ProviderSelection | null = null;
         try {
           await prepareUserTurn(entry.live, goal);
+          // ── Vision guard: never ship a pasted image to a blind model. ──
+          // A pinned text-only model (deepseek et al) used to receive the image
+          // blocks anyway and answer "can't view the image" or guess blind
+          // (sess_e4c6022d). If this turn carries images and the active model
+          // lacks vision, escalate JUST this turn to a vision-capable provider
+          // (never off the Ares Gateway), or tell the model to be honest.
+          const turnContent = await contentFromUserInput(goal, entry.live.context.workspace);
+          const hasImages = turnContent.some((block) => block.type === "image");
+          if (hasImages && !modelLikelyHasVision(entry.live.selection.model)) {
+            const pinned = entry.live.selection;
+            const visionSel = await pickVisionFallback(pinned, liveDeadProviders()).catch(() => null);
+            if (visionSel) {
+              await entry.live.session.setProvider(visionSel.provider, visionSel.model, {
+                contextBudgetTokens: chatContextBudget(visionSel),
+                summarizeSpan: makeSpanSummarizer(visionSel, (usage) =>
+                  entry.live.session.recordAuxiliaryUsage("compaction", visionSel.provider.name, visionSel.model, usage),
+                ),
+              });
+              entry.live.selection = visionSel;
+              revertSelection = pinned;
+              escalatedSelection = visionSel;
+              tagEmit(sid, {
+                type: "system_reminder_injected",
+                source: "instructions",
+                text: `Image attached — ${pinned.model} can't see images, so this turn runs on ${visionSel.provider.name}/${visionSel.model}. Your model choice is restored next turn.`,
+              });
+              tagEmit(sid, { type: "route_resolved", model: visionSel.model, provider: visionSel.provider.name, lane: entry.lane ?? "chat", source: "assigned" });
+            } else {
+              entry.live.queueSystemReminder(
+                `The user attached an image, but the current model (${pinned.model}) cannot see images and no vision-capable provider is configured. Say so plainly, describe what you'd need (a vision model — e.g. Claude, GPT-4o, or Gemini — selected in the model picker), and work from the user's text only. Do NOT guess at the image's contents.`,
+                "instructions",
+              );
+            }
+          }
           const streamOnce = async (gen: AsyncGenerator<unknown>) => {
             for await (const event of gen) {
               const ev = event as { type: string; status?: "completed" | "interrupted" | "failed"; error?: { code?: string; message?: string }; touchedFiles?: string[] };
@@ -1786,7 +1994,7 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
               tagEmit(sid, event as Record<string, unknown>);
             }
           };
-          await streamOnce(entry.live.session.sendContent(await contentFromUserInput(goal, entry.live.context.workspace)));
+          await streamOnce(entry.live.session.sendContent(turnContent));
 
           // Self-healing fallback: if the turn died because the current provider
           // is unauthenticated / out of balance / unreachable, walk healthy
@@ -1846,6 +2054,24 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           tagEmit(command.sessionId, { type: "error", error: { code: "turn_throw", message: err instanceof Error ? err.message : String(err), retriable: false } });
           tagEmit(command.sessionId, { type: "turn_end", status: "failed", usage: {}, durationMs: 0 });
         } finally {
+          // A vision escalation was for THIS turn only — hand the conversation
+          // back to the user's pinned model. If the failover loop replaced the
+          // model mid-turn (provider death), its choice wins — don't revert onto
+          // a pin that may itself be part of the problem.
+          if (revertSelection && escalatedSelection && entry.live.selection === escalatedSelection) {
+            try {
+              const pinned = revertSelection;
+              await entry.live.session.setProvider(pinned.provider, pinned.model, {
+                contextBudgetTokens: chatContextBudget(pinned),
+                summarizeSpan: makeSpanSummarizer(pinned, (usage) =>
+                  entry.live.session.recordAuxiliaryUsage("compaction", pinned.provider.name, pinned.model, usage),
+                ),
+              });
+              entry.live.selection = pinned;
+            } catch {
+              // keep the vision model rather than kill the session
+            }
+          }
           entry.turnActive = false;
           activeTurns--;
         }

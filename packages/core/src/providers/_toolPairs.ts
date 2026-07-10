@@ -8,28 +8,46 @@
 import type { ContentBlock, Message } from "@ares/protocol";
 
 /**
- * Drop orphaned tool blocks before sending to an Anthropic-shaped endpoint. The
- * API 400s on a tool_result whose tool_use was dropped (compaction, an
- * interrupted turn, or a mid-conversation provider switch) — "unexpected
- * tool_use_id ... Each tool_result block must have a corresponding tool_use
- * block". Convert orphans to plain text so the model keeps the context without an
- * invalid request.
+ * Repair tool-call pairing before sending to an Anthropic-shaped endpoint.
+ *
+ * Anthropic's rule is strict ADJACENCY, not mere existence: every `tool_use` in
+ * an assistant message must be answered by a `tool_result` (same id) in the
+ * message IMMEDIATELY AFTER it. The API 400s otherwise —
+ *   "tool_use ids were found without tool_result blocks immediately after: <id>.
+ *    Each tool_use block must have a corresponding tool_result block in the next
+ *    message."
+ * and once that shape is persisted, every subsequent turn re-sends it and 400s
+ * identically — a permanently bricked session.
+ *
+ * The old check only asked "does a matching block exist ANYWHERE?" — so a pair
+ * split by an intervening message (an interrupted turn where the user's next
+ * message landed between the tool_use and its result, a compaction summary
+ * inserted mid-pair, or a mid-conversation provider switch that reordered ids)
+ * passed the sanitizer but still 400'd. We now validate by adjacency: a
+ * `tool_use` is kept only when the very next message carries its `tool_result`,
+ * and a `tool_result` only when the previous message emitted its `tool_use`.
+ * Everything else is converted to plain text so the model keeps the context
+ * without an invalid request. This repairs the persisted corruption on the way
+ * out — the next send succeeds and the session un-bricks itself.
  */
 export function sanitizeToolPairs(messages: readonly Message[]): Message[] {
-  const useIds = new Set<string>();
-  const resultIds = new Set<string>();
-  for (const m of messages) {
-    for (const b of m.content) {
-      if (b.type === "tool_use") useIds.add(b.id);
-      else if (b.type === "tool_result") resultIds.add(b.tool_use_id);
+  // A tool call is validly paired only when the tool_use and its tool_result sit
+  // in adjacent messages (assistant → user). Compute that set in one pass.
+  const pairedIds = new Set<string>();
+  for (let i = 0; i < messages.length - 1; i++) {
+    const useIdsHere = new Set<string>();
+    for (const b of messages[i].content) if (b.type === "tool_use") useIdsHere.add(b.id);
+    if (useIdsHere.size === 0) continue;
+    for (const b of messages[i + 1].content) {
+      if (b.type === "tool_result" && useIdsHere.has(b.tool_use_id)) pairedIds.add(b.tool_use_id);
     }
   }
   return messages.map((m) => {
     const content = m.content.flatMap((b): ContentBlock[] => {
-      if (b.type === "tool_use" && !resultIds.has(b.id)) {
+      if (b.type === "tool_use" && !pairedIds.has(b.id)) {
         return [{ type: "text", text: `[earlier ${b.name} tool call — result not retained]` }];
       }
-      if (b.type === "tool_result" && !useIds.has(b.tool_use_id)) {
+      if (b.type === "tool_result" && !pairedIds.has(b.tool_use_id)) {
         const text =
           typeof b.content === "string"
             ? b.content
