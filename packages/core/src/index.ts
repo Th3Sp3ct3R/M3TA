@@ -122,6 +122,7 @@ export {
 export {
   ContinuousVerifier,
   deriveNarrowVerify,
+  deriveScopedVerify,
   findRelatedTestFiles,
   triageVerifyOutput,
   type VerifierOptions,
@@ -131,7 +132,26 @@ export {
   type WorkspaceSetup,
   type CommandRunner,
   type VerifyCacheStats,
+  type VerificationEvidenceSnapshot,
 } from "./verifier.js";
+
+export {
+  buildRepositoryMap,
+  renderRepositoryMap,
+  repositoryMapReminder,
+  type RepositoryMap,
+  type RepositoryPackageMap,
+  type RepositoryMapOptions,
+} from "./repoCartography.js";
+
+export {
+  CodingJournal,
+  type CodingJournalOptions,
+  type CodingJournalState,
+  type CodingPhase,
+  type CodingCheckRecord,
+  type CodingFailureRecord,
+} from "./codingJournal.js";
 
 export {
   HookManager,
@@ -156,6 +176,7 @@ export {
 export {
   connectMcpServer,
   disconnectMcpServer,
+  setMcpServerEnabled,
   getMcpAccessToken,
   loadRemoteMcpServers,
   connectorNameFromUrl,
@@ -213,10 +234,12 @@ export {
   DEFAULT_OLLAMA_SLOTS,
   OLLAMA_CLOUD_MODELS,
   ollamaCloudModelsFor,
+  fetchOllamaLibraryModels,
   type SlotName,
   type SlotConfig,
   type OllamaCloudPoolOptions,
   type OllamaCloudModel,
+  type OllamaLibraryModel,
 } from "./providers/ollamaCloud.js";
 
 export {

@@ -1,6 +1,6 @@
 // Extracted from entry.ts — providers.
 
-import { MockEchoProvider, OpenAIResponsesProvider, OpenRouterProvider, DeepSeekProvider, AnthropicProvider, DEFAULT_ANTHROPIC_MODEL, OllamaCloudPool, DEFAULT_OLLAMA_SLOTS, OLLAMA_CLOUD_MODELS, fetchDeepSeekModels, fetchOpenRouterModels, fetchAnthropicModels, loadAuthToken, MoaProvider, type MoaMember, type Provider } from "@ares/core";
+import { MockEchoProvider, OpenAIResponsesProvider, OpenRouterProvider, DeepSeekProvider, AnthropicProvider, DEFAULT_ANTHROPIC_MODEL, OllamaCloudPool, DEFAULT_OLLAMA_SLOTS, OLLAMA_CLOUD_MODELS, fetchOllamaLibraryModels, fetchDeepSeekModels, fetchOpenRouterModels, fetchAnthropicModels, loadAuthToken, MoaProvider, type MoaMember, type Provider } from "@ares/core";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
 import { type SubModelPool } from "@ares/tools";
@@ -42,6 +42,13 @@ interface DaemonModelOption {
   capabilities?: string[];
   /** Rich prose (OpenRouter) for the discovery cards. */
   description?: string;
+  /** Structured stats for the discovery panel (the hint string keeps a packed
+   *  copy for old clients, but the UI wants real numbers). */
+  contextLength?: number;
+  pricing?: { input?: number; output?: number };
+  /** Ollama library meta: human pull count + relative updated age. */
+  pulls?: string;
+  updated?: string;
 }
 
 export const TERMINAL_PROVIDERS = ["ollama", "openai", "anthropic", "deepseek", "openrouter", "ares", "custom", "moa", "mock"] as const;
@@ -321,6 +328,11 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
       ],
       // OpenRouter ships a rich blurb per model — the heart of the discovery UI.
       description: model.description?.trim() || undefined,
+      contextLength: model.contextLength || undefined,
+      pricing: {
+        input: model.promptPrice != null ? Number(model.promptPrice) * 1e6 : undefined,
+        output: model.completionPrice != null ? Number(model.completionPrice) * 1e6 : undefined,
+      },
     }));
   }
 
@@ -367,6 +379,7 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
     const apiKey = settings.ollamaApiKey || process.env.OLLAMA_API_KEY || "";
     const response = await fetch("https://ollama.com/api/tags", {
       headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(8_000),
     }).catch(() => null);
     if (response?.ok) {
       const payload = await response.json() as {
@@ -388,6 +401,31 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
         });
       }
     }
+  }
+
+  // The FULL public library (ollama.com/library) — every model, pulled or not,
+  // with the same blurb/pulls/updated meta the website shows. Degrades to
+  // nothing on network failure; never blocks the rest of the catalog.
+  const library = await fetchOllamaLibraryModels().catch(() => []);
+  for (const entry of library) {
+    if (entry.capabilities.includes("embedding")) continue; // not chat-pickable
+    const caps = [
+      ...(entry.capabilities.includes("tools") ? ["tools"] : []),
+      ...(entry.capabilities.includes("thinking") ? ["reasoning"] : []),
+      ...(entry.capabilities.includes("vision") ? ["vision"] : []),
+    ];
+    put({
+      // Cloud-hosted library models run as name:cloud; local-only ones by name
+      // (which works once pulled — the UI shows pulled state).
+      id: entry.cloud ? `${entry.name}:cloud` : entry.name,
+      label: entry.name,
+      hint: [entry.pulls ? `${entry.pulls} pulls` : "", entry.tagCount ? `${entry.tagCount} tag${entry.tagCount === 1 ? "" : "s"}` : "", entry.updated ? `updated ${entry.updated}` : ""].filter(Boolean).join(" · "),
+      group: entry.cloud ? "Ollama Library · cloud" : "Ollama Library",
+      capabilities: caps,
+      description: entry.description,
+      pulls: entry.pulls,
+      updated: entry.updated,
+    });
   }
 
   return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));

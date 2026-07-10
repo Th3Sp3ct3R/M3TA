@@ -25,6 +25,7 @@ import {
   type PermissionPromptDecision,
   type PermissionPromptSuggestion,
   type ReasoningLevel,
+  type WorkStatus,
   isToolUseBlock,
 } from "@ares/protocol";
 import { randomUUID } from "node:crypto";
@@ -173,6 +174,30 @@ export interface QueryEngineConfig {
    * repair loop at the engine level.
    */
   confirmTurnEnd?(): Promise<Array<{ text: string; source: "verifier" | "hook" }>>;
+  /** Require concrete successful proof after a tool reports changed files. */
+  requireVerificationEvidence?: boolean;
+  /** Host-owned automatic verifier evidence. Empty reminders alone are not
+   * proof because they also mean no checks or skipped tooling. */
+  verificationEvidence?(): {
+    mutationGeneration: number;
+    passedCommands: number;
+    failedCommands: number;
+    skippedCommands: number;
+    latestPassedAt?: number;
+    latestFailedAt?: number;
+    latestRunGeneration?: number;
+    latestRunStatus?: "passed" | "failed" | "cancelled" | "no_checks";
+    latestRunStrength?: "syntax" | "static" | "behavioral";
+    latestLabels?: string[];
+  };
+  /** Durable coding state from a previous turn still needs proof. */
+  outstandingVerificationRequired?(): boolean;
+  /** True only for debt carried into this turn (not mutations made now). */
+  persistedVerificationDebt?(): boolean;
+  /** False when durable touched-file history overflowed and tail checks are incomplete. */
+  persistedVerificationScopeComplete?(): boolean;
+  /** Latest exact mutation observed below the engine (e.g. checkpoint-derived shell diff). */
+  observedMutationAt?(): number;
   /**
    * Failure-signature recall. When a tool fails the SAME way twice in a row (an
    * approach that's about to be declared dead), the engine asks the host whether
@@ -183,6 +208,15 @@ export interface QueryEngineConfig {
    */
   recallFailureFix?(input: { tool: string; signature: string; error: string }): Promise<string | null>;
   requestPermission?(request: ToolPermissionRequest): Promise<PermissionPromptDecision>;
+  /**
+   * When false, a PermissionDeniedError from a tool is an ORDINARY error result
+   * the model can route around, instead of interrupting the whole turn.
+   * Interactive sessions keep the default (true): the user said no, stop.
+   * Child engines (subagents, operator forks) set false — one denied
+   * out-of-workspace path used to kill an entire researcher fleet with
+   * "(subagent produced no text output)" (bug report 96ca5473).
+   */
+  permissionDenialInterrupts?: boolean;
   beforeToolUseCheckpoint?(request: {
     toolUseId: string;
     toolName: string;
@@ -792,6 +826,11 @@ export class QueryEngine {
     this.messages.push(...messages);
   }
 
+  /** Restore the last persisted TodoWrite snapshot on session resume. */
+  hydrateTodos(todos: readonly import("@ares/protocol").Todo[]): void {
+    this.latestTodos = todos.map((todo) => ({ ...todo }));
+  }
+
   appendUserMessage(text: string): Message {
     return this.appendUserMessageContent([{ type: "text", text }]);
   }
@@ -1109,6 +1148,74 @@ export class QueryEngine {
     let repeatBreakerFired = false;
     let oscillationFired = false;
     let ceilingNudged = false;
+    // Coding completion truth. Tool-reported mutations arm the proof gate;
+    // only a successful manual check or host verifier result AFTER the latest
+    // mutation can mark the work verified.
+    let lastMutationAt = 0;
+    let manualVerificationAt = 0;
+    let manualVerificationFailureCommand: string | null = null;
+    let latestManualVerificationCommand: string | null = null;
+    const changedFiles = new Set<string>();
+    let proofGateFired = false;
+    let unverifiedSurfaced = false;
+    let workStatus: WorkStatus = "not_applicable";
+    let verificationGenerationAtMutation = this.cfg.verificationEvidence?.().mutationGeneration ?? 0;
+    const hasOutstandingVerification = (): boolean => this.cfg.outstandingVerificationRequired?.() === true;
+    const hasPersistedVerificationDebt = (): boolean => this.cfg.persistedVerificationDebt?.() === true;
+    const hasCompletePersistedVerificationScope = (): boolean => this.cfg.persistedVerificationScopeComplete?.() !== false;
+    const requiresVerification = (): boolean => changedFiles.size > 0 || hasOutstandingVerification();
+    const hasPostMutationProof = (): boolean => {
+      const evidence = this.cfg.verificationEvidence?.();
+      if (evidence) {
+        const currentGenerationPassed =
+          evidence.latestRunStatus === "passed" &&
+          evidence.latestRunStrength === "behavioral" &&
+          evidence.latestRunGeneration === evidence.mutationGeneration;
+        if (
+          currentGenerationPassed &&
+          manualVerificationFailureCommand !== null
+        ) {
+          return false;
+        }
+        if (!currentGenerationPassed) {
+          // Some file types have no automatic checker. A single anchored manual
+          // command may satisfy that explicit no-check state, but can NEVER
+          // override a failed/cancelled/superseded host run.
+          const observedMutationAt = Math.max(lastMutationAt, this.cfg.observedMutationAt?.() ?? 0);
+          const manualCoversPersistedOverflow = hasCompletePersistedVerificationScope() ||
+            (latestManualVerificationCommand !== null && verificationCommandFamily(latestManualVerificationCommand) === latestManualVerificationCommand);
+          return evidence.latestRunStatus === "no_checks" &&
+            evidence.latestRunGeneration === evidence.mutationGeneration &&
+            manualVerificationAt > 0 &&
+            manualVerificationFailureCommand === null &&
+            manualCoversPersistedOverflow &&
+            (observedMutationAt === 0 || manualVerificationAt >= observedMutationAt);
+        }
+        // A current-turn mutation must cause a newer verifier generation. For
+        // durable outstanding work, prepareUserTurn explicitly reschedules the
+        // persisted touched files before streaming, so equality is expected.
+        const hasCurrentTurnMutation = changedFiles.size > 0 || (this.cfg.observedMutationAt?.() ?? 0) > 0;
+        if (
+          hasPersistedVerificationDebt() &&
+          !hasCompletePersistedVerificationScope()
+        ) {
+          return latestManualVerificationCommand !== null &&
+            verificationCommandFamily(latestManualVerificationCommand) === latestManualVerificationCommand &&
+            manualVerificationFailureCommand === null;
+        }
+        return hasPersistedVerificationDebt() && !hasCurrentTurnMutation
+          ? true
+          : (evidence.latestRunGeneration ?? -1) > verificationGenerationAtMutation;
+      }
+      return lastMutationAt > 0 &&
+        manualVerificationFailureCommand === null &&
+        manualVerificationAt >= lastMutationAt;
+    };
+    const resolvedWorkStatus = (): WorkStatus => {
+      if (workStatus === "blocked") return "blocked";
+      if (!requiresVerification()) return "not_applicable";
+      return hasPostMutationProof() ? "verified" : "unverified";
+    };
 
     for (let iter = 0; iter < maxIters; iter++) {
       // Honor a Stop at every iteration boundary — independent of provider
@@ -1116,7 +1223,7 @@ export class QueryEngine {
       // an interrupt during/after a non-cooperative tool wouldn't be felt until
       // the next provider stream (many seconds), so Stop appeared dead.
       if (this.liveSignal().aborted) {
-        yield { type: "turn_end", status: "interrupted", usage: totalUsage, durationMs: Date.now() - startedAt };
+        yield { type: "turn_end", status: "interrupted", workStatus: resolvedWorkStatus(), usage: totalUsage, durationMs: Date.now() - startedAt };
         return;
       }
       // ─── Stream one assistant turn from the provider ─────────────────
@@ -1144,7 +1251,7 @@ export class QueryEngine {
         const rawBudgetAttempts = contextBudgetAttempts(this.cfg.contextBudgetTokens ?? 0);
         const budgetAttempts = rawBudgetAttempts.map((b) => (b > 0 ? Math.max(1, Math.floor(b / this.tokenScale)) : b));
         let modelStarted = false;
-        for (let attempt = 0; attempt < budgetAttempts.length; attempt++) {
+        budgetLoop: for (let attempt = 0; attempt < budgetAttempts.length; attempt++) {
           // S1 — transient-failure retry. A retriable provider error (529
           // overloaded, 429, network blip, stream stall) that lands BEFORE any
           // model output is no longer a dead turn: back off and re-issue the
@@ -1267,6 +1374,20 @@ export class QueryEngine {
               }
             }
 
+            // Some gateways occasionally close an otherwise healthy HTTP/SSE
+            // response before sending a terminal message_done. When NOTHING was
+            // committed, replaying the same request is safe and materially more
+            // useful than failing the whole turn (production report
+            // sess_ebed3deb). An owner interrupt is deliberately excluded: that
+            // is handled as an interrupted turn below, never retried.
+            if (!assistantMessage && !streamError && !this.liveSignal().aborted) {
+              streamError = {
+                code: "no_message_done",
+                message: "provider closed stream without message_done",
+                retriable: true,
+              };
+            }
+
             // Transient, pre-output failure → wait and retry the same request.
             // A stall is also retriable after thinking-only output: nothing was
             // committed to the conversation, so re-issuing is safe.
@@ -1286,6 +1407,19 @@ export class QueryEngine {
               let waitMs = Math.max(transientBackoffMs(transientRetry), streamError.retryAfterMs ?? 0);
               let note = `provider hiccup (${streamError.code}); retrying in ${(waitMs / 1000).toFixed(1)}s — attempt ${transientRetry}/${MAX_TRANSIENT_RETRIES}`;
               if (isStallError(streamError)) {
+                // Two consecutive stalls at the same window size usually mean the
+                // provider is choking on the PROMPT itself (deepseek/ollama-cloud
+                // stall silently on very large prompts) — re-issuing the same size
+                // just burns another 90s of dead air. Shrink the history window
+                // and go again instead (bug report 4a8ac088: 90s×2+ of silence).
+                if (transientRetry >= 2 && !sawCommittedOutput && attempt < budgetAttempts.length - 1) {
+                  yield {
+                    type: "system_reminder_injected",
+                    text: `Provider stalled ${transientRetry} times at this prompt size; retrying with a smaller recent-history window (${budgetAttempts[attempt + 1].toLocaleString()} tokens).`,
+                    source: "compaction",
+                  };
+                  continue budgetLoop;
+                }
                 // The effort-dial cutoff: a stall already burned its wait — retry
                 // promptly, one reasoning notch down (never below "low"), so the
                 // turn completes at reduced effort instead of spinning forever.
@@ -1327,6 +1461,22 @@ export class QueryEngine {
         yield {
           type: "turn_end",
           status: "failed",
+          workStatus: resolvedWorkStatus(),
+          usage: totalUsage,
+          durationMs: Date.now() - startedAt,
+        };
+        return;
+      }
+
+      // guardStreamStalls intentionally swallows the AbortError raised while it
+      // closes the provider iterator. Without this explicit branch, Stop fell
+      // through to the missing-message guard and surfaced as a FAILED
+      // `no_message_done` turn even though the abort worked.
+      if (this.liveSignal().aborted) {
+        yield {
+          type: "turn_end",
+          status: "interrupted",
+          workStatus: resolvedWorkStatus(),
           usage: totalUsage,
           durationMs: Date.now() - startedAt,
         };
@@ -1334,11 +1484,18 @@ export class QueryEngine {
       }
 
       if (streamError) {
+        // Provider-emitted errors were already forwarded from the stream. The
+        // premature-close error is synthesized locally, so surface it once only
+        // after its retry budget is exhausted.
+        if (streamError.code === "no_message_done") {
+          yield { type: "error", error: streamError };
+        }
         yield {
           type: "turn_end",
           // A user interrupt surfaces as a provider abort error — report it as
           // interrupted, not failed.
           status: this.liveSignal().aborted ? "interrupted" : "failed",
+          workStatus: resolvedWorkStatus(),
           usage: totalUsage,
           durationMs: Date.now() - startedAt,
         };
@@ -1353,6 +1510,7 @@ export class QueryEngine {
         yield {
           type: "turn_end",
           status: "failed",
+          workStatus: resolvedWorkStatus(),
           usage: totalUsage,
           durationMs: Date.now() - startedAt,
         };
@@ -1496,6 +1654,7 @@ export class QueryEngine {
             // — escalation off the surfaced UNRESOLVED reminders is the harness's
             // job; see the C1-gate-honesty contract test.
             for (const r of gateReminders) {
+              workStatus = "blocked";
               yield {
                 type: "system_reminder_injected",
                 text: `UNRESOLVED at turn end (verification still failing): ${r.text}`,
@@ -1503,6 +1662,45 @@ export class QueryEngine {
               };
             }
           }
+        }
+        // Post-edit proof gate. The verifier's empty reminder queue is NOT a
+        // green verdict: it can also mean no command was derived or every tool
+        // was skipped. Settle the normal end gate first, then require concrete
+        // pass evidence newer than the last mutation. One retry gives the model
+        // a chance to run the right package check; a second unsupported finish
+        // ends honestly as UNVERIFIED rather than looping forever.
+        if (
+          this.cfg.requireVerificationEvidence &&
+          workStatus !== "blocked" &&
+          requiresVerification() &&
+          !hasPostMutationProof() &&
+          !this.liveSignal().aborted
+        ) {
+          workStatus = "unverified";
+          if (!proofGateFired) {
+            proofGateFired = true;
+            const sample = [...changedFiles].slice(0, 8).map((file) => file.startsWith("<") ? file : path.relative(this.cfg.workspace, file)).join(", ");
+            const scope = changedFiles.size > 0 ? `You changed ${changedFiles.size} file(s)` : "This long-running coding task still has unverified persisted changes";
+            const text = `${scope}, but Ares has no complete all-green behavior-capable verifier run for the newest mutation generation${sample ? ` (${sample})` : ""}. Static syntax/type/lint checks are useful but do not prove requested behavior. Run the narrowest meaningful affected tests or real reproduction now. A skipped tool, an older run, one passing command inside a red run, or a verbal claim is not proof.`;
+            this.messages.push({
+              id: cryptoId(),
+              role: "user",
+              content: [{ type: "system_reminder", text }],
+              createdAt: new Date().toISOString(),
+            });
+            yield { type: "system_reminder_injected", text, source: "verifier" };
+            continue;
+          }
+          if (!unverifiedSurfaced) {
+            unverifiedSurfaced = true;
+            yield {
+              type: "system_reminder_injected",
+              text: "UNVERIFIED at turn end: coding changes remain, but no complete all-green behavior-capable check run is tied to the newest mutation generation. Static checks may pass, but requested behavior is not verified complete.",
+              source: "verifier",
+            };
+          }
+        } else if (requiresVerification() && hasPostMutationProof()) {
+          workStatus = "verified";
         }
         // If we got here still capped at the output-token limit (the 3 auto-
         // continues at C3 were exhausted), the assistant's message is literally
@@ -1518,6 +1716,7 @@ export class QueryEngine {
         yield {
           type: "turn_end",
           status: this.liveSignal().aborted ? "interrupted" : "completed",
+          workStatus: resolvedWorkStatus(),
           usage: totalUsage,
           durationMs: Date.now() - startedAt,
         };
@@ -1567,10 +1766,37 @@ export class QueryEngine {
 
       let interruptedByTool = false;
       for (const batch of buildDepAwareBatches(runnable, this.cfg.workspace)) {
+        // Capture BEFORE yielding tool events to the host: Session/UI consumers
+        // schedule verification while tool_end is yielded, so reading the
+        // generation after yield would mistake the new generation for baseline.
+        const verificationGenerationBeforeBatch = this.cfg.verificationEvidence?.().mutationGeneration ?? verificationGenerationAtMutation;
         const outcomes = yield* this.runToolBatch(batch);
         for (const outcome of outcomes) {
           resultByToolUseId.set(outcome.toolUseId, outcome.result);
           interruptedByTool ||= outcome.interrupted === true;
+          if (outcome.touchedFiles?.length) {
+            verificationGenerationAtMutation = verificationGenerationBeforeBatch;
+            lastMutationAt = Math.max(lastMutationAt, outcome.finishedAt ?? Date.now());
+            for (const file of outcome.touchedFiles) changedFiles.add(file);
+            workStatus = "unverified";
+          } else if (outcome.potentialMutation) {
+            verificationGenerationAtMutation = verificationGenerationBeforeBatch;
+            lastMutationAt = Math.max(lastMutationAt, outcome.finishedAt ?? Date.now());
+            changedFiles.add("<shell-mediated workspace changes>");
+            workStatus = "unverified";
+          }
+          if (outcome.verificationPassed) {
+            if (
+              !manualVerificationFailureCommand ||
+              verificationCommandCovers(outcome.verificationCommand ?? "", manualVerificationFailureCommand)
+            ) {
+              manualVerificationAt = Math.max(manualVerificationAt, outcome.finishedAt ?? Date.now());
+              latestManualVerificationCommand = outcome.verificationCommand ?? null;
+              manualVerificationFailureCommand = null;
+            }
+          } else if (outcome.verificationAttempted) {
+            manualVerificationFailureCommand = outcome.verificationCommand ?? "unknown verification command";
+          }
         }
         if (interruptedByTool) {
           fillMissingToolResults(pendingToolUses, resultByToolUseId, "tool skipped after permission interruption");
@@ -1583,6 +1809,7 @@ export class QueryEngine {
           yield {
             type: "turn_end",
             status: "interrupted",
+            workStatus: resolvedWorkStatus(),
             usage: totalUsage,
             durationMs: Date.now() - startedAt,
           };
@@ -1804,6 +2031,7 @@ export class QueryEngine {
         yield {
           type: "turn_end",
           status: "completed",
+          workStatus: resolvedWorkStatus(),
           usage: totalUsage,
           durationMs: Date.now() - startedAt,
         };
@@ -1822,6 +2050,7 @@ export class QueryEngine {
     yield {
       type: "turn_end",
       status: "failed",
+      workStatus: resolvedWorkStatus(),
       usage: totalUsage,
       durationMs: Date.now() - startedAt,
     };
@@ -1857,7 +2086,7 @@ export class QueryEngine {
           // error result and the batch keeps draining.
           outcomes[index] = {
             toolUseId: use.id,
-            interrupted: isPermissionDeniedError(err),
+            interrupted: this.cfg.permissionDenialInterrupts !== false && isPermissionDeniedError(err),
             result: { type: "tool_result", tool_use_id: use.id, content: message, is_error: true },
           };
         } finally {
@@ -2049,6 +2278,12 @@ export class QueryEngine {
           : modelText;
       return {
         toolUseId: use.id,
+        touchedFiles: result.touchedFiles,
+        finishedAt: Date.now(),
+        verificationAttempted: isManualVerificationCall(use.name, use.input),
+        verificationCommand: manualVerificationCommand(use.name, use.input) ?? undefined,
+        verificationPassed: isSuccessfulVerificationCall(use.name, use.input, result.output),
+        potentialMutation: isPotentialCodeMutationCall(use.name, use.input),
         result: {
           type: "tool_result",
           tool_use_id: use.id,
@@ -2091,7 +2326,10 @@ export class QueryEngine {
       }
       return {
         toolUseId: use.id,
-        interrupted: isPermissionDeniedError(err),
+        interrupted: this.cfg.permissionDenialInterrupts !== false && isPermissionDeniedError(err),
+        finishedAt: Date.now(),
+        verificationAttempted: isManualVerificationCall(use.name, use.input),
+        verificationCommand: manualVerificationCommand(use.name, use.input) ?? undefined,
         result: {
           type: "tool_result",
           tool_use_id: use.id,
@@ -2116,6 +2354,12 @@ interface ToolExecutionOutcome {
   toolUseId: string;
   result: ToolResultBlock;
   interrupted?: boolean;
+  touchedFiles?: string[];
+  finishedAt?: number;
+  verificationAttempted?: boolean;
+  verificationCommand?: string;
+  verificationPassed?: boolean;
+  potentialMutation?: boolean;
 }
 
 class AsyncEventQueue<T> {
@@ -2273,7 +2517,9 @@ interface ToolDeps {
 function analyzeToolDeps(use: ResolvedToolUse, workspace: string): ToolDeps {
   const name = use.tool.schema.name;
   const safety = use.tool.schema.safety;
-  const isWriteSafety = safety === "workspace-write" || safety === "destructive";
+  const taskType = String(((use.input ?? {}) as Record<string, unknown>).subagent_type ?? "");
+  const readOnlyTask = name === "Task" && taskType !== "general-purpose";
+  const isWriteSafety = !readOnlyTask && (safety === "workspace-write" || safety === "destructive");
 
   if (SOLO_TOOL_NAMES.has(name)) {
     return { target: null, isWrite: isWriteSafety, solo: true };
@@ -2780,6 +3026,56 @@ const PROGRESS_TOOLS = new Set([
   "ComputerUse",
 ]);
 
+function manualVerificationCommand(name: string, input: unknown): string | null {
+  if (name !== "Bash" && name !== "PowerShell") return null;
+  const request = (input ?? {}) as Record<string, unknown>;
+  if (request.run_in_background === true) return null;
+  const command = String(request.command ?? "").trim().replace(/\s+/g, " ");
+  // Manual proof is a fallback only when no structured host verifier exists.
+  // Accept one anchored check command, never a substring or shell chain: this
+  // rejects `echo test`, `pnpm test; exit 0`, pipelines, and verify-then-mutate.
+  if (/[;&|><`]|\$\(/.test(command)) return null;
+  if (/(?:^|\s)(?:--collect-only|--co|--no-run|--listtests|--list-tests|--dry-run|--help|--version|--showconfig|--show-config|--print-config|--passwithnotests|--allow-no-tests)(?:\s|$)/i.test(command)) return null;
+  if (/^(?:npx\s+)?(?:tsc|eslint|vitest|jest)\s+-(?:v|h)$/i.test(command)) return null;
+  if (!/^(?:node\s+--test\b|(?:pnpm|yarn)\s+(?:test|check|lint|build|typecheck)\b|npm\s+(?:test|run\s+(?:check|lint|build|typecheck))\b|npx\s+(?:tsc|eslint|vitest|jest)\b|(?:vitest|jest|pytest|ruff|mypy|tsc|eslint)\b|cargo\s+(?:test|check|clippy)\b|go\s+(?:test|build)\b)(?:\s+[^\r\n]*)?$/i.test(command)) {
+    return null;
+  }
+  return command.toLowerCase();
+}
+
+function isManualVerificationCall(name: string, input: unknown): boolean {
+  return manualVerificationCommand(name, input) !== null;
+}
+
+function verificationCommandFamily(command: string): string | null {
+  const match = command.match(/^(node\s+--test|(?:pnpm|yarn)\s+(?:test|check|lint|build|typecheck)|npm\s+(?:test|run\s+(?:check|lint|build|typecheck))|npx\s+(?:tsc|eslint|vitest|jest)|(?:vitest|jest|pytest|ruff|mypy|tsc|eslint)|cargo\s+(?:test|check|clippy)|go\s+(?:test|build))\b/i);
+  return match?.[1].toLowerCase().replace(/\s+/g, " ") ?? null;
+}
+
+function verificationCommandCovers(passingCommand: string, failedCommand: string): boolean {
+  if (passingCommand === failedCommand) return true;
+  const passingFamily = verificationCommandFamily(passingCommand);
+  const failedFamily = verificationCommandFamily(failedCommand);
+  return passingFamily !== null && passingFamily === failedFamily && passingCommand === passingFamily;
+}
+
+function isSuccessfulVerificationCall(name: string, input: unknown, output: unknown): boolean {
+  if (!isManualVerificationCall(name, input)) return false;
+  if (!output || typeof output !== "object") return false;
+  const result = output as Record<string, unknown>;
+  return result.exitCode === 0 && result.timedOut !== true;
+}
+
+function isPotentialCodeMutationCall(name: string, input: unknown): boolean {
+  if (["Write", "Edit", "ApplyIntent", "FindAndEdit", "NotebookEdit"].includes(name)) return true;
+  if (name !== "Bash" && name !== "PowerShell") return false;
+  const command = String(((input ?? {}) as Record<string, unknown>).command ?? "");
+  // Conservative shell mutation cues. The Session checkpoint diff is the final
+  // authority and supplies exact files; this early signal merely arms the proof
+  // gate before the inner engine tries to finish.
+  return /(?:^|[\s;&|])(?:rm|mv|cp|mkdir|touch|sed\s+-i|git\s+(?:apply|checkout|restore|mv|rm)|npm\s+(?:install|uninstall)|pnpm\s+(?:add|remove|install)|yarn\s+(?:add|remove|install)|cargo\s+(?:add|remove)|apply_patch)\b|(?:>|>>|Set-Content|Add-Content|Out-File|New-Item|Remove-Item|Move-Item|Copy-Item)/i.test(command);
+}
+
 /** Consecutive gather-only tool rounds tolerated before the convergence
  *  reminder fires. Overridable for tests / unusual workloads. */
 function currentGatherStallRounds(): number {
@@ -2997,14 +3293,32 @@ function describeActivity(toolName: string, input: unknown): string {
     case "Browser": {
       const action = str(i.action);
       const u = str(i.url);
-      if (action === "open") return u ? `Opening ${hostOf(u)}` : "Opening a page";
+      // Honest targets: local files and the in-app engine are NOT "the web".
+      const embedded = str(i.engine) === "embedded" || (!u && !!str(i.html));
+      const target = (() => {
+        if (!u) return embedded ? "your page in the Ares window" : "a page";
+        try {
+          const parsed = new URL(u.includes("://") ? u : `https://${u}`);
+          if (parsed.protocol === "file:") return `local file ${decodeURIComponent(parsed.pathname.split("/").pop() ?? "")}`.trim();
+          if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") return `local app ${parsed.host}`;
+          return parsed.host.replace(/^www\./, "") || u;
+        } catch {
+          return u;
+        }
+      })();
+      if (action === "open") return `Opening ${target}`;
+      if (action === "preview") return `Previewing ${target}`;
       if (action === "tree") return "Reading the page";
-      if (action === "screenshot" || action === "filmstrip") return "Capturing the screen";
+      if (action === "screenshot" || action === "filmstrip") return embedded ? "Reading the in-app page" : "Capturing the screen";
       if (action === "fill") return str(i.label) ? `Filling “${str(i.label)}”` : "Filling a field";
+      if (action === "fill_selector") return str(i.selector) ? `Typing into ${str(i.selector)}` : "Filling a field";
       if (action === "click") return str(i.name) ? `Clicking “${str(i.name)}”` : "Clicking a control";
+      if (action === "click_text") return str(i.query) ? `Clicking “${str(i.query)}”` : "Clicking a control";
+      if (action === "console") return "Reading the console";
+      if (action === "eval") return "Testing in the page";
       if (action === "state") return "Checking the page state";
       if (action === "close") return "Closing the browser";
-      return "Browsing the web";
+      return embedded ? "Using the in-app browser" : "Browsing the web";
     }
     case "ComputerUse": {
       const action = str(i.action);
