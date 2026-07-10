@@ -81,7 +81,17 @@ struct PresenceState {
 /// loading a plain, deterministic asset URL.
 struct LivingSurfaceState {
     session_id: Mutex<Option<String>>,
+    /// The staged generated document, served over the ares-surface:// scheme.
+    /// A srcdoc iframe INHERITS the app CSP (whose build-time style hashes and
+    /// script-src 'self' silently strip every generated <style>/<script> in
+    /// packaged builds); a scheme-served document owns its headers instead.
+    document: Mutex<Option<String>>,
+    doc_seq: AtomicU64,
 }
+
+/// The generated surface's entire authority. Inline script/style may run, but
+/// every network request — fetch, XHR, imports, css url(), beacons — is refused.
+const LIVING_SURFACE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data:;";
 
 #[derive(Clone, Serialize)]
 struct PresenceSnapshot {
@@ -1614,6 +1624,29 @@ async fn ares_living_surface_open(
     Ok(())
 }
 
+/// Stage the composed surface document and return the scheme URL the iframe
+/// should load. The sequence number only busts the WebView's navigation cache;
+/// the handler always serves the latest staged document.
+#[tauri::command]
+fn ares_living_surface_stage(
+    document: String,
+    state: State<LivingSurfaceState>,
+) -> Result<String, String> {
+    if document.len() > 600_000 {
+        return Err("surface document exceeds the size limit".to_string());
+    }
+    *state
+        .document
+        .lock()
+        .map_err(|_| "Living Surface document state is unavailable".to_string())? = Some(document);
+    let seq = state.doc_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    // Windows and Android serve custom schemes over http://<scheme>.localhost.
+    #[cfg(any(windows, target_os = "android"))]
+    return Ok(format!("http://ares-surface.localhost/doc/{seq}"));
+    #[cfg(not(any(windows, target_os = "android")))]
+    Ok(format!("ares-surface://localhost/doc/{seq}"))
+}
+
 #[tauri::command]
 fn ares_living_surface_context(state: State<LivingSurfaceState>) -> Result<String, String> {
     state
@@ -1698,6 +1731,34 @@ fn main() {
         })
         .manage(LivingSurfaceState {
             session_id: Mutex::new(None),
+            document: Mutex::new(None),
+            doc_seq: AtomicU64::new(0),
+        })
+        // The Living Surface's generated document. Serving it over a dedicated
+        // scheme gives it its OWN Content-Security-Policy header — a srcdoc
+        // iframe would inherit the app CSP and lose every generated style and
+        // script in packaged builds. The window's sandbox attribute (scripts
+        // without same-origin) still applies on top.
+        .register_uri_scheme_protocol("ares-surface", |ctx, _request| {
+            let staged = ctx
+                .app_handle()
+                .state::<LivingSurfaceState>()
+                .document
+                .lock()
+                .ok()
+                .and_then(|doc| doc.clone());
+            match staged {
+                Some(html) => tauri::http::Response::builder()
+                    .header("Content-Type", "text/html; charset=utf-8")
+                    .header("Content-Security-Policy", LIVING_SURFACE_CSP)
+                    .header("Cache-Control", "no-store")
+                    .body(html.into_bytes())
+                    .unwrap_or_else(|_| tauri::http::Response::new(Vec::new())),
+                None => tauri::http::Response::builder()
+                    .status(404)
+                    .body(Vec::new())
+                    .unwrap_or_else(|_| tauri::http::Response::new(Vec::new())),
+            }
         })
         .setup(|app| {
             let handle = app.handle().clone();
@@ -1788,7 +1849,8 @@ fn main() {
             ares_living_surface_open,
             ares_living_surface_close,
             ares_living_surface_ready,
-            ares_living_surface_context
+            ares_living_surface_context,
+            ares_living_surface_stage
         ])
         .build(tauri::generate_context!())
         .expect("error while building Ares Tauri app")

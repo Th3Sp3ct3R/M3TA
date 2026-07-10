@@ -359,6 +359,10 @@ export function LivingSurface({ sessionId }: { sessionId: string }) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const pendingPosts = useRef<unknown[]>([]);
   const faults = useRef<string[]>([]);
+  // Native builds serve the document over ares-surface:// so it carries its
+  // OWN sealed CSP — a srcdoc frame inherits the app CSP, whose packaged
+  // style hashes and script-src 'self' strip every generated style/script.
+  const [frameSrc, setFrameSrc] = useState<string | null>(null);
   const prefs = useMemo(() => {
     try { return JSON.parse(localStorage.getItem("ares.desktop.v3") ?? "{}"); } catch { return {}; }
   }, []);
@@ -385,6 +389,15 @@ export function LivingSurface({ sessionId }: { sessionId: string }) {
   useEffect(() => {
     try { localStorage.setItem(historyKey(sessionId), JSON.stringify(history.slice(-20))); } catch { /* best effort */ }
   }, [history, sessionId]);
+
+  useEffect(() => {
+    if (!native) return;
+    let stale = false;
+    invoke<string>("ares_living_surface_stage", { document: iframeDocument(snapshot) })
+      .then((url) => { if (!stale) setFrameSrc(url); })
+      .catch((error) => addLine("system", `Could not stage the surface: ${String(error)}`));
+    return () => { stale = true; };
+  }, [addLine, native, snapshot]);
 
   const deliverPosts = useCallback((posts: unknown[], documentChanged: boolean) => {
     if (!posts.length) return;
@@ -610,14 +623,16 @@ export function LivingSurface({ sessionId }: { sessionId: string }) {
         </div>
       </header>
 
-      <iframe
-        ref={iframeRef}
-        className="livingCanvas"
-        title={snapshot.title}
-        sandbox="allow-scripts allow-forms allow-pointer-lock"
-        srcDoc={iframeDocument(snapshot)}
-        onLoad={onFrameLoad}
-      />
+      {!native || frameSrc ? (
+        <iframe
+          ref={iframeRef}
+          className="livingCanvas"
+          title={snapshot.title}
+          sandbox="allow-scripts allow-forms allow-pointer-lock"
+          {...(native ? { src: frameSrc ?? undefined } : { srcDoc: iframeDocument(snapshot) })}
+          onLoad={onFrameLoad}
+        />
+      ) : null}
 
       <div className="livingActivity" data-on={busy ? "1" : "0"}><i /><span>{activity}</span></div>
 

@@ -38,6 +38,20 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.28.1",
+    date: "July 2026",
+    title: "The Living Surface, actually alive",
+    tagline: "A hotfix for the installed app: generated surfaces now arrive fully styled and fully working — the packaged security policy was silently stripping their looks and their code.",
+    highlights: [
+      {
+        icon: "🎨",
+        title: "Surfaces render for real",
+        tag: "Polished",
+        blurb: "The installed app was blocking every generated style and script, leaving surfaces as bare text on white. Each world is now served with its own sealed policy — full visuals, working code, still zero network or system access.",
+      },
+    ],
+  },
+  {
     version: "0.28.0",
     date: "July 2026",
     title: "The Living Surface",

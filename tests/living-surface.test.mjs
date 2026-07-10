@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
   isDocumentMutation,
@@ -129,6 +131,25 @@ test("Living Surface prompt teaches FORGE/INHABIT and carries a bounded snapshot
   assert.match(prompt, /TypeError: boom/);
   assert.ok(prompt.length < 34_000, `prompt unexpectedly large: ${prompt.length}`);
   assert.ok(!prompt.includes("[IN-SURFACE INTERACTION] The user is interacting"));
+});
+
+test("Living Surface serves the generated document over its own scheme, never srcdoc, in native builds", () => {
+  // A srcdoc iframe inherits the app CSP: packaged builds inject style hashes
+  // and script-src 'self', which silently strip every generated <style> and
+  // <script>. The document must be scheme-served so it owns its headers.
+  const root = process.cwd();
+  const rust = readFileSync(join(root, "tauri", "src-tauri", "src", "main.rs"), "utf8");
+  assert.match(rust, /register_uri_scheme_protocol\("ares-surface"/);
+  assert.match(rust, /LIVING_SURFACE_CSP/);
+  assert.match(rust, /default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'/);
+  assert.match(rust, /fn ares_living_surface_stage/);
+  const conf = readFileSync(join(root, "tauri", "src-tauri", "tauri.conf.json"), "utf8");
+  assert.match(conf, /frame-src[^;"]*ares-surface:[^;"]*http:\/\/ares-surface\.localhost/);
+  const tsx = readFileSync(join(root, "tauri", "src", "LivingSurface.tsx"), "utf8");
+  assert.match(tsx, /ares_living_surface_stage/);
+  assert.match(tsx, /native \? \{ src: frameSrc \?\? undefined \} : \{ srcDoc:/);
+  assert.match(tsx, /sandbox="allow-scripts allow-forms allow-pointer-lock"/);
+  assert.ok(!tsx.includes('sandbox="allow-scripts allow-same-origin'), "scripts must never combine with same-origin");
 });
 
 test("Living Surface prompt tags in-surface interactions for INHABIT routing", () => {
