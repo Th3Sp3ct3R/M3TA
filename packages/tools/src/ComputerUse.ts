@@ -38,17 +38,36 @@ const inputSchema = z
         "cursor",
         "launch",
         "activate",
+        "uia_tree",
+        "uia_click",
+        "uia_fill",
+        "act",
       ])
       .describe(
-        "screenshot: capture the whole screen (downscaled, returned as an image you can see). window: capture ONLY the focused window — cleaner than a full multi-monitor shot when working in one app; clicks still map. windows: list the open top-level windows (title, process, position, minimized/visible) so you can pick what to activate/capture instead of guessing a title. zoom: capture a rectangle at x,y of size w×h so small text/targets are legible and precisely clickable. move: move cursor to x,y. click/double_click/right_click: at x,y (or current position). type: send literal text. key: a key combo — SendKeys notation (^c=Ctrl+C, %{F4}=Alt+F4, {ENTER}, {TAB}, ~=Enter) OR a Windows-key chord like 'WIN', 'WIN+R', 'WIN+I'. scroll: wheel by amount (negative=down). cursor: report the current cursor position. launch: start an app/URI (text=program, a common name like 'settings'/'notepad'/'calc', or a ms-settings:/chrome:// URI; key=optional arguments) — use this to OPEN things, never the Win key. activate: bring a window to the foreground by title substring (text).",
+        "Observe with screenshot/window/windows/zoom. Prefer uia_tree then uia_click/uia_fill by accessible name. Use act for ordered desktop/UIA steps with one final capture; target pins and re-verifies the foreground window before state changes. Pixel, keyboard, launch, and activate actions remain fallbacks.",
       ),
     x: z.number().int().optional().describe("Target X for move/click/zoom — in the pixel coordinates of the LAST image you were shown (top-left origin)."),
     y: z.number().int().optional().describe("Target Y for move/click/zoom — in the pixel coordinates of the LAST image you were shown (top-left origin)."),
     w: z.number().int().positive().optional().describe("Zoom region width, in the LAST image's pixel space (default covers ~800 screen px)."),
     h: z.number().int().positive().optional().describe("Zoom region height, in the LAST image's pixel space (default covers ~600 screen px)."),
     text: z.string().optional().describe("Literal text for type; program/URI for launch; window-title substring for activate."),
+    target: z.string().optional().describe("Required foreground window title/process substring. The tool re-activates and verifies it immediately before acting."),
+    name: z.string().optional().describe("Accessible name for uia_click/uia_fill."),
+    role: z.string().optional().describe("Optional UI Automation control type, such as Button, Edit, or MenuItem."),
+    value: z.string().optional().describe("Value for uia_fill."),
     key: z.string().optional().describe("Key combo for the key action, or launch arguments."),
     amount: z.number().int().optional().describe("Wheel notches for scroll (negative scrolls down). Default 3."),
+    steps: z.array(z.object({
+      action: z.enum(["move", "click", "double_click", "right_click", "type", "key", "scroll", "activate", "uia_click", "uia_fill"]),
+      x: z.number().int().optional(),
+      y: z.number().int().optional(),
+      text: z.string().optional(),
+      key: z.string().optional(),
+      amount: z.number().int().optional(),
+      name: z.string().optional(),
+      role: z.string().optional(),
+      value: z.string().optional(),
+    }).strict()).min(1).max(32).optional().describe("act: execute up to 32 desktop/UIA steps in one tool call, with one final verification capture."),
   })
   .strict();
 
@@ -89,6 +108,10 @@ export interface ComputerUseOutput {
   window?: string;
   /** Title of the window actually activated (for the `activate` action). */
   title?: string;
+  /** UI Automation elements or post-action accessible observation. */
+  elements?: Array<{ name: string; role: string; automationId?: string; enabled?: boolean }>;
+  observed?: string;
+  completed?: Array<{ step: number; action: string; outcome: string }>;
 }
 
 const MOUSE_ACTIONS = new Set(["move", "click", "double_click", "right_click"]);
@@ -104,7 +127,7 @@ const MOUSE_ACTIONS = new Set(["move", "click", "double_click", "right_click"]);
  *     inject keystrokes into whatever holds focus. ARES_COMPUTERUSE_ALLOW_TYPING=0
  *     blocks them outright (default: allowed).
  */
-const READ_ONLY_ACTIONS = new Set(["screenshot", "zoom", "window", "windows", "cursor"]);
+const READ_ONLY_ACTIONS = new Set(["screenshot", "zoom", "window", "windows", "cursor", "uia_tree"]);
 const TYPING_ACTIONS = new Set(["type", "key"]);
 
 /**
@@ -129,7 +152,7 @@ export interface ShotMeta {
 const IDENTITY_SHOT: ShotMeta = { originX: 0, originY: 0, captureW: 1, captureH: 1, imageW: 1, imageH: 1 };
 
 /** State-changing actions that get a post-action verification capture. */
-const VERIFY_ACTIONS = new Set(["click", "double_click", "right_click", "type", "key", "scroll"]);
+const VERIFY_ACTIONS = new Set(["click", "double_click", "right_click", "type", "key", "scroll", "uia_click", "uia_fill"]);
 
 function captureHash(imageBase64: string): string {
   return createHash("sha1").update(imageBase64).digest("hex");
@@ -214,7 +237,7 @@ export function makeComputerUseTool(runner: ComputerActionRunner = runComputerAc
   return buildTool({
     name: "ComputerUse",
     description:
-      "Control the REAL desktop (mouse, keyboard, screen) — LAST RESORT, for native apps only (no API, no web page): a settings dialog, a desktop-only app, an installer. NEVER use this for anything inside a web page or browser — use the Browser tool instead: it drives the page directly without stealing the user's mouse, is faster, and doesn't break when the user moves their own cursor. EXCEPTION: when the owner has enabled 'Desktop control of browser windows' (Settings → Advanced) and asks you to drive THEIR real, already-open browser, do exactly that — screenshot, activate their window, click and type like any native app; do not demand a bridge attach or open your own browser instead. WORKFLOW (follow it in this order): 1) 'windows' to list what's open; 2) 'activate' the target by title — it focuses the window AND attaches a fresh capture of it; 3) act on THAT image's coordinates (click/type/key); a post-action capture with a red marker at your click point is attached automatically — LOOK at it: the marker shows where you actually clicked, and the result names the window that received the click. If it says 'screen unchanged' or the wrong window got the click, re-activate and re-aim with 'zoom' — do NOT re-click the same spot blindly. A full-desktop 'screenshot' on a multi-monitor rig is heavily downscaled and BAD for aiming — prefer 'window' captures. Windows only. Note: this hijacks the user's actual mouse/keyboard — be deliberate.",
+      "Control the REAL Windows desktop for native apps. Prefer UI Automation: uia_tree then uia_click/uia_fill by accessible name. For multi-step work use act with target=<window title>; focus is re-verified before every state change and one final capture proves the outcome. Use pixels only when no accessible control exists: windows, activate/window/zoom, then click and inspect the marked verification capture. NEVER use this for web content; Browser handshake/tabs/attach/act is faster and does not steal the owner's mouse. Do not repeat an unchanged click blindly.",
     safety: "external-state",
     concurrency: "exclusive",
     inputZod: inputSchema,
@@ -241,6 +264,15 @@ export function makeComputerUseTool(runner: ComputerActionRunner = runComputerAc
       if (i.action === "activate" && !i.text?.trim()) {
         return { ok: false, message: "activate needs `text` — a substring of the target window's title (use `windows` to list them)." };
       }
+      if (i.action === "act" && !i.steps?.length) {
+        return { ok: false, message: "act needs `steps` â€” ordered desktop/UIA actions to run in one focused transaction." };
+      }
+      if ((i.action === "uia_click" || i.action === "uia_fill") && !i.name?.trim()) {
+        return { ok: false, message: `${i.action} needs an accessible control \`name\` (use uia_tree first).` };
+      }
+      if (i.action === "uia_fill" && i.value === undefined) {
+        return { ok: false, message: "uia_fill needs `value`." };
+      }
       if (
         i.action === "activate" &&
         process.env.ARES_COMPUTERUSE_ALLOW_BROWSER !== "1" &&
@@ -266,6 +298,10 @@ export function makeComputerUseTool(runner: ComputerActionRunner = runComputerAc
       if (i.action === "screenshot") return "Capturing the screen";
       if (i.action === "window") return "Capturing the active window";
       if (i.action === "windows") return "Listing open windows";
+      if (i.action === "uia_tree") return "Reading accessible desktop controls";
+      if (i.action === "uia_click") return `Clicking accessible control ${i.name ?? ""}`;
+      if (i.action === "uia_fill") return `Filling accessible control ${i.name ?? ""}`;
+      if (i.action === "act") return `Completing ${i.steps?.length ?? 0} desktop actions`;
       if (i.action === "launch") return `Launching ${i.text ?? "an app"}`;
       if (i.action === "type") return "Typing on the desktop";
       if (i.action === "key") return `Pressing ${i.key ?? "a key"}`;
@@ -284,6 +320,51 @@ export function makeComputerUseTool(runner: ComputerActionRunner = runComputerAc
         );
       }
 
+      const ensureTargetFocused = async (target: string | undefined): Promise<void> => {
+        if (!target?.trim()) return;
+        const focused = await runner({ action: "activate", text: target.trim() } as RunnerInput, lastShot);
+        if (!focused.ok) throw new Error(`ComputerUse focus handshake failed: ${focused.error ?? `could not activate ${target}`}`);
+        if (focused.foreground === false) throw new Error(`ComputerUse focus handshake failed: Windows did not grant foreground focus to "${focused.title ?? target}"`);
+      };
+
+      if (i.action === "act") {
+        const completed: Array<{ step: number; action: string; outcome: string }> = [];
+        for (let index = 0; index < i.steps!.length; index += 1) {
+          const step = i.steps![index];
+          if (step.action !== "activate") await ensureTargetFocused(i.target);
+          const result = await runner(step as RunnerInput, lastShot);
+          if (!result.ok) throw new Error(`ComputerUse act stopped at step ${index + 1}/${i.steps!.length} (${step.action}): ${result.error ?? "unknown error"}`);
+          if (result.image) {
+            lastShot = shotMetaFrom(result);
+            lastShotHash = result.rawHash ?? captureHash(result.image);
+          }
+          completed.push({
+            step: index + 1,
+            action: step.action,
+            outcome: result.observed ?? result.title ?? result.focus ?? "ok",
+          });
+        }
+        const capture = await runner({ action: "window" } as RunnerInput, lastShot).catch(() => runner({ action: "screenshot" } as RunnerInput, lastShot));
+        const output: ComputerUseOutput = {
+          ok: true,
+          action: "act",
+          completed,
+          verified: capture.ok && !!capture.image,
+          observed: completed.at(-1)?.outcome,
+          note: capture.ok && capture.image
+            ? "batched desktop transaction completed; final focused-window capture attached"
+            : "batched desktop transaction completed, but final verification capture failed",
+        };
+        if (capture.ok && capture.image) {
+          lastShot = shotMetaFrom(capture);
+          lastShotHash = capture.rawHash ?? captureHash(capture.image);
+          return { output, display: `Completed ${completed.length} desktop actions · verified`, images: [{ mediaType: "image/png", data: capture.image }] };
+        }
+        return { output, display: `Completed ${completed.length} desktop actions · verification unavailable` };
+      }
+
+      if (!READ_ONLY_ACTIONS.has(i.action) && i.action !== "activate") await ensureTargetFocused(i.target);
+
       const result = await runner(i, lastShot);
       if (!result.ok) {
         throw new Error(`ComputerUse ${i.action} failed: ${result.error ?? "unknown error"}`);
@@ -294,6 +375,14 @@ export function makeComputerUseTool(runner: ComputerActionRunner = runComputerAc
         return {
           output: { ok: true, action: "windows", windows, note: `${windows.length} open window(s). 'activate' the one you want by title — it focuses the window and attaches a fresh capture of it.` },
           display: `Listed ${windows.length} window(s)`,
+        };
+      }
+
+      if (i.action === "uia_tree") {
+        const elements = result.elements ?? [];
+        return {
+          output: { ok: true, action: i.action, elements, note: `${elements.length} accessible control(s); prefer uia_click/uia_fill by name over pixel coordinates.` },
+          display: `Read ${elements.length} accessible control(s)`,
         };
       }
 
@@ -372,6 +461,7 @@ export function makeComputerUseTool(runner: ComputerActionRunner = runComputerAc
         action: i.action,
         x: result.x,
         y: result.y,
+        observed: result.observed,
       };
       let display = describeDone(i, result);
       // Keyboard tier: an explicit audit line — what was injected, into which
@@ -528,6 +618,8 @@ interface PsResult {
   x?: number;
   y?: number;
   windows?: WindowInfo[];
+  elements?: Array<{ name: string; role: string; automationId?: string; enabled?: boolean }>;
+  observed?: string;
   /** Foreground-window title at type/key time; window under the cursor for clicks. */
   focus?: string;
   /** Matched window title (activate). */
@@ -670,6 +762,9 @@ async function runComputerAction(input: RunnerInput, shot: ShotMeta): Promise<Ps
     text: input.text ?? "",
     key: input.key ?? "",
     amount: input.amount ?? 3,
+    name: input.name ?? "",
+    role: input.role ?? "",
+    value: input.value ?? "",
     markX: input.markX ?? null,
     markY: input.markY ?? null,
   }));
@@ -716,6 +811,8 @@ function Out-Result($obj) { [Console]::Out.WriteLine("ARES_RESULT:" + ($obj | Co
 try {
   Add-Type -AssemblyName System.Windows.Forms
   Add-Type -AssemblyName System.Drawing
+  Add-Type -AssemblyName UIAutomationClient
+  Add-Type -AssemblyName UIAutomationTypes
   Add-Type @"
 using System;
 using System.Collections.Generic;
@@ -844,6 +941,63 @@ public static class AresType {
       return $sb.ToString()
     } catch { return '' }
   }
+  function Get-UiaRoot {
+    $h = [AresIn]::GetForegroundWindow()
+    if ($h -eq [IntPtr]::Zero) { return $null }
+    try { return [System.Windows.Automation.AutomationElement]::FromHandle($h) } catch { return $null }
+  }
+  function Find-Uia([string]$name, [string]$role) {
+    $root = Get-UiaRoot
+    if ($null -eq $root) { return $null }
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $stack = New-Object 'System.Collections.Generic.Stack[System.Windows.Automation.AutomationElement]'
+    $first = $walker.GetFirstChild($root)
+    while ($null -ne $first) { $stack.Push($first); $first = $walker.GetNextSibling($first) }
+    $needle = $name.Trim().ToLower()
+    $roleNeedle = $role.Trim().ToLower()
+    $visited = 0
+    while ($stack.Count -gt 0 -and $visited -lt 3000) {
+      $el = $stack.Pop(); $visited++
+      try {
+        $n = [string]$el.Current.Name
+        $ct = ([string]$el.Current.ControlType.ProgrammaticName).Replace('ControlType.','')
+        $nameMatch = ($n.ToLower() -eq $needle) -or ($n.ToLower().Contains($needle))
+        $roleMatch = ($roleNeedle -eq '') -or ($ct.ToLower() -eq $roleNeedle)
+        if ($nameMatch -and $roleMatch -and -not $el.Current.IsOffscreen) { return $el }
+      } catch { }
+      try {
+        $child = $walker.GetFirstChild($el)
+        while ($null -ne $child) { $stack.Push($child); $child = $walker.GetNextSibling($child) }
+      } catch { }
+    }
+    return $null
+  }
+  function Uia-Snapshot {
+    $root = Get-UiaRoot
+    $out = @()
+    if ($null -eq $root) { return $out }
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $stack = New-Object 'System.Collections.Generic.Stack[System.Windows.Automation.AutomationElement]'
+    $first = $walker.GetFirstChild($root)
+    while ($null -ne $first) { $stack.Push($first); $first = $walker.GetNextSibling($first) }
+    $visited = 0
+    while ($stack.Count -gt 0 -and $visited -lt 3000 -and $out.Count -lt 120) {
+      $el = $stack.Pop(); $visited++
+      try {
+        $n = [string]$el.Current.Name
+        $id = [string]$el.Current.AutomationId
+        $ct = ([string]$el.Current.ControlType.ProgrammaticName).Replace('ControlType.','')
+        if (($n -ne '' -or $id -ne '') -and -not $el.Current.IsOffscreen) {
+          $out += @{ name = $n; role = $ct; automationId = $id; enabled = [bool]$el.Current.IsEnabled }
+        }
+      } catch { }
+      try {
+        $child = $walker.GetFirstChild($el)
+        while ($null -ne $child) { $stack.Push($child); $child = $walker.GetNextSibling($child) }
+      } catch { }
+    }
+    return $out
+  }
   function Mouse($down, $up) {
     [AresIn]::mouse_event($down, 0, 0, 0, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 25
@@ -958,6 +1112,47 @@ public static class AresType {
         $list += @{ title = $w.Title; process = $pn; x = $w.L; y = $w.T; width = ($w.R - $w.L); height = ($w.B - $w.T); minimized = [bool]$w.Iconic; visible = $true }
       }
       Out-Result @{ ok = $true; action = 'windows'; windows = @($list) }
+    }
+    'uia_tree' {
+      $els = Uia-Snapshot
+      Out-Result @{ ok = $true; action = 'uia_tree'; elements = @($els); observed = ((@($els | Select-Object -First 12 | ForEach-Object { $_.role + ':' + $_.name })) -join ' | ') }
+    }
+    'uia_click' {
+      $el = Find-Uia ([string]$a.name) ([string]$a.role)
+      if ($null -eq $el) { Out-Result @{ ok = $false; error = ("no visible UI Automation control matched '" + $a.name + "'" ) } }
+      else {
+        $done = $false; $pat = $null
+        if ($el.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pat)) {
+          ([System.Windows.Automation.InvokePattern]$pat).Invoke(); $done = $true
+        } elseif ($el.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pat)) {
+          ([System.Windows.Automation.SelectionItemPattern]$pat).Select(); $done = $true
+        }
+        if (-not $done) {
+          $r = $el.Current.BoundingRectangle
+          if ($r.IsEmpty) { Out-Result @{ ok = $false; error = 'matched accessible control has no clickable rectangle' }; return }
+          $cx = [int]($r.X + $r.Width / 2); $cy = [int]($r.Y + $r.Height / 2)
+          Set-Pos $cx $cy; Mouse 0x0002 0x0004
+        }
+        Start-Sleep -Milliseconds 80
+        Out-Result @{ ok = $true; action = 'uia_click'; observed = ("invoked " + $el.Current.ControlType.ProgrammaticName.Replace('ControlType.','') + " '" + $el.Current.Name + "'"); focus = (Get-FocusTitle) }
+      }
+    }
+    'uia_fill' {
+      $el = Find-Uia ([string]$a.name) ([string]$a.role)
+      if ($null -eq $el) { Out-Result @{ ok = $false; error = ("no visible UI Automation control matched '" + $a.name + "'" ) } }
+      else {
+        $pat = $null; $set = $false
+        if ($el.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pat)) {
+          $vp = [System.Windows.Automation.ValuePattern]$pat
+          if (-not $vp.Current.IsReadOnly) { $vp.SetValue([string]$a.value); $set = $true }
+        }
+        if (-not $set) {
+          $el.SetFocus(); [System.Windows.Forms.SendKeys]::SendWait('^a'); [void][AresType]::Type([string]$a.value)
+        }
+        Start-Sleep -Milliseconds 60
+        $observed = "filled " + $el.Current.ControlType.ProgrammaticName.Replace('ControlType.','') + " '" + $el.Current.Name + "'"
+        Out-Result @{ ok = $true; action = 'uia_fill'; observed = $observed; focus = (Get-FocusTitle) }
+      }
     }
     'launch' {
       $target = ([string]$a.text).Trim()

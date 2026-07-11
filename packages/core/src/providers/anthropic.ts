@@ -496,27 +496,37 @@ interface WireMessage {
 export function stripUnpairedWireToolBlocks(messages: WireMessage[]): WireMessage[] {
   let current = messages;
   for (let pass = 0; pass < 6; pass++) {
-    const paired = new Set<string>();
+    const pairedUses = new Set<Record<string, unknown>>();
+    const pairedResults = new Set<Record<string, unknown>>();
     for (let i = 0; i < current.length - 1; i++) {
-      const uses = new Set<string>();
-      for (const b of current[i].content) {
-        if (b.type === "tool_use" && typeof b.id === "string") uses.add(b.id);
+      const source = current[i];
+      const target = current[i + 1];
+      if (source.role !== "assistant" || target.role !== "user") continue;
+      const resultsById = new Map<string, Record<string, unknown>>();
+      for (const block of target.content) {
+        if (block.type === "tool_result" && typeof block.tool_use_id === "string" && !resultsById.has(block.tool_use_id)) {
+          resultsById.set(block.tool_use_id, block);
+        }
       }
-      if (uses.size === 0) continue;
-      for (const b of current[i + 1].content) {
-        if (b.type === "tool_result" && typeof b.tool_use_id === "string" && uses.has(b.tool_use_id)) {
-          paired.add(b.tool_use_id);
+      const seenUses = new Set<string>();
+      for (const block of source.content) {
+        if (block.type !== "tool_use" || typeof block.id !== "string" || seenUses.has(block.id)) continue;
+        seenUses.add(block.id);
+        const result = resultsById.get(block.id);
+        if (result) {
+          pairedUses.add(block);
+          pairedResults.add(result);
         }
       }
     }
     let changed = false;
     const rewritten = current.map((m) => {
       const content = m.content.map((b) => {
-        if (b.type === "tool_use" && typeof b.id === "string" && !paired.has(b.id)) {
+        if (b.type === "tool_use" && typeof b.id === "string" && !pairedUses.has(b)) {
           changed = true;
           return { type: "text", text: `[earlier ${String(b.name ?? "tool")} call — result not retained]` };
         }
-        if (b.type === "tool_result" && typeof b.tool_use_id === "string" && !paired.has(b.tool_use_id)) {
+        if (b.type === "tool_result" && typeof b.tool_use_id === "string" && !pairedResults.has(b)) {
           changed = true;
           const c = b.content;
           const text =

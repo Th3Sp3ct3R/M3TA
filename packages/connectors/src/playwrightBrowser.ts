@@ -18,6 +18,10 @@ import { runChallengeHandoff, type HumanCheckHandler } from "./challenge.js";
 
 export interface PlaywrightOptions {
   headless?: boolean;
+  /** Attach to an already-debuggable Chromium only; never launch a fallback. */
+  attachOnly?: boolean;
+  /** Per-call CDP endpoint, used by the Browser handshake action. */
+  cdpUrl?: string;
   /** Called when a CAPTCHA/Cloudflare wall is hit — the human-handoff Gate.
    *  Absent → challenges are detected but navigation just proceeds (legacy). */
   onChallenge?: HumanCheckHandler;
@@ -123,7 +127,9 @@ export interface AcquiredPage {
 export interface AcquireOptions {
   /** Explicit CDP endpoint (ARES_BROWSER_CDP_URL). Tried first when set. */
   cdpUrl?: string;
-  /** Opt-in localhost CDP auto-discovery (ARES_BROWSER_CDP_DISCOVERY=1). OFF by default. */
+  /** Fail after CDP probes instead of launching a separate browser. */
+  requireCdp?: boolean;
+  /** Localhost CDP auto-discovery. createPlaywrightBrowser enables it unless ARES_BROWSER_CDP_DISCOVERY=0. */
   discovery?: boolean;
   /** Ports to probe when discovery is on. Defaults to [9222]. */
   discoveryPorts?: number[];
@@ -169,6 +175,13 @@ export async function acquireBrowserPage(pw: any, opts: AcquireOptions): Promise
     } catch {
       // Unreachable / refused → try the next target, then fall back to launching.
     }
+  }
+
+  if (opts.requireCdp) {
+    throw new Error(
+      "BROWSER_ATTACH_UNAVAILABLE: no debuggable Chromium endpoint answered. An already-open normal Chrome/Edge cannot be silently hijacked. " +
+        "Start an Ares-controlled browser profile with remote debugging, or install an explicit owner-approved extension bridge.",
+    );
   }
 
   let lastError: unknown;
@@ -244,7 +257,8 @@ export async function createPlaywrightBrowser(opts: PlaywrightOptions = {}): Pro
   // its own persistent-profile browser when none is found. Kill switch:
   // ARES_BROWSER_CDP_DISCOVERY=0. Explicit ARES_BROWSER_CDP_URL still wins.
   const acquired = await acquireBrowserPage(pw, {
-    cdpUrl: process.env.ARES_BROWSER_CDP_URL?.trim() || undefined,
+    cdpUrl: opts.cdpUrl?.trim() || process.env.ARES_BROWSER_CDP_URL?.trim() || undefined,
+    requireCdp: opts.attachOnly,
     discovery: process.env.ARES_BROWSER_CDP_DISCOVERY !== "0",
     discoveryPorts: parseCdpPorts(process.env.ARES_BROWSER_CDP_PORTS),
     executablePath: findInstalledChromium(),
@@ -464,6 +478,7 @@ export async function createPlaywrightBrowser(opts: PlaywrightOptions = {}): Pro
 
   return {
     name: "playwright",
+    strategy: acquired.strategy,
     async tabs() {
       const pages = page.context().pages();
       return Promise.all(pages.map(async (candidate: any, index: number) => ({

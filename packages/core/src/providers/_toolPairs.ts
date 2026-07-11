@@ -33,21 +33,36 @@ import type { ContentBlock, Message } from "@ares/protocol";
 export function sanitizeToolPairs(messages: readonly Message[]): Message[] {
   // A tool call is validly paired only when the tool_use and its tool_result sit
   // in adjacent messages (assistant → user). Compute that set in one pass.
-  const pairedIds = new Set<string>();
+  const pairedUses = new Set<ContentBlock>();
+  const pairedResults = new Set<ContentBlock>();
   for (let i = 0; i < messages.length - 1; i++) {
-    const useIdsHere = new Set<string>();
-    for (const b of messages[i].content) if (b.type === "tool_use") useIdsHere.add(b.id);
-    if (useIdsHere.size === 0) continue;
-    for (const b of messages[i + 1].content) {
-      if (b.type === "tool_result" && useIdsHere.has(b.tool_use_id)) pairedIds.add(b.tool_use_id);
+    const current = messages[i];
+    const next = messages[i + 1];
+    // Protocol history may use role:"tool" (OpenAI-style) or role:"user"
+    // (Anthropic-style) for the immediately following result message.
+    const nextRole = String(next.role);
+    if (current.role !== "assistant" || (nextRole !== "user" && nextRole !== "tool")) continue;
+    const resultsById = new Map<string, ContentBlock>();
+    for (const block of next.content) {
+      if (block.type === "tool_result" && !resultsById.has(block.tool_use_id)) resultsById.set(block.tool_use_id, block);
+    }
+    const seenUses = new Set<string>();
+    for (const block of current.content) {
+      if (block.type !== "tool_use" || seenUses.has(block.id)) continue;
+      seenUses.add(block.id);
+      const result = resultsById.get(block.id);
+      if (result) {
+        pairedUses.add(block);
+        pairedResults.add(result);
+      }
     }
   }
   return messages.map((m) => {
     const content = m.content.flatMap((b): ContentBlock[] => {
-      if (b.type === "tool_use" && !pairedIds.has(b.id)) {
+      if (b.type === "tool_use" && !pairedUses.has(b)) {
         return [{ type: "text", text: `[earlier ${b.name} tool call — result not retained]` }];
       }
-      if (b.type === "tool_result" && !pairedIds.has(b.tool_use_id)) {
+      if (b.type === "tool_result" && !pairedResults.has(b)) {
         const text =
           typeof b.content === "string"
             ? b.content

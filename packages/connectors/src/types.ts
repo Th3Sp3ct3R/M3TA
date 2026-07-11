@@ -36,6 +36,11 @@ export interface ConsoleEntry {
 
 export interface BrowserConnector {
   readonly name: string;
+  /** How this browser was acquired: "cdp:<url>" = attached to a real, already-
+   *  running browser (the user's logged-in session); "launch:<label>" = a
+   *  browser Ares launched itself (its own persistent profile). Lets callers
+   *  tell the owner WHOSE browser the tabs/actions belong to. */
+  readonly strategy?: string;
   navigate(url: string): Promise<BrowserState>;
   /** DOM-first targeting: the structured tree, preferred over pixels. */
   accessibilityTree(): Promise<AccessibilityNode[]>;

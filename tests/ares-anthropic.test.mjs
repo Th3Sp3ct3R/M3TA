@@ -612,3 +612,21 @@ test("stripUnpairedWireToolBlocks: converges when dropping a message re-orphans 
   // A is orphaned (its next message is B's tool_use, not A's result) → text.
   assert.ok(!flat.includes('"id":"A"'), "orphaned tool_use A converted to text");
 });
+
+test("stripUnpairedWireToolBlocks: a valid old pair cannot bless a replayed orphan with the same id", () => {
+  // Exact wake/steer failure shape: interruption replay retained a valid pair,
+  // then appended another tool_result carrying the reused provider id without
+  // its tool_use immediately before it. Pairing by global id accepted both and
+  // Anthropic rejected the later block as `unexpected tool_use_id`.
+  const swept = stripUnpairedWireToolBlocks([
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_REUSED", name: "Browser", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_REUSED", content: "first result" }] },
+    { role: "assistant", content: [{ type: "text", text: "working" }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_REUSED", content: "orphan replay" }] },
+  ]);
+
+  const realResults = swept.flatMap((m) => m.content).filter((b) => b.type === "tool_result");
+  assert.equal(realResults.length, 1, "only the adjacent one-to-one result survives as a tool_result");
+  assert.equal(realResults[0].content, "first result");
+  assert.match(JSON.stringify(swept), /orphan replay/, "orphan content is retained as neutral text");
+});

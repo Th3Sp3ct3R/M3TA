@@ -38,6 +38,44 @@ export interface ChangelogEntry {
 // from the "earlier updates" strip.
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.28.5",
+    date: "July 2026",
+    title: "Browser control at full speed",
+    tagline: "Ares can attach to an already-running browser, execute whole flows in one pass, and prove what happened without repeating risky actions.",
+    highlights: [
+      {
+        icon: "⚡",
+        title: "Browser flows fly",
+        tag: "Faster",
+        blurb: "Ares can attach to a browser that is already open and batch clicks, typing, and navigation into one fast operation instead of crawling through one action at a time.",
+      },
+      {
+        icon: "✓",
+        title: "Proof after every run",
+        tag: "Safer",
+        blurb: "Browser actions now return the final page state and block accidental duplicate clicks, so Ares can confirm success instead of guessing and trying again.",
+      },
+      {
+        icon: "⌁",
+        title: "Desktop controls understand",
+        tag: "New",
+        blurb: "Ares can target Windows controls by their accessible names, keep the intended app focused, and perform several desktop actions in a single coordinated run.",
+      },
+      {
+        icon: "↪",
+        title: "Interruptions steer cleanly",
+        tag: "Polished",
+        blurb: "Talking over a working turn no longer poisons the Anthropic conversation with an orphaned tool-result error; your interruption safely redirects the active work.",
+      },
+      {
+        icon: "🛡",
+        title: "Approvals mean something",
+        tag: "Safer",
+        blurb: "A held or refused browser action is now unmistakable, and approved actions reach the same permission surface as the rest of Ares instead of silently doing nothing.",
+      },
+    ],
+  },
+  {
     version: "0.28.4",
     date: "July 2026",
     title: "Computer use that actually lands",

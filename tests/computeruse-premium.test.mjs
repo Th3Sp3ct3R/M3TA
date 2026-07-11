@@ -235,3 +235,51 @@ test("verification capture asks the driver to draw the click marker", async () =
   assert.equal(verify.input.markY, 40);
   assert.equal(verify.input._phys, true, "verification zoom is a physical-space capture");
 });
+
+test("target focus handshake re-activates and verifies the window immediately before a click", async () => {
+  const runner = fakeRunner([
+    { ok: true, action: "activate", title: "Target App", foreground: true },
+    { ok: true, action: "click", x: 30, y: 40, focus: "Target App" },
+    shot(PNG_B),
+  ]);
+  const tool = makeComputerUseTool(runner);
+  const result = await tool.call({ action: "click", target: "Target App", x: 30, y: 40 }, ctx());
+  assert.equal(runner.calls[0].input.action, "activate");
+  assert.equal(runner.calls[1].input.action, "click");
+  assert.equal(result.output.window, "Target App");
+});
+
+test("act batches desktop/UIA steps behind one focus contract and one final capture", async () => {
+  const runner = fakeRunner([
+    { ok: true, action: "activate", title: "Settings", foreground: true },
+    { ok: true, action: "uia_fill", observed: "filled Edit 'Search'", focus: "Settings" },
+    { ok: true, action: "activate", title: "Settings", foreground: true },
+    { ok: true, action: "uia_click", observed: "invoked Button 'Apply'", focus: "Settings" },
+    { ...shot(PNG_B), action: "window" },
+  ]);
+  const tool = makeComputerUseTool(runner);
+  const result = await tool.call({
+    action: "act",
+    target: "Settings",
+    steps: [
+      { action: "uia_fill", name: "Search", role: "Edit", value: "privacy" },
+      { action: "uia_click", name: "Apply", role: "Button" },
+    ],
+  }, ctx());
+  assert.deepEqual(runner.calls.map((c) => c.input.action), ["activate", "uia_fill", "activate", "uia_click", "window"]);
+  assert.equal(result.output.completed.length, 2);
+  assert.equal(result.output.verified, true);
+  assert.equal(result.images.length, 1);
+});
+
+test("uia_tree returns named controls for selector-first native operation", async () => {
+  const runner = fakeRunner([{
+    ok: true,
+    action: "uia_tree",
+    elements: [{ name: "Save", role: "Button", automationId: "save", enabled: true }],
+  }]);
+  const tool = makeComputerUseTool(runner);
+  const result = await tool.call({ action: "uia_tree" }, ctx());
+  assert.equal(result.output.elements[0].name, "Save");
+  assert.match(result.output.note, /prefer uia_click\/uia_fill/);
+});
