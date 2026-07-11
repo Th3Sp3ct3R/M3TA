@@ -1,6 +1,6 @@
 // Extracted from entry.ts — daemon.
 
-import { authStatus, listSessions, loadSessionSnapshot, loadSessionRollout, deleteSession, renameSession, type Provider, classifyLane, runAnthropicLoginFlow, sideQuery, sideQueryJson, QueryEngine, installGlobalCrashHandlers, EventRing, probeCredentialEncryption, connectMcpServer, disconnectMcpServer, loadRemoteMcpServers, connectorNameFromUrl } from "@ares/core";
+import { authStatus, listSessions, loadSessionSnapshot, loadSessionRollout, deleteSession, renameSession, type Provider, classifyLane, runAnthropicLoginFlow, sideQuery, sideQueryJson, QueryEngine, installGlobalCrashHandlers, EventRing, probeCredentialEncryption, connectMcpServer, disconnectMcpServer, setMcpServerEnabled, loadRemoteMcpServers, connectorNameFromUrl, fetchOpenRouterModels, runOpenAILoginFlow } from "@ares/core";
 import { appendFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -18,7 +18,7 @@ import { prepareEngineBinary } from "../engineBinary.js";
 import { captureScreen } from "../screenCapture.js";
 import { ConsciousnessWatch, WATCHER_VOICE_PROMPT } from "../watch.js";
 import { recordConsciousnessObservation } from "../consciousnessContext.js";
-import { aresAgentHome, onLifecycle } from "@ares/agent";
+import { aresAgentHome, onLifecycle, runSkill, skillHubProbe, skillHubList, skillHubGet, skillHubPublish, installHubSkill, readLocalSkillFiles } from "@ares/agent";
 import { QueryEngineDispatcher, OperatorBackgroundLoop, deriveLeash, domainOf, isOperatorPaused, listGoals, loadStandingOrders, materializeDueStandingOrders, type StandingOrder } from "@ares/operator";
 import { MemoryStore, reflectOnRun, detectWorkspaceProjectId, loadProjectState, buildConversationDigest, mergeDurableFacts, CONVERSATION_REFLECT_SYSTEM, DURABLE_FACTS_SCHEMA_HINT, type DurableFact } from "@ares/mind";
 import { OAUTH_PROVIDERS, PROVIDER_LABELS, startOAuthFlow, connectedProviders, getProviderConfig, setCredential, hasCredential, deleteCredential, clientIdName, clientSecretName, runAresAccountSignin, probeAresOauth } from "@ares/core";
@@ -27,12 +27,12 @@ import { gateToolPermission } from "../policyGate.js";
 import { embeddedBridge } from "./browserBridge.js";
 import { garrisonCommand } from "./garrisonCmd.js";
 import { cleanCommandId, normalizePermissionDecision } from "./permissions.js";
-import { aresGatewayBase, daemonModelCatalog, fetchAresGatewayMe, fetchCustomOpenAiModels, postAresGatewayReport, providerFamilyForSelection, selectProvider } from "./providers.js";
+import { aresGatewayBase, daemonModelCatalog, fetchAresGatewayMe, fetchCustomOpenAiModels, postAresGatewayReport, preflightProviderSelection, providerFamilyForSelection, selectProvider, type ProviderSelection } from "./providers.js";
 import { ParsedArgs, cliVersion } from "./runtime.js";
-import { LiveSession, chatContextBudget, createSession, createSessionWithSelection, handleReasoningCommand, isProviderFatalError, makeSpanSummarizer, pickHealthyFallback, resolveReasoningLevel } from "./sessionFactory.js";
+import { LiveSession, chatContextBudget, createSession, createSessionWithSelection, handleReasoningCommand, isProviderFatalError, makeSpanSummarizer, modelLikelyHasVision, pickHealthyFallback, pickVisionFallback, resolveReasoningLevel } from "./sessionFactory.js";
 import { startGatewayMirror } from "./telegramWiring.js";
 import { contentFromUserInput, undoLines } from "./terminalLines.js";
-import { buildSystemPrompt, finishTurn, gatherGitRunFacts, mindSessionEnded, prepareUserTurn } from "./turnPipeline.js";
+import { buildSystemPrompt, disposeLiveSession, finishTurn, gatherGitRunFacts, mindSessionEnded, prepareUserTurn } from "./turnPipeline.js";
 
 interface DaemonInputCommand {
   type?: string;
@@ -44,6 +44,8 @@ interface DaemonInputCommand {
   /** discover_custom_models — OpenAI-compatible base URL to probe. */
   base?: string;
   goal?: string;
+  /** Structured hands-free mode; excluded from goal classification/history. */
+  voice?: boolean;
   command?: string;
   level?: string;
   id?: string;
@@ -80,6 +82,11 @@ interface DaemonInputCommand {
   action?: string;
   /** operator_control halt reason (freeform, logged with the kill-switch flag file). */
   reason?: string;
+  /** skill_invoke payload — JSON handed to the skill's handler(input, ctx). */
+  input?: unknown;
+  /** skill_invoke correlation id — echoed back in skill_result so the UI can
+   *  match a response to the exact call (TTS utterances, surface clicks). */
+  invokeId?: string;
 }
 
 const ROUTING_LANES = ["chat", "coding", "research", "tool-use"] as const;
@@ -152,6 +159,7 @@ function normalizeEngineConfig(raw: unknown): import("../uiSettings.js").EngineC
     operatorAutotick: typeof r.operatorAutotick === "boolean" ? r.operatorAutotick : undefined,
     operatorTickMinutes: num(r.operatorTickMinutes, 1, 720),
     subagentTurnLimit: num(r.subagentTurnLimit, 5, 200),
+    computerUseBrowser: typeof r.computerUseBrowser === "boolean" ? r.computerUseBrowser : undefined,
   };
 }
 
@@ -170,6 +178,25 @@ export function applyEngineConfigEnv(cfg: import("../uiSettings.js").EngineConfi
   }
   if (cfg.subagentTurnLimit) process.env.ARES_SUBAGENT_TURN_LIMIT = String(cfg.subagentTurnLimit);
   if (cfg.operatorTickMinutes) process.env.ARES_OPERATOR_TICK_MS = String(cfg.operatorTickMinutes * 60_000);
+  // Owner opt-in: desktop control of real browser windows. Explicit false
+  // clears it so flipping the toggle off takes effect without a restart.
+  if (cfg.computerUseBrowser === true) process.env.ARES_COMPUTERUSE_ALLOW_BROWSER = "1";
+  else if (cfg.computerUseBrowser === false) delete process.env.ARES_COMPUTERUSE_ALLOW_BROWSER;
+}
+
+/** A UI surface a skill contributes — a button (and, later, toggles/panels)
+ *  that the app renders in the active-skills tray. Clicking it invokes the
+ *  skill itself with `input` (the whole security model: a surface can only run
+ *  its own skill). */
+interface SkillSurface {
+  id: string;
+  label: string;
+  icon?: string;
+  kind?: "button" | "toggle";
+  /** JSON passed to the skill's handler when the surface is activated. */
+  input?: unknown;
+  /** Optional hint shown on hover. */
+  hint?: string;
 }
 
 interface DaemonSkillInfo {
@@ -178,6 +205,82 @@ interface DaemonSkillInfo {
   status: string;
   category: string;
   enabled: boolean;
+  /** Capabilities this skill supplies (e.g. ["tts"]) — Ares routes the matching
+   *  built-in through the toggled-on provider skill instead. */
+  provides: string[];
+  /** UI buttons this skill contributes to the active-skills tray. */
+  surfaces: SkillSurface[];
+  /** Whether this skill has executable code, versus prompt/docs only. */
+  runnable: boolean;
+  modifiedAt?: number;
+}
+
+/** Parse a `surfaces:` value (JSON array) into validated SkillSurface[]. Tolerant:
+ *  a malformed value yields no surfaces rather than breaking the whole list. */
+export function parseSurfaces(raw: string): SkillSurface[] {
+  if (!raw || !raw.trim().startsWith("[")) return [];
+  let arr: unknown;
+  try {
+    arr = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(arr)) return [];
+  const out: SkillSurface[] = [];
+  for (const item of arr) {
+    if (!item || typeof item !== "object") continue;
+    const s = item as Record<string, unknown>;
+    const id = typeof s.id === "string" ? s.id : "";
+    const label = typeof s.label === "string" ? s.label : "";
+    if (!id || !label) continue;
+    out.push({
+      id,
+      label,
+      icon: typeof s.icon === "string" ? s.icon : undefined,
+      kind: s.kind === "toggle" ? "toggle" : "button",
+      input: s.input,
+      hint: typeof s.hint === "string" ? s.hint : undefined,
+    });
+    if (out.length >= 12) break; // a tray, not a dashboard
+  }
+  return out;
+}
+
+export function inferSkillProvides(entryName: string, skillMd: string, surfaces: SkillSurface[], declared: string[]): string[] {
+  const provides = new Set(declared.map((s) => s.trim()).filter(Boolean));
+  const surfaceProvidesTts = surfaces.some((surface) => {
+    const input = surface.input;
+    return !!input && typeof input === "object" && (input as Record<string, unknown>).op === "tts";
+  });
+  const bodyClaimsTts =
+    /\bprovides\s+(?:the\s+)?['"`]?tts['"`]?\s+capability\b/i.test(skillMd) ||
+    /\btext[- ]to[- ]speech\b/i.test(skillMd) ||
+    // Known voice engines named in the manifest are as clear a signal as any.
+    /\b(piper|kokoro|elevenlabs|coqui)\b/i.test(skillMd);
+  // "tts" anywhere in the skill's NAME (piper_tts, tts-eleven, my_tts…) — users
+  // name their voice skills exactly this way and expect them to just be used.
+  const nameSignalsTts = /(^|[_-])tts([_-]|$)/i.test(entryName);
+
+  // A hand-authored voice provider should not fail silently because its
+  // frontmatter omitted one line. The explicit `provides:` field still wins,
+  // but a tts-ish name, a TTS surface, or a clear manifest body claim are
+  // enough for the desktop to route speech through the provider.
+  if (!provides.has("tts") && (nameSignalsTts || surfaceProvidesTts || bodyClaimsTts)) {
+    provides.add("tts");
+  }
+  // Same courtesy for speech-to-text providers (whisper.cpp, Deepgram, …):
+  // a transcribe surface, an stt name, or a clear body claim registers them.
+  const surfaceProvidesStt = surfaces.some((surface) => {
+    const input = surface.input;
+    return !!input && typeof input === "object" && (input as Record<string, unknown>).op === "transcribe";
+  });
+  const bodyClaimsStt =
+    /\bprovides\s+(?:the\s+)?['"`]?stt['"`]?\s+capability\b/i.test(skillMd) ||
+    /\bspeech[- ]to[- ]text\b/i.test(skillMd);
+  if (!provides.has("stt") && (entryName === "stt" || surfaceProvidesStt || bodyClaimsStt)) {
+    provides.add("stt");
+  }
+  return [...provides];
 }
 
 /** List skills under ~/.ares/skills, parsing SKILL.md frontmatter + enabled set. */
@@ -200,16 +303,71 @@ async function daemonSkillsList(home: string): Promise<DaemonSkillInfo[]> {
     if (!text) continue;
     const fm = text.match(/^---\n([\s\S]*?)\n---/);
     const field = (key: string) => fm?.[1].match(new RegExp(`^${key}:\\s*(.+)$`, "m"))?.[1]?.trim() ?? "";
+    // Multi-line frontmatter tolerance: authors write normal YAML —
+    //   provides:
+    //     - tts
+    // or a surfaces JSON array spread over lines. Capture everything from the
+    // key to the next top-level key and flatten it, so those parse instead of
+    // silently yielding nothing (the old reader was strictly single-line).
+    const fieldBlock = (key: string) => {
+      const lines = (fm?.[1] ?? "").split("\n");
+      const start = lines.findIndex((l) => l.startsWith(`${key}:`));
+      if (start < 0) return "";
+      const out: string[] = [lines[start].slice(key.length + 1)];
+      for (let i = start + 1; i < lines.length; i++) {
+        if (/^\S/.test(lines[i])) break; // next top-level key
+        out.push(lines[i]);
+      }
+      return out.join("\n").trim();
+    };
+    const listField = (key: string) => {
+      const inline = field(key);
+      if (inline && !inline.startsWith("-")) return inline.split(",").map((s) => s.trim()).filter(Boolean);
+      const block = fieldBlock(key);
+      const items = [...block.matchAll(/^\s*-\s*(.+)$/gm)].map((m) => m[1].trim().replace(/^['"]|['"]$/g, "")).filter(Boolean);
+      return items.length > 0 ? items : inline.split(",").map((s) => s.trim()).filter(Boolean);
+    };
+    const declaredProvides = listField("provides");
+    let surfaces = parseSurfaces(field("surfaces"));
+    if (surfaces.length === 0) {
+      const block = fieldBlock("surfaces").split("\n").map((l) => l.trim()).join(" ").trim();
+      if (block.startsWith("[")) surfaces = parseSurfaces(block);
+    }
+    if (surfaces.length === 0) {
+      const sj = await readFile(path.join(skillsDir, entry.name, "surfaces.json"), "utf8").catch(() => "");
+      if (sj) surfaces = parseSurfaces(sj);
+    }
+    const provides = inferSkillProvides(entry.name, text, surfaces, declaredProvides);
+    const handlerPath = path.join(skillsDir, entry.name, "handler.js");
+    const handlerStat = await stat(handlerPath).catch(() => null);
+    const manifestStat = await stat(md).catch(() => null);
     skills.push({
       name: entry.name,
       description: field("description") || "Local skill.",
       status: field("status") || "ready",
       category: field("category") || "general",
       enabled: !disabled.has(entry.name),
+      provides,
+      surfaces,
+      runnable: !!handlerStat,
+      modifiedAt: Math.max(handlerStat?.mtimeMs ?? 0, manifestStat?.mtimeMs ?? 0) || undefined,
     });
   }
   skills.sort((a, b) => a.name.localeCompare(b.name));
   return skills;
+}
+
+/** One row per connected remote MCP connector, shaped for the /mcp explorer. */
+async function mcpDirectorySnapshot(): Promise<Array<{ name: string; url: string; displayName: string; oauth: boolean; connectedAt: string | null; enabled: boolean }>> {
+  const servers = await loadRemoteMcpServers().catch(() => ({}));
+  return Object.entries(servers).map(([name, e]) => ({
+    name,
+    url: e.url,
+    displayName: e.displayName ?? name,
+    oauth: !!e.oauth,
+    connectedAt: e.connectedAt ?? null,
+    enabled: e.enabled !== false,
+  }));
 }
 
 interface UsageStats {
@@ -221,7 +379,37 @@ interface UsageStats {
   auxiliaryTokensIn: number;
   auxiliaryTokensOut: number;
   daily: Array<{ date: string; in: number; out: number }>;
-  models: Array<{ model: string; tokensIn: number; tokensOut: number; cacheReadTokens: number; calls: number }>;
+  models: Array<{ model: string; provider?: string; tokensIn: number; tokensOut: number; cacheReadTokens: number; calls: number; costUsd?: number }>;
+  /** Per-provider rollup (tokens, requests, estimated spend) — the DeepSeek-
+   *  platform-style view. Cost is an estimate from live OpenRouter pricing
+   *  where the model is listed there; undefined = unknown, 0 = local/free. */
+  providers: Array<{ provider: string; tokensIn: number; tokensOut: number; cacheReadTokens: number; calls: number; costUsd?: number }>;
+}
+
+/** Estimate spend for a model from live OpenRouter pricing (matched by id
+ *  suffix). Local ollama = $0. Returns undefined when the price is unknown. */
+function estimateCostUsd(
+  provider: string,
+  model: string,
+  usage: { tokensIn: number; tokensOut: number; cacheReadTokens: number },
+  orPrices: Map<string, { input: number; output: number }>,
+): number | undefined {
+  if (provider === "ollama" && !model.includes("cloud")) return 0;
+  if (provider === "mock") return 0;
+  const bare = model.toLowerCase();
+  let price = orPrices.get(bare);
+  if (!price) {
+    for (const [id, p] of orPrices) {
+      if (id.endsWith(`/${bare}`) || bare === id.split("/").pop()) {
+        price = p;
+        break;
+      }
+    }
+  }
+  if (!price) return undefined;
+  // Cache reads bill at roughly a tenth of input on the major providers.
+  const uncachedIn = Math.max(0, usage.tokensIn - usage.cacheReadTokens);
+  return (uncachedIn / 1e6) * price.input + (usage.cacheReadTokens / 1e6) * price.input * 0.1 + (usage.tokensOut / 1e6) * price.output;
 }
 
 /** Aggregate usage across all on-disk sessions within the trailing window. */
@@ -229,7 +417,8 @@ async function daemonUsageStats(workspace: string, days: number): Promise<UsageS
   const sessionsRoot = path.join(workspace, ".ares", "sessions");
   const cutoff = Date.now() - days * 24 * 60 * 60_000;
   const daily = new Map<string, { in: number; out: number }>();
-  const models = new Map<string, { tokensIn: number; tokensOut: number; cacheReadTokens: number; calls: number }>();
+  const models = new Map<string, { provider: string; model: string; tokensIn: number; tokensOut: number; cacheReadTokens: number; calls: number }>();
+  const providers = new Map<string, { tokensIn: number; tokensOut: number; cacheReadTokens: number; calls: number }>();
   let sessions = 0;
   let apiCalls = 0;
   let tokensIn = 0;
@@ -252,6 +441,7 @@ async function daemonUsageStats(workspace: string, days: number): Promise<UsageS
       auxiliaryTokensOut: 0,
       daily: [],
       models: [],
+      providers: [],
     };
   }
   const { stat: statFn } = await import("node:fs/promises");
@@ -262,9 +452,11 @@ async function daemonUsageStats(workspace: string, days: number): Promise<UsageS
     if (!st || st.mtimeMs < cutoff) continue;
     const metaRaw = await readFile(path.join(sessionDir, "meta.json"), "utf8").catch(() => "");
     let model = "unknown";
+    let sessionProvider = "unknown";
     try {
-      const meta = JSON.parse(metaRaw) as { provider?: { model?: string } };
+      const meta = JSON.parse(metaRaw) as { provider?: { model?: string; name?: string } };
       if (meta.provider?.model) model = meta.provider.model;
+      if (meta.provider?.name) sessionProvider = meta.provider.name;
     } catch {
       /* unknown model */
     }
@@ -276,9 +468,11 @@ async function daemonUsageStats(workspace: string, days: number): Promise<UsageS
     for (const line of eventsText.split(/\r?\n/)) {
       if (!line) continue;
       let entry: {
+        ts?: string | number;
         event?: {
           type?: string;
           model?: string;
+          provider?: string;
           usage?: {
             inputTokens?: number;
             outputTokens?: number;
@@ -299,6 +493,9 @@ async function daemonUsageStats(workspace: string, days: number): Promise<UsageS
       const cached = ev.usage.cacheReadTokens ?? 0;
       const calls = ev.usage.modelCalls ?? 1;
       const eventModel = ev.model || model;
+      // Session persistence stamps provider on turn_end/auxiliary_usage — use
+      // it for a real per-provider rollup (the old code discarded it).
+      const eventProvider = (ev.provider || sessionProvider).toLowerCase();
       apiCalls += calls;
       tokensIn += inTok;
       tokensOut += outTok;
@@ -310,25 +507,55 @@ async function daemonUsageStats(workspace: string, days: number): Promise<UsageS
       sIn += inTok;
       sOut += outTok;
       counted = true;
-      const m = models.get(eventModel) ?? { tokensIn: 0, tokensOut: 0, cacheReadTokens: 0, calls: 0 };
+      const mKey = `${eventProvider} ${eventModel}`;
+      const m = models.get(mKey) ?? { provider: eventProvider, model: eventModel, tokensIn: 0, tokensOut: 0, cacheReadTokens: 0, calls: 0 };
       m.tokensIn += inTok;
       m.tokensOut += outTok;
       m.cacheReadTokens += cached;
       m.calls += calls;
-      models.set(eventModel, m);
-    }
-    if (counted) {
-      sessions++;
-      const day = new Date(st.mtimeMs).toISOString().slice(0, 10);
+      models.set(mKey, m);
+      const p = providers.get(eventProvider) ?? { tokensIn: 0, tokensOut: 0, cacheReadTokens: 0, calls: 0 };
+      p.tokensIn += inTok;
+      p.tokensOut += outTok;
+      p.cacheReadTokens += cached;
+      p.calls += calls;
+      providers.set(eventProvider, p);
+      // Per-entry timestamp beats file mtime: a week-long session no longer
+      // dumps all its tokens onto its last-touched day.
+      const entryMs = entry.ts ? new Date(entry.ts).getTime() : NaN;
+      const day = new Date(Number.isFinite(entryMs) ? entryMs : st.mtimeMs).toISOString().slice(0, 10);
       const d = daily.get(day) ?? { in: 0, out: 0 };
-      d.in += sIn;
-      d.out += sOut;
+      d.in += inTok;
+      d.out += outTok;
       daily.set(day, d);
     }
+    if (counted) sessions++;
+  }
+  // Live OpenRouter pricing turns tokens into estimated dollars where the
+  // model is listed there (most frontier + open models are). Cached; a
+  // network failure simply leaves cost undefined.
+  const orPrices = new Map<string, { input: number; output: number }>();
+  const orModels = await fetchOpenRouterModels().catch(() => []);
+  for (const m of orModels) {
+    if (m.promptPrice == null && m.completionPrice == null) continue;
+    orPrices.set(m.id.toLowerCase(), { input: Number(m.promptPrice ?? 0) * 1e6, output: Number(m.completionPrice ?? 0) * 1e6 });
   }
   const dailyArr = [...daily.entries()].map(([date, v]) => ({ date, in: v.in, out: v.out })).sort((a, b) => a.date.localeCompare(b.date));
-  const modelArr = [...models.entries()]
-    .map(([model, v]) => ({ model, ...v }))
+  const modelArr = [...models.values()]
+    .map((v) => ({ ...v, costUsd: estimateCostUsd(v.provider, v.model, v, orPrices) }))
+    .sort((a, b) => b.tokensIn + b.tokensOut - (a.tokensIn + a.tokensOut));
+  const providerArr = [...providers.entries()]
+    .map(([provider, v]) => {
+      const providerModels = modelArr.filter((m) => m.provider === provider);
+      const known = providerModels.filter((m) => m.costUsd !== undefined);
+      // A provider's cost is only meaningful if every model under it priced.
+      const costUsd = known.length === providerModels.length && providerModels.length > 0
+        ? known.reduce((total, m) => total + (m.costUsd ?? 0), 0)
+        : known.length > 0
+          ? known.reduce((total, m) => total + (m.costUsd ?? 0), 0)
+          : undefined;
+      return { provider, ...v, costUsd };
+    })
     .sort((a, b) => b.tokensIn + b.tokensOut - (a.tokensIn + a.tokensOut));
   return {
     sessions,
@@ -340,6 +567,7 @@ async function daemonUsageStats(workspace: string, days: number): Promise<UsageS
     auxiliaryTokensOut,
     daily: dailyArr,
     models: modelArr,
+    providers: providerArr,
   };
 }
 
@@ -556,12 +784,16 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
     // freedom posture for ordinary tools is untouched.
     const gate = gateToolPermission(request, { attended: true });
     if (gate.kind === "deny") return Promise.resolve("deny");
-    if (gate.kind === "ask") {
+    // Owner permission policy (master/per-category toggles, read LIVE so the
+    // Permissions tab applies mid-session). A soft gate "ask" (ComputerUse,
+    // unknown categories) is subordinate to the owner's posture — otherwise
+    // "free" mode would still nag on every desktop action, which is exactly
+    // the regression the gate promises never to cause. Only a HARD block
+    // (payments, email, credentials, destructive wipes) outranks the posture.
+    const outcome = decidePermission(request, live?.runtime.permissions);
+    if (gate.kind === "ask" && (gate.hardBlocked || outcome !== "allow")) {
       return commands.waitForPermission({ ...request, reason: gate.reason ?? request.reason });
     }
-    // Owner permission policy (master/per-category toggles, read LIVE so the
-    // Permissions tab applies mid-session). "allow" flows; "ask" prompts the owner.
-    const outcome = decidePermission(request, live?.runtime.permissions);
     return outcome === "allow" ? Promise.resolve("allow_once") : commands.waitForPermission(request);
   };
   let live: LiveSession;
@@ -584,13 +816,15 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
   interface DaemonEntry {
     live: LiveSession;
     turnActive: boolean;
+    pendingSteers: string[];
+    landingSteers: Array<{ text: string; reminder: string }>;
     /** The lane (task domain) this session is currently on, for sticky auto
      *  routing — the model only switches when the lane actually changes. */
     lane?: string;
   }
   const DEFAULT_SID = "__primary__";
   const sessions = new Map<string, DaemonEntry>();
-  const primaryEntry: DaemonEntry = { live, turnActive: false };
+  const primaryEntry: DaemonEntry = { live, turnActive: false, pendingSteers: [], landingSteers: [] };
   let mainSelection = live.selection;
   let mainProviderFamily = providerFamilyForSelection(live.selection);
   let activeTurns = 0;
@@ -830,7 +1064,7 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
       requestPermission,
       { startAgentRuntime: false, sessionId: saved ? undefined : sid },
     );
-    const entry: DaemonEntry = { live: fresh, turnActive: false };
+    const entry: DaemonEntry = { live: fresh, turnActive: false, pendingSteers: [], landingSteers: [] };
     sessions.set(sid, entry);
     tagEmit(sid, { type: "session_opened", model: fresh.selection.model, provider: fresh.selection.provider.name });
     return entry;
@@ -1169,30 +1403,24 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           continue;
         }
         try {
+          const entry = await resolveEntry(command.sessionId);
+          if (entry.turnActive) throw new Error("this chat is busy; stop the turn before changing its model");
           const flags = new Map<string, string>([["provider", provider], ["model", model]]);
           const selection = await selectProvider(flags);
+          await preflightProviderSelection(selection);
+          const previous = entry.live.selection;
+          // The owner may have just repaired this provider; re-probe this one
+          // without reviving unrelated providers that failed in other chats.
+          deadProviders.delete(providerFamilyForSelection(selection));
+          await entry.live.session.setProvider(selection.provider, selection.model, {
+            contextBudgetTokens: chatContextBudget(selection),
+            summarizeSpan: makeSpanSummarizer(selection, (usage) =>
+              entry.live.session.recordAuxiliaryUsage("compaction", selection.provider.name, selection.model, usage),
+            ),
+          });
+          entry.live.selection = selection;
           mainSelection = selection;
-          mainProviderFamily = provider;
-          // Owner explicitly chose a provider — give every provider a fresh chance
-          // (they may have just topped up the one that ran dry).
-          deadProviders.clear();
-          const entries = [...new Set([primaryEntry, ...sessions.values()])];
-          for (const entry of entries) {
-            if (entry.turnActive) continue;
-            const entrySelection = entry === primaryEntry ? selection : await selectProvider(flags);
-            await entry.live.session.setProvider(entrySelection.provider, entrySelection.model, {
-              contextBudgetTokens: chatContextBudget(entrySelection),
-              summarizeSpan: makeSpanSummarizer(entrySelection, (usage) =>
-                entry.live.session.recordAuxiliaryUsage(
-                  "compaction",
-                  entrySelection.provider.name,
-                  entrySelection.model,
-                  usage,
-                ),
-              ),
-            });
-            entry.live.selection = entrySelection;
-          }
+          mainProviderFamily = providerFamilyForSelection(selection);
           const settings = await loadUiSettings();
           await updateUiSettings({
             routingMode: "manual",
@@ -1209,9 +1437,23 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
             lastCustomModel: provider === "custom" ? model : settings.lastCustomModel,
             lastMoaModel: provider === "moa" ? model : settings.lastMoaModel,
           });
-          process.stdout.write(JSON.stringify({ type: "model_switched", provider, model }) + "\n");
+          tagEmit(command.sessionId, {
+            type: "model_switched",
+            provider: providerFamilyForSelection(selection),
+            model: selection.model,
+            previousProvider: providerFamilyForSelection(previous),
+            previousModel: previous.model,
+          });
         } catch (err) {
-          process.stdout.write(JSON.stringify({ type: "daemon_error", error: `model_switch: ${err instanceof Error ? err.message : String(err)}` }) + "\n");
+          const entry = await resolveEntry(command.sessionId).catch(() => null);
+          tagEmit(command.sessionId, {
+            type: "model_switch_failed",
+            provider,
+            model,
+            currentProvider: entry ? providerFamilyForSelection(entry.live.selection) : mainProviderFamily,
+            currentModel: entry?.live.selection.model ?? mainSelection.model,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
         continue;
       }
@@ -1298,15 +1540,7 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
         continue;
       }
       if (command.type === "mcp_list") {
-        const servers = await loadRemoteMcpServers().catch(() => ({}));
-        const connectors = Object.entries(servers).map(([name, e]) => ({
-          name,
-          url: e.url,
-          displayName: e.displayName ?? name,
-          oauth: !!e.oauth,
-          connectedAt: e.connectedAt ?? null,
-        }));
-        process.stdout.write(JSON.stringify({ type: "mcp_directory", connectors }) + "\n");
+        process.stdout.write(JSON.stringify({ type: "mcp_directory", connectors: await mcpDirectorySnapshot() }) + "\n");
         continue;
       }
       if (command.type === "mcp_connect") {
@@ -1327,10 +1561,8 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
                 process.stdout.write(JSON.stringify({ type: "oauth_url", url: authUrl }) + "\n");
               },
             });
-            const servers = await loadRemoteMcpServers().catch(() => ({}));
-            const connectors = Object.entries(servers).map(([n, e]) => ({ name: n, url: e.url, displayName: e.displayName ?? n, oauth: !!e.oauth, connectedAt: e.connectedAt ?? null }));
-            process.stdout.write(JSON.stringify({ type: "mcp_connect_result", ok: true, name: result.name }) + "\n");
-            process.stdout.write(JSON.stringify({ type: "mcp_directory", connectors }) + "\n");
+            process.stdout.write(JSON.stringify({ type: "mcp_connect_result", ok: true, name: result.name, toolCount: result.toolCount ?? null }) + "\n");
+            process.stdout.write(JSON.stringify({ type: "mcp_directory", connectors: await mcpDirectorySnapshot() }) + "\n");
           } catch (err) {
             process.stdout.write(JSON.stringify({ type: "mcp_connect_result", ok: false, name, error: err instanceof Error ? err.message : String(err) }) + "\n");
           }
@@ -1340,9 +1572,134 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
       if (command.type === "mcp_disconnect") {
         const name = typeof command.name === "string" ? command.name.trim() : "";
         await disconnectMcpServer(name).catch(() => false);
-        const servers = await loadRemoteMcpServers().catch(() => ({}));
-        const connectors = Object.entries(servers).map(([n, e]) => ({ name: n, url: e.url, displayName: e.displayName ?? n, oauth: !!e.oauth, connectedAt: e.connectedAt ?? null }));
-        process.stdout.write(JSON.stringify({ type: "mcp_directory", connectors }) + "\n");
+        process.stdout.write(JSON.stringify({ type: "mcp_directory", connectors: await mcpDirectorySnapshot() }) + "\n");
+        continue;
+      }
+      if (command.type === "mcp_toggle") {
+        // Pause/resume a connector without dropping its OAuth tokens.
+        const name = typeof command.name === "string" ? command.name.trim() : "";
+        const enabled = command.enabled !== false;
+        if (name) await setMcpServerEnabled(name, enabled).catch(() => false);
+        process.stdout.write(JSON.stringify({ type: "mcp_directory", connectors: await mcpDirectorySnapshot() }) + "\n");
+        continue;
+      }
+      if (command.type === "mcp_tools") {
+        // Live tool listing for one connector — the /mcp explorer's expand row.
+        // Runs off the command loop: a slow/unreachable server must not block chat.
+        const name = typeof command.name === "string" ? command.name.trim() : "";
+        if (!name) {
+          process.stdout.write(JSON.stringify({ type: "mcp_tools", name, tools: [], error: "a connector name is required" }) + "\n");
+          continue;
+        }
+        void (async () => {
+          const { listMcpServerTools } = await import("@ares/tools");
+          const out = await listMcpServerTools(live.context.workspace, name, 15_000).catch(
+            (err) => ({ tools: [], error: err instanceof Error ? err.message : String(err) }),
+          );
+          process.stdout.write(JSON.stringify({ type: "mcp_tools", name, tools: out.tools, error: out.error ?? null }) + "\n");
+        })();
+        continue;
+      }
+      if (command.type === "mcp_search") {
+        // Search the public MCP registry for connect-able (remote HTTP) servers.
+        const text = typeof command.text === "string" ? command.text.trim() : "";
+        void (async () => {
+          try {
+            const res = await fetch(
+              `https://registry.modelcontextprotocol.io/v0/servers?limit=30&search=${encodeURIComponent(text)}`,
+              { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(10_000) },
+            );
+            if (!res.ok) throw new Error(`registry ${res.status}`);
+            const json = await res.json() as {
+              servers?: Array<{
+                server?: {
+                  name?: string;
+                  description?: string;
+                  remotes?: Array<{ type?: string; url?: string; headers?: Array<{ isRequired?: boolean; isSecret?: boolean }> }>;
+                };
+                _meta?: Record<string, { isLatest?: boolean; status?: string }>;
+              }>;
+            };
+            const seen = new Set<string>();
+            const results: Array<{ name: string; fullName: string; description: string; url: string; needsKey: boolean }> = [];
+            for (const row of json.servers ?? []) {
+              const server = row.server;
+              const official = row._meta?.["io.modelcontextprotocol.registry/official"];
+              if (!server?.name || official?.isLatest === false || (official?.status && official.status !== "active")) continue;
+              for (const remote of server.remotes ?? []) {
+                const url = remote.url ?? "";
+                if (!/^https:\/\//i.test(url) || seen.has(url)) continue;
+                if (remote.type && !/^(streamable-http|sse|http)$/i.test(remote.type)) continue;
+                seen.add(url);
+                results.push({
+                  name: server.name.split("/").pop() ?? server.name,
+                  fullName: server.name,
+                  description: (server.description ?? "").slice(0, 160),
+                  url,
+                  needsKey: (remote.headers ?? []).some((h) => h.isRequired && h.isSecret),
+                });
+                break; // one remote per server is enough for the gallery
+              }
+              if (results.length >= 12) break;
+            }
+            process.stdout.write(JSON.stringify({ type: "mcp_search_results", text, results }) + "\n");
+          } catch (err) {
+            process.stdout.write(JSON.stringify({ type: "mcp_search_results", text, results: [], error: err instanceof Error ? err.message : String(err) }) + "\n");
+          }
+        })();
+        continue;
+      }
+      if (command.type === "ollama_pull") {
+        // Download a library model through the LOCAL ollama daemon, streaming
+        // /api/pull progress to the model panel. Runs off the command loop.
+        const model = typeof command.model === "string" ? command.model.trim() : "";
+        if (!model || !/^[a-z0-9._:\/-]+$/i.test(model)) {
+          process.stdout.write(JSON.stringify({ type: "ollama_pull_done", model, ok: false, error: "a valid model name is required" }) + "\n");
+          continue;
+        }
+        void (async () => {
+          const host = (process.env.OLLAMA_HOST?.trim() || "http://127.0.0.1:11434").replace(/\/$/, "");
+          try {
+            const res = await fetch(`${host}/api/pull`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ model }),
+            });
+            if (!res.ok || !res.body) throw new Error(res.status === 404 ? "model not found in the library" : `local Ollama isn't running (${res.status})`);
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buf = "";
+            let lastEmit = 0;
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buf += decoder.decode(value, { stream: true });
+              const lines = buf.split("\n");
+              buf = lines.pop() ?? "";
+              for (const line of lines) {
+                if (!line.trim()) continue;
+                let p: { status?: string; total?: number; completed?: number; error?: string };
+                try {
+                  p = JSON.parse(line);
+                } catch {
+                  continue;
+                }
+                if (p.error) throw new Error(p.error);
+                const pct = p.total ? Math.round(((p.completed ?? 0) / p.total) * 100) : null;
+                const now = Date.now();
+                if (now - lastEmit > 300) {
+                  lastEmit = now;
+                  process.stdout.write(JSON.stringify({ type: "ollama_pull_progress", model, status: p.status ?? "", pct }) + "\n");
+                }
+              }
+            }
+            process.stdout.write(JSON.stringify({ type: "ollama_pull_done", model, ok: true }) + "\n");
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            const friendly = /fetch failed|ECONNREFUSED/i.test(msg) ? "Local Ollama isn't running — start the Ollama app, then try again." : msg;
+            process.stdout.write(JSON.stringify({ type: "ollama_pull_done", model, ok: false, error: friendly }) + "\n");
+          }
+        })();
         continue;
       }
       if (command.type === "discover_custom_models") {
@@ -1412,6 +1769,14 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           const entry = sessions.get(id);
           if (entry && entry !== primaryEntry) {
             try { entry.live.session.interrupt?.(); } catch { /* best-effort */ }
+            await entry.live.verifier.cancel().catch(() => undefined);
+            await entry.live.shellRegistry.killAll().catch(() => 0);
+            const deadline = Date.now() + 5_000;
+            while (entry.turnActive && Date.now() < deadline) {
+              await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            if (entry.turnActive) throw new Error("session is still quiescing after interrupt; deletion refused to prevent rollout resurrection");
+            await disposeLiveSession(entry.live);
             sessions.delete(id);
           }
           const ok = await deleteSession(live.context.workspace, id);
@@ -1483,6 +1848,79 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
         process.stdout.write(JSON.stringify({ type: "skill_toggle_set", name, enabled }) + "\n");
         continue;
       }
+      if (command.type === "skill_invoke") {
+        // One generic path for BOTH a tray surface-button click and a capability
+        // call (e.g. TTS through a provider skill). The app never runs arbitrary
+        // skills — it can only invoke what's already installed + enabled, and a
+        // surface can only run its own skill.
+        const name = typeof command.name === "string" ? command.name.trim() : "";
+        const invokeId = typeof command.invokeId === "string" ? command.invokeId : undefined;
+        if (!name) {
+          process.stdout.write(JSON.stringify({ type: "daemon_error", error: "skill_invoke requires name" }) + "\n");
+          continue;
+        }
+        const settings = await loadUiSettings();
+        if ((settings.disabledSkills ?? []).includes(name)) {
+          process.stdout.write(JSON.stringify({ type: "skill_result", invokeId, name, ok: false, error: `skill '${name}' is disabled` }) + "\n");
+          continue;
+        }
+        // Self-heal divergence: UI settings are the source of truth here, but
+        // runSkill enforces the on-disk `.disabled` marker. A stale marker (a
+        // best-effort write from an old toggle) would make an enabled skill
+        // refuse to run — clear it before invoking.
+        if (/^[a-z0-9][a-z0-9_-]*$/i.test(name)) {
+          await rm(path.join(aresAgentHome(live.context.home), "skills", name, ".disabled"), { force: true }).catch(() => {});
+        }
+        const started = Date.now();
+        const run = await runSkill({ home: live.context.home, name, input: command.input, timeoutMs: 60_000 }).catch(
+          (err) => ({ ok: false, result: undefined, error: err instanceof Error ? err.message : String(err) }) as { ok: boolean; result?: unknown; error?: string },
+        );
+        process.stdout.write(JSON.stringify({
+          type: "skill_result",
+          invokeId,
+          name,
+          ok: run.ok,
+          result: run.ok ? run.result : undefined,
+          error: run.ok ? undefined : (run.error ?? "skill failed"),
+          durationMs: Date.now() - started,
+        }) + "\n");
+        continue;
+      }
+      if (command.type === "skillhub_list") {
+        const gwSettings = await loadUiSettings();
+        const base = aresGatewayBase(gwSettings);
+        const reachable = await skillHubProbe(base);
+        const skills = reachable ? await skillHubList(base, typeof command.text === "string" ? command.text : "").catch(() => []) : [];
+        process.stdout.write(JSON.stringify({ type: "skillhub_list", reachable, skills }) + "\n");
+        continue;
+      }
+      if (command.type === "skillhub_install") {
+        const gwSettings = await loadUiSettings();
+        const base = aresGatewayBase(gwSettings);
+        const id = typeof command.id === "string" ? command.id : "";
+        const files = id ? await skillHubGet(base, id).catch(() => null) : null;
+        if (!files) {
+          process.stdout.write(JSON.stringify({ type: "skillhub_installed", ok: false, error: "skill not found on the hub" }) + "\n");
+          continue;
+        }
+        const res = await installHubSkill(live.context.home, files).then((r) => ({ ok: true as const, ...r })).catch((e) => ({ ok: false as const, error: e instanceof Error ? e.message : String(e) }));
+        process.stdout.write(JSON.stringify({ type: "skillhub_installed", ...res }) + "\n");
+        continue;
+      }
+      if (command.type === "skillhub_publish") {
+        const gwSettings = await loadUiSettings();
+        const base = aresGatewayBase(gwSettings);
+        const token = gwSettings.aresGatewayToken || process.env.ARES_GATEWAY_TOKEN || "";
+        const name = typeof command.name === "string" ? command.name : "";
+        const files = name ? await readLocalSkillFiles(live.context.home, name).catch(() => null) : null;
+        if (!files) {
+          process.stdout.write(JSON.stringify({ type: "skillhub_published", ok: false, error: "local skill not found" }) + "\n");
+          continue;
+        }
+        const res = await skillHubPublish(base, token, files);
+        process.stdout.write(JSON.stringify({ type: "skillhub_published", ...res }) + "\n");
+        continue;
+      }
       if (command.type === "usage_stats") {
         const days = Number(command.days) > 0 ? Math.floor(Number(command.days)) : 30;
         const stats = await daemonUsageStats(live.context.workspace, days).catch(() => null);
@@ -1507,6 +1945,34 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
       if (command.type === "anthropic_login_finish") {
         // No-op: finish is handled automatically by the loopback server.
         // Kept so older UI builds don't crash the daemon.
+        continue;
+      }
+      if (command.type === "openai_login_start") {
+        // ChatGPT OAuth (loopback authorization-code + PKCE). The browser does
+        // the /authorize page — clearing Cloudflare's bot challenge, which a
+        // server-side device-code fetch cannot — and we catch the redirect on
+        // localhost:1455. Routes GPT usage through the ChatGPT subscription.
+        const sid = command.sessionId;
+        void runOpenAILoginFlow({
+          onAuthorizeUrl: (url) => tagEmit(sid, { type: "openai_login_url", url }),
+        })
+          .then((file) => {
+            tagEmit(sid, { type: "openai_login_done", ok: true, email: file.profile.email ?? null, plan: file.profile.planType ?? null });
+          })
+          .catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            tagEmit(sid, { type: "openai_login_done", ok: false, error: msg.slice(0, 200) });
+          });
+        continue;
+      }
+      if (command.type === "openai_auth_status") {
+        const status = await authStatus().catch(() => null);
+        process.stdout.write(JSON.stringify({
+          type: "openai_auth_status",
+          configured: !!status?.configured,
+          email: status?.email ?? null,
+          plan: status?.planType ?? null,
+        }) + "\n");
         continue;
       }
       if (command.type === "operator_status") {
@@ -1694,12 +2160,17 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           tagEmit(command.sessionId, { type: "daemon_error", error: "steer requires text" });
           continue;
         }
-        const entry = sessions.get(command.sessionId || DEFAULT_SID) ?? primaryEntry;
-        entry.live.queueSystemReminder(
-          `The user STEERED mid-task: "${text.trim()}". Adjust course to honor this, but keep your current objective and everything you've already done — do not restart.`,
-          "instructions",
-        );
-        tagEmit(command.sessionId, { type: "steer_applied", text: text.trim() });
+        const entry = sessions.get(command.sessionId || DEFAULT_SID);
+        if (!entry?.turnActive) {
+          tagEmit(command.sessionId, { type: "daemon_error", error: "there is no active turn to steer" });
+          continue;
+        }
+        // Preempt a provider or tool that may never reach the old "safe"
+        // reminder boundary. The turn runner resumes the same pending turn with
+        // this steering text injected after the interrupt unwinds.
+        entry.pendingSteers.push(text.trim());
+        tagEmit(command.sessionId, { type: "steer_queued", text: text.trim() });
+        entry.live.session.interrupt();
         continue;
       }
       if (command.type !== "send" || !command.goal) {
@@ -1711,9 +2182,14 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
       // stream concurrently and steer/interrupt land mid-turn.
       const sid = command.sessionId || DEFAULT_SID;
       const goal = command.goal;
+      const voiceMode = command.voice === true;
       const entry = await resolveEntry(command.sessionId);
       if (entry.turnActive) {
-        tagEmit(command.sessionId, { type: "daemon_error", error: "a turn is already running in this chat" });
+        // A send mid-turn IS steering — the owner talking over Ares ("hey
+        // Ares, no—") must never bounce with an error. Same drain as steer.
+        entry.pendingSteers.push(goal.trim());
+        tagEmit(command.sessionId, { type: "steer_queued", text: goal.trim() });
+        entry.live.session.interrupt();
         continue;
       }
       entry.turnActive = true;
@@ -1732,7 +2208,7 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
             .map((message) => messageText(message));
           const lane = classifyLane([...recentGoals, goal].join("\n"));
           let model = entry.live.selection.model;
-          let providerName = entry.live.selection.provider.name;
+          let providerName = providerFamilyForSelection(entry.live.selection);
           let source: "assigned" | "main" | "sticky" = "main";
           if (settings.routingMode === "auto") {
             const assigned = settings.routing?.[lane];
@@ -1745,6 +2221,7 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
             if (assigned?.family && assigned.model && !onAssigned && !isProviderDead(assigned.family) && (laneChanged || firstTurn)) {
               try {
                 const sel = await selectProvider(new Map([["provider", assigned.family], ["model", assigned.model]]));
+                await preflightProviderSelection(sel);
                 await entry.live.session.setProvider(sel.provider, sel.model, {
                   contextBudgetTokens: chatContextBudget(sel),
                   summarizeSpan: makeSpanSummarizer(sel, (usage) =>
@@ -1753,7 +2230,7 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
                 });
                 entry.live.selection = sel;
                 model = sel.model;
-                providerName = sel.provider.name;
+                providerName = providerFamilyForSelection(sel);
                 source = "assigned";
               } catch {
                 // bad family / missing key → keep the current model
@@ -1770,11 +2247,49 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           // best-effort — never block a turn on attribution
         }
         const turnState = { status: "completed" as "completed" | "interrupted" | "failed", fatalProvider: null as string | null };
+        // Restore the user's pinned model after a one-turn vision escalation.
+        let revertSelection: ProviderSelection | null = null;
+        let escalatedSelection: ProviderSelection | null = null;
         try {
           await prepareUserTurn(entry.live, goal);
+          // ── Vision guard: never ship a pasted image to a blind model. ──
+          // A pinned text-only model (deepseek et al) used to receive the image
+          // blocks anyway and answer "can't view the image" or guess blind
+          // (sess_e4c6022d). If this turn carries images and the active model
+          // lacks vision, escalate JUST this turn to a vision-capable provider
+          // (never off the Ares Gateway), or tell the model to be honest.
+          const turnContent = await contentFromUserInput(goal, entry.live.context.workspace);
+          if (voiceMode) turnContent.unshift({ type: "system_reminder", text: "<voice-mode/>" });
+          const hasImages = turnContent.some((block) => block.type === "image");
+          if (hasImages && !modelLikelyHasVision(entry.live.selection.model)) {
+            const pinned = entry.live.selection;
+            const visionSel = await pickVisionFallback(pinned, liveDeadProviders()).catch(() => null);
+            if (visionSel) {
+              await entry.live.session.setProvider(visionSel.provider, visionSel.model, {
+                contextBudgetTokens: chatContextBudget(visionSel),
+                summarizeSpan: makeSpanSummarizer(visionSel, (usage) =>
+                  entry.live.session.recordAuxiliaryUsage("compaction", visionSel.provider.name, visionSel.model, usage),
+                ),
+              });
+              entry.live.selection = visionSel;
+              revertSelection = pinned;
+              escalatedSelection = visionSel;
+              tagEmit(sid, {
+                type: "system_reminder_injected",
+                source: "instructions",
+                text: `Image attached — ${pinned.model} can't see images, so this turn runs on ${visionSel.provider.name}/${visionSel.model}. Your model choice is restored next turn.`,
+              });
+              tagEmit(sid, { type: "route_resolved", model: visionSel.model, provider: visionSel.provider.name, lane: entry.lane ?? "chat", source: "assigned" });
+            } else {
+              entry.live.queueSystemReminder(
+                `The user attached an image, but the current model (${pinned.model}) cannot see images and no vision-capable provider is configured. Say so plainly, describe what you'd need (a vision model — e.g. Claude, GPT-4o, or Gemini — selected in the model picker), and work from the user's text only. Do NOT guess at the image's contents.`,
+                "instructions",
+              );
+            }
+          }
           const streamOnce = async (gen: AsyncGenerator<unknown>) => {
             for await (const event of gen) {
-              const ev = event as { type: string; status?: "completed" | "interrupted" | "failed"; error?: { code?: string; message?: string }; touchedFiles?: string[] };
+              const ev = event as { type: string; status?: "completed" | "interrupted" | "failed"; error?: { code?: string; message?: string }; touchedFiles?: string[]; text?: string };
               // Continuous verification, daemon path: every edited file feeds the
               // verifier (same as the chat paths); the engine's end-of-turn gate
               // settles it and refuses "done" over red verdicts.
@@ -1783,10 +2298,35 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
               if (ev.type === "error" && isProviderFatalError(ev.error)) {
                 turnState.fatalProvider = `${ev.error?.code ?? "provider_error"}: ${ev.error?.message ?? ""}`.slice(0, 200);
               }
+              if (ev.type === "system_reminder_injected" && typeof ev.text === "string") {
+                const landed = entry.landingSteers.findIndex((steer) => steer.reminder === ev.text);
+                if (landed >= 0) {
+                  const [steer] = entry.landingSteers.splice(landed, 1);
+                  tagEmit(sid, { type: "steer_applied", text: steer.text });
+                }
+              }
+              // Steering preemption is internal. Keep the composer busy until
+              // the automatically resumed attempt reaches its real turn_end.
+              if (ev.type === "turn_end" && ev.status === "interrupted" && entry.pendingSteers.length > 0) continue;
               tagEmit(sid, event as Record<string, unknown>);
             }
           };
-          await streamOnce(entry.live.session.sendContent(await contentFromUserInput(goal, entry.live.context.workspace)));
+          await streamOnce(entry.live.session.sendContent(turnContent));
+
+          // Queue steering only after the interrupted attempt unwinds. That
+          // guarantees the resumed provider call receives it instead of draining
+          // it immediately before an abort boundary.
+          while (entry.pendingSteers.length > 0) {
+            const steers = entry.pendingSteers.splice(0);
+            for (const text of steers) {
+              const reminder = `The user STEERED mid-task: "${text}". Adjust course to honor this, but keep your current objective and everything you've already done — do not restart.`;
+              entry.landingSteers.push({ text, reminder });
+              entry.live.queueSystemReminder(reminder, "instructions");
+            }
+            turnState.status = "completed";
+            turnState.fatalProvider = null;
+            await streamOnce(entry.live.session.resumeTurn());
+          }
 
           // Self-healing fallback: if the turn died because the current provider
           // is unauthenticated / out of balance / unreachable, walk healthy
@@ -1800,7 +2340,10 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
             if (isPermanentlyDeadError(turnState.fatalProvider)) {
               markProviderDead(providerFamilyForSelection(entry.live.selection));
             }
-            const fallback = await pickHealthyFallback(entry.live.selection, liveDeadProviders()).catch(() => null);
+            const routingMode = (await loadUiSettings().catch(() => ({ routingMode: "manual" as const }))).routingMode;
+            const fallback = await pickHealthyFallback(entry.live.selection, liveDeadProviders(), {
+              allowCrossProvider: routingMode === "auto",
+            }).catch(() => null);
             if (!fallback) {
               const onAres = providerFamilyForSelection(entry.live.selection) === "ares";
               tagEmit(sid, {
@@ -1808,7 +2351,9 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
                 source: "instructions",
                 text: onAres
                   ? `Your Ares account couldn't run this turn (${turnState.fatalProvider}). Check your credits and granted models at doingteam.com → Account — you won't be switched to another provider's key.`
-                  : `All configured providers failed (${turnState.fatalProvider}). Add credit or a working API key in Settings → API Keys.`,
+                  : routingMode !== "auto"
+                    ? `Pinned provider ${providerFamilyForSelection(entry.live.selection)}/${entry.live.selection.model} failed (${turnState.fatalProvider}). The selection was kept. Enable Auto routing if you want cross-provider failover.`
+                    : `All configured providers failed (${turnState.fatalProvider}). Add credit or a working API key in Settings → API Keys.`,
               });
               break;
             }
@@ -1826,9 +2371,9 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
             tagEmit(sid, {
               type: "system_reminder_injected",
               source: "instructions",
-              text: `Provider failed (${turnState.fatalProvider}). Switched to ${fallback.provider.name}/${fallback.model}.`,
+              text: `Provider failed (${turnState.fatalProvider}). Auto routing switched to ${providerFamilyForSelection(fallback)}/${fallback.model}.`,
             });
-            tagEmit(sid, { type: "route_resolved", model: fallback.model, provider: fallback.provider.name, lane: entry.lane ?? "chat", source: "assigned" });
+            tagEmit(sid, { type: "route_resolved", model: fallback.model, provider: providerFamilyForSelection(fallback), lane: entry.lane ?? "chat", source: "assigned" });
             // Reset and re-run; if THIS one also fails fatally the loop continues.
             turnState.status = "completed";
             turnState.fatalProvider = null;
@@ -1837,7 +2382,7 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           await finishTurn(entry.live, turnState.status);
           // A completed turn may have landed a commit — reflect it into the war
           // map. Fire-and-forget; reflection never delays or breaks the turn.
-          if (turnState.status === "completed") {
+          if (turnState.status === "completed" && (entry.live.session.lastWorkStatus === "verified" || entry.live.session.lastWorkStatus === "not_applicable")) {
             void reflectAfterTurn(goal).catch(() => {});
             // Learn from the conversation too — durable facts/preferences → memory.
             void reflectConversationAfterTurn(entry, sid).catch(() => {});
@@ -1846,6 +2391,24 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           tagEmit(command.sessionId, { type: "error", error: { code: "turn_throw", message: err instanceof Error ? err.message : String(err), retriable: false } });
           tagEmit(command.sessionId, { type: "turn_end", status: "failed", usage: {}, durationMs: 0 });
         } finally {
+          // A vision escalation was for THIS turn only — hand the conversation
+          // back to the user's pinned model. If the failover loop replaced the
+          // model mid-turn (provider death), its choice wins — don't revert onto
+          // a pin that may itself be part of the problem.
+          if (revertSelection && escalatedSelection && entry.live.selection === escalatedSelection) {
+            try {
+              const pinned = revertSelection;
+              await entry.live.session.setProvider(pinned.provider, pinned.model, {
+                contextBudgetTokens: chatContextBudget(pinned),
+                summarizeSpan: makeSpanSummarizer(pinned, (usage) =>
+                  entry.live.session.recordAuxiliaryUsage("compaction", pinned.provider.name, pinned.model, usage),
+                ),
+              });
+              entry.live.selection = pinned;
+            } catch {
+              // keep the vision model rather than kill the session
+            }
+          }
           entry.turnActive = false;
           activeTurns--;
         }
@@ -1866,8 +2429,7 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
     const allEntries = sessions.size > 0 ? [...sessions.values()] : [primaryEntry];
     for (const entry of allEntries) {
       try {
-        await entry.live.agentRuntime?.sessionEnded();
-        entry.live.agentRuntime?.stop();
+        await disposeLiveSession(entry.live);
       } catch {
         // best-effort teardown
       }
