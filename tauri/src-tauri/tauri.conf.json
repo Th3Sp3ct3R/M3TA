@@ -21,7 +21,9 @@
       "icons/icon.ico"
     ],
     "targets": [
-      "nsis"
+      "nsis",
+      "app",
+      "dmg"
     ],
     "resources": {
       "runtime/": "runtime/",

@@ -1,0 +1,21 @@
+{
+  "name": "@ares/harness",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "description": "The Harness (AzA): scraper run orchestrator — loads accounts, routes to a device, and drives platform automation adapters. Execution is injected via interfaces so device/automation implementations can live in any repo.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "demo": "node dist/demo.js"
+  }
+}

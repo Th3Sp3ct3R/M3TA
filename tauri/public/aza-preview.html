@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AzA · Targets — design preview</title>
+<style>
+  @import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;650&display=swap");
+  html,body{height:100%;margin:0}
+  .aza{
+    --aza-black:#050605;--aza-obsidian:#0b0d0c;--aza-panel:#111413;--aza-panel-soft:#171b19;
+    --aza-white:#f5f7f2;--aza-mist:#c4cabe;--aza-stone:#80877c;
+    --aza-border:rgba(245,247,242,.13);--aza-border-strong:rgba(245,247,242,.28);
+    --aza-green:#74d99f;--aza-cyan:#78c7d6;--aza-amber:#d9b66f;--aza-red:#e47d72;
+    --aza-font-sans:"IBM Plex Sans","Avenir Next","SF Pro Display",system-ui,sans-serif;
+    --aza-font-mono:"IBM Plex Mono","Geist Mono","SF Mono",monospace;
+    color:var(--aza-white);font-family:var(--aza-font-sans);color-scheme:dark;
+  }
+  *{box-sizing:border-box}
+  .control-shell{min-height:100vh;display:grid;grid-template-columns:72px minmax(0,1fr);
+    background:linear-gradient(rgba(245,247,242,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(245,247,242,.026) 1px,transparent 1px),var(--aza-black);background-size:32px 32px}
+  .control-rail{height:100vh;border-right:1px solid var(--aza-border);background:rgba(11,13,12,.92);display:grid;grid-template-rows:86px repeat(4,48px) 1fr;justify-items:center;padding-top:16px}
+  .brand-mark{width:42px;height:42px;border:1px solid var(--aza-border-strong);display:grid;place-items:center;font-family:var(--aza-font-mono);font-size:11px;letter-spacing:.08em;color:var(--aza-white);background:#0f1712}
+  .control-rail button{width:40px;height:40px;display:grid;place-items:center;color:var(--aza-stone);border:1px solid transparent;border-radius:8px;background:none;cursor:pointer;font-size:15px}
+  .control-rail button:hover{color:var(--aza-white);border-color:var(--aza-border);background:rgba(245,247,242,.06)}
+  .control-workspace{min-width:0;display:grid;gap:18px;padding:24px;align-content:start}
+  .control-topbar{display:flex;align-items:center;justify-content:space-between;gap:18px;padding-bottom:16px;border-bottom:1px solid var(--aza-border)}
+  .control-topbar h1{margin:4px 0 0;font-size:38px;line-height:1;font-weight:600}
+  .aza-label{margin:0;color:var(--aza-cyan);font-family:var(--aza-font-mono);font-size:11px;letter-spacing:.04em;text-transform:uppercase}
+  .topbar-actions{display:flex;align-items:center;gap:10px}
+  .metrics-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+  .aza-metric-card{min-height:118px;border:1px solid var(--aza-border);background:var(--aza-panel);border-radius:14px;padding:18px}
+  .aza-metric-card strong{display:block;margin-top:14px;font-size:30px;line-height:1}
+  .aza-metric-card span.sub{display:block;margin-top:8px;color:var(--aza-stone);font-size:13px}
+  .aza-card{border:1px solid var(--aza-border);background:var(--aza-panel);border-radius:14px;padding:20px;background-image:linear-gradient(rgba(245,247,242,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(245,247,242,.035) 1px,transparent 1px);background-size:24px 24px}
+  .aza-card h3{margin:0;font-size:24px;font-weight:600}
+  .form-line{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin-top:16px}
+  .field{display:grid;gap:5px}
+  .field label{font-family:var(--aza-font-mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--aza-stone)}
+  input{min-height:40px;border:1px solid var(--aza-border);border-radius:8px;background:rgba(5,6,5,.66);color:var(--aza-white);padding:0 12px;font:inherit;font-size:13px}
+  input:focus-visible{outline:1px solid var(--aza-cyan);outline-offset:1px}
+  .aza-button{min-height:40px;display:inline-flex;align-items:center;gap:8px;border-radius:12px;padding:0 16px;color:var(--aza-white);border:1px solid var(--aza-border);background:var(--aza-panel);font:inherit;font-size:13px;cursor:pointer}
+  .aza-button:hover{border-color:var(--aza-border-strong);box-shadow:0 0 18px rgba(245,247,242,.1)}
+  .aza-button-primary{background:var(--aza-white);color:var(--aza-black);border-color:var(--aza-white)}
+  .aza-badge{display:inline-flex;align-items:center;min-height:24px;border-radius:999px;border:1px solid var(--aza-border);padding:0 9px;font-family:var(--aza-font-mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--aza-mist)}
+  .aza-badge-strong{color:var(--aza-black);background:var(--aza-white);border-color:var(--aza-white)}
+  .aza-badge-muted{color:var(--aza-stone)}
+  .status-table{display:grid;gap:8px;margin-top:16px}
+  .data-row{min-height:48px;display:grid;grid-template-columns:minmax(0,1.4fr) 84px minmax(0,1fr) minmax(0,1fr) minmax(0,1.3fr);align-items:center;gap:14px;border:1px solid var(--aza-border);background:rgba(245,247,242,.035);padding:10px 12px}
+  .data-row strong{color:var(--aza-white);font-size:14px;font-weight:650}
+  .data-row.head{min-height:0;border:0;background:transparent;padding:4px 12px}
+  .data-row.head span{color:var(--aza-stone);font-family:var(--aza-font-mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase}
+  code{color:var(--aza-mist);font-family:var(--aza-font-mono);font-size:12px}
+  .verified{color:var(--aza-green)}
+  .footer-line{min-height:44px;display:flex;align-items:center;gap:10px;color:var(--aza-stone);font-family:var(--aza-font-mono);font-size:12px;border-top:1px solid var(--aza-border)}
+  .footer-line .dot{width:7px;height:7px;border-radius:50%;background:var(--aza-cyan);box-shadow:0 0 8px rgba(120,199,214,.7)}
+</style>
+</head>
+<body>
+<div class="aza control-shell">
+  <nav class="control-rail">
+    <div class="brand-mark">AzA</div>
+    <button title="Targets">◎</button>
+    <button title="Sources">▤</button>
+    <button title="Runs">▷</button>
+    <button title="Settings">⚙</button>
+  </nav>
+  <div class="control-workspace">
+    <header class="control-topbar">
+      <div><p class="aza-label">AzA · Targets</p><h1>Targets</h1></div>
+      <div class="topbar-actions"><button class="aza-button aza-button-primary">Collect</button></div>
+    </header>
+    <section class="metrics-grid">
+      <div class="aza-metric-card"><span class="aza-badge">Leads</span><strong>5</strong><span class="sub">in pool</span></div>
+      <div class="aza-metric-card"><span class="aza-badge">Verified</span><strong>3</strong><span class="sub">badged accounts</span></div>
+      <div class="aza-metric-card"><span class="aza-badge">Email</span><strong>3</strong><span class="sub">contactable</span></div>
+      <div class="aza-metric-card"><span class="aza-badge aza-badge-strong">Zero burn</span><strong>0</strong><span class="sub">accounts risked</span></div>
+    </section>
+    <section class="aza-card">
+      <h3>Query</h3>
+      <div class="form-line">
+        <div class="field"><label>Category</label><input value="music" /></div>
+        <div class="field"><label>Country</label><input value="United States" /></div>
+        <div class="field"><label>Min followers</label><input value="10000" /></div>
+        <button class="aza-button">Run query</button>
+      </div>
+      <div class="status-table">
+        <div class="data-row head"><span>User</span><span>Followers</span><span>Category</span><span>Country</span><span>Email</span></div>
+        <div class="data-row"><strong>@cayla.craft<span class="verified"> ✦</span></strong><code>120k</code><span><span class="aza-badge aza-badge-muted">Entrepreneur</span></span><code>United States</code><code>hi@caylacraft.com</code></div>
+        <div class="data-row"><strong>@richiezav</strong><code>45k</code><span><span class="aza-badge aza-badge-muted">Business</span></span><code>United States</code><code>rich@example.com</code></div>
+        <div class="data-row"><strong>@bigmusic<span class="verified"> ✦</span></strong><code>500k</code><span><span class="aza-badge aza-badge-muted">Musician</span></span><code>United States</code><code>—</code></div>
+        <div class="data-row"><strong>@fitldn<span class="verified"> ✦</span></strong><code>8.2k</code><span><span class="aza-badge aza-badge-muted">Fitness</span></span><code>United Kingdom</code><code>—</code></div>
+        <div class="data-row"><strong>@glowbeauty</strong><code>22k</code><span><span class="aza-badge aza-badge-muted">Beauty</span></span><code>Canada</code><code>glow@example.com</code></div>
+      </div>
+    </section>
+    <footer class="footer-line"><span class="dot"></span><span>zero account burn · 5 leads</span></footer>
+  </div>
+</div>
+</body>
+</html>

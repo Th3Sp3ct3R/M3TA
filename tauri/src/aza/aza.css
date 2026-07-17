@@ -1,0 +1,181 @@
+/* AzA design system — vendored from Th3Sp3ct3R/AzA-Design-System (canonical).
+   "Intelligence made visible." Monochrome near-black + blueprint geometry +
+   command-surface density. Hue (cyan/green/amber/red) is used ONLY for labels,
+   focus, and status — never decoration.
+
+   SCOPED to `.aza`: tokens live on `.aza` (not :root) and generic element
+   selectors (input/code) are nested, so this NEVER bleeds into the Ares shell. */
+
+.aza {
+  --aza-black: #050605;
+  --aza-obsidian: #0b0d0c;
+  --aza-panel: #111413;
+  --aza-panel-soft: #171b19;
+  --aza-white: #f5f7f2;
+  --aza-mist: #c4cabe;
+  --aza-stone: #80877c;
+  --aza-border: rgba(245, 247, 242, 0.13);
+  --aza-border-strong: rgba(245, 247, 242, 0.28);
+  --aza-green: #74d99f;
+  --aza-cyan: #78c7d6;
+  --aza-amber: #d9b66f;
+  --aza-red: #e47d72;
+  --aza-font-sans: "Avenir Next", "IBM Plex Sans", "SF Pro Display", system-ui, sans-serif;
+  --aza-font-mono: "IBM Plex Mono", "Geist Mono", "SF Mono", monospace;
+
+  color: var(--aza-white);
+  font-family: var(--aza-font-sans);
+}
+
+/* ── shell: rail + workspace, faint blueprint grid ──────────────────────── */
+.aza.control-shell {
+  min-height: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  background:
+    linear-gradient(rgba(245, 247, 242, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(245, 247, 242, 0.026) 1px, transparent 1px),
+    var(--aza-black);
+  background-size: 32px 32px;
+  overflow: hidden;
+}
+
+.aza .control-rail {
+  height: 100%;
+  border-right: 1px solid var(--aza-border);
+  background: rgba(11, 13, 12, 0.92);
+  display: grid;
+  grid-template-rows: 86px repeat(4, 48px) 1fr;
+  justify-items: center;
+  padding-top: 16px;
+}
+.aza .brand-mark {
+  width: 42px; height: 42px;
+  border: 1px solid var(--aza-border-strong);
+  display: grid; place-items: center;
+  font-family: var(--aza-font-mono);
+  font-size: 11px; letter-spacing: 0.08em;
+  color: var(--aza-white);
+  background: #0f1712;
+}
+.aza .control-rail a, .aza .control-rail button {
+  width: 40px; height: 40px;
+  display: grid; place-items: center;
+  color: var(--aza-stone);
+  border: 1px solid transparent; border-radius: 8px;
+  background: none; cursor: pointer;
+}
+.aza .control-rail a:hover, .aza .control-rail button:hover,
+.aza .control-rail a:focus-visible {
+  color: var(--aza-white);
+  border-color: var(--aza-border);
+  background: rgba(245, 247, 242, 0.06);
+  outline: none;
+}
+
+.aza .control-workspace {
+  min-width: 0; min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  gap: 18px;
+  padding: 24px;
+  overflow: hidden;
+}
+
+.aza .control-topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 18px; padding-bottom: 16px;
+  border-bottom: 1px solid var(--aza-border);
+}
+.aza .control-topbar h1 { margin: 4px 0 0; font-size: 38px; line-height: 1; letter-spacing: 0; font-weight: 600; }
+.aza .aza-label { margin: 0; color: var(--aza-cyan); font-family: var(--aza-font-mono); font-size: 11px; line-height: 1.4; letter-spacing: 0.04em; text-transform: uppercase; }
+.aza .topbar-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+
+/* ── metrics ────────────────────────────────────────────────────────────── */
+.aza .metrics-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.aza .aza-metric-card {
+  min-height: 118px; border: 1px solid var(--aza-border); background: var(--aza-panel);
+  border-radius: 14px; padding: 18px; display: flex; justify-content: space-between; gap: 18px;
+}
+.aza .aza-metric-card strong { display: block; margin-top: 14px; font-size: 30px; line-height: 1; }
+.aza .aza-metric-card span { display: block; margin-top: 8px; color: var(--aza-stone); font-size: 13px; }
+.aza .aza-metric-card .aza-badge { align-self: flex-start; }
+
+/* ── panel / card ───────────────────────────────────────────────────────── */
+.aza .aza-card {
+  border: 1px solid var(--aza-border); background: var(--aza-panel);
+  border-radius: 14px; padding: 20px; min-height: 0;
+  display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: 0;
+}
+.aza .aza-card.blueprint {
+  background-image:
+    linear-gradient(rgba(245, 247, 242, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(245, 247, 242, 0.035) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+.aza .aza-card h3 { margin: 0; font-size: 24px; font-weight: 600; }
+
+/* ── query form ─────────────────────────────────────────────────────────── */
+.aza .form-line { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-top: 16px; }
+.aza .field { display: grid; gap: 5px; }
+.aza .field label { font-family: var(--aza-font-mono); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--aza-stone); }
+.aza input {
+  min-height: 40px; min-width: 0;
+  border: 1px solid var(--aza-border); border-radius: 8px;
+  background: rgba(5, 6, 5, 0.66); color: var(--aza-white);
+  padding: 0 12px; font: inherit; font-size: 13px;
+}
+.aza input:focus-visible { outline: 1px solid var(--aza-cyan); outline-offset: 1px; }
+
+/* ── buttons ────────────────────────────────────────────────────────────── */
+.aza .aza-button {
+  min-height: 40px; display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  border-radius: 12px; padding: 0 16px; color: var(--aza-white);
+  border: 1px solid var(--aza-border); background: var(--aza-panel);
+  font: inherit; font-size: 13px; cursor: pointer;
+  transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
+}
+.aza .aza-button:hover, .aza .aza-button:focus-visible { border-color: var(--aza-border-strong); box-shadow: 0 0 18px rgba(245, 247, 242, 0.1); outline: none; }
+.aza .aza-button:active { transform: translateY(1px); }
+.aza .aza-button:disabled { opacity: 0.5; cursor: not-allowed; }
+.aza .aza-button-primary { background: var(--aza-white); color: var(--aza-black); border-color: var(--aza-white); }
+
+/* ── badges ─────────────────────────────────────────────────────────────── */
+.aza .aza-badge {
+  display: inline-flex; align-items: center; min-height: 24px; border-radius: 999px;
+  border: 1px solid var(--aza-border); padding: 0 9px;
+  font-family: var(--aza-font-mono); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--aza-mist); white-space: nowrap;
+}
+.aza .aza-badge-strong { color: var(--aza-black); background: var(--aza-white); border-color: var(--aza-white); }
+.aza .aza-badge-muted { color: var(--aza-stone); }
+
+/* ── results: status/data rows ──────────────────────────────────────────── */
+.aza .status-table { display: grid; gap: 8px; margin-top: 16px; overflow: auto; min-height: 0; align-content: start; }
+.aza .data-row {
+  min-height: 48px; display: grid;
+  grid-template-columns: minmax(0, 1.4fr) 84px minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.3fr);
+  align-items: center; gap: 14px;
+  border: 1px solid var(--aza-border); background: rgba(245, 247, 242, 0.035); padding: 10px 12px;
+}
+.aza .data-row strong { color: var(--aza-white); font-size: 14px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.aza .data-row code, .aza code { color: var(--aza-mist); font-family: var(--aza-font-mono); font-size: 12px; overflow-wrap: anywhere; }
+.aza .data-row .verified { color: var(--aza-green); }
+.aza .data-row.head { min-height: 0; border: 0; background: transparent; padding: 4px 12px; }
+.aza .data-row.head span { color: var(--aza-stone); font-family: var(--aza-font-mono); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; }
+
+/* ── footer ─────────────────────────────────────────────────────────────── */
+.aza .footer-line {
+  min-height: 44px; display: flex; align-items: center; gap: 10px;
+  color: var(--aza-stone); font-family: var(--aza-font-mono); font-size: 12px;
+  border-top: 1px solid var(--aza-border);
+}
+.aza .footer-line .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--aza-cyan); box-shadow: 0 0 8px rgba(120, 199, 214, 0.7); }
+
+.aza .empty-state { margin: auto; text-align: center; color: var(--aza-stone); display: grid; justify-items: center; gap: 12px; padding: 40px; }
+.aza .empty-state .brand-mark { width: 54px; height: 54px; font-size: 13px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .aza .aza-button { transition: none; }
+}
