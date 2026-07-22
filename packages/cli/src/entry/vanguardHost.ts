@@ -32,15 +32,89 @@ interface VanguardEngineLike {
 /** The daemon's tagEmit: events tagged with the Ares session id. */
 type TagEmit = (sessionId: string | undefined, obj: Record<string, unknown>) => void;
 
-/** Providers the Vanguard engine can drive natively. */
-const DRIVABLE = new Set(["anthropic", "openai", "deepseek", "kimi", "ollama"]);
+/** The slice of Ares uiSettings the drive needs to authenticate any family. */
+export interface DriveSettings {
+  readonly anthropicKey?: string;
+  readonly deepSeekKey?: string;
+  readonly ollamaApiKey?: string;
+  readonly kimiKey?: string;
+  readonly openRouterKey?: string;
+  readonly customBaseUrl?: string;
+  readonly customApiKey?: string;
+  readonly aresGatewayUrl?: string;
+  readonly aresGatewayToken?: string;
+}
 
-/** Ares uiSettings key fields, by provider family. */
-const SETTINGS_KEYS: Readonly<Record<string, string>> = {
-  anthropic: "anthropicKey",
-  deepseek: "deepSeekKey",
-  ollama: "ollamaApiKey",
+/** Families Vanguard drives natively, with their Ares settings key. */
+const NATIVE_FAMILIES: Readonly<Record<string, { settingsKey?: keyof DriveSettings }>> = {
+  anthropic: { settingsKey: "anthropicKey" },
+  openai: {},
+  deepseek: { settingsKey: "deepSeekKey" },
+  kimi: { settingsKey: "kimiKey" },
+  ollama: { settingsKey: "ollamaApiKey" },
 };
+
+interface DriveTarget {
+  readonly provider: string;
+  readonly endpoint?: string;
+  readonly credentialVariable?: string;
+  /** Key to inject into the credential variable when the env has none. */
+  readonly settingsValue?: string;
+  /** Native family for OAuth checks; undefined disables OAuth. */
+  readonly oauthFamily?: string;
+}
+
+/**
+ * Every Ares selection maps onto the engine: native families directly, and
+ * openrouter / custom / the in-house ares gateway through explicit endpoints
+ * with dedicated credential variables, so first-party key env vars are never
+ * clobbered by gateway tokens.
+ */
+function driveTarget(family: string, settings: DriveSettings): DriveTarget {
+  const native = NATIVE_FAMILIES[family];
+  if (native !== undefined) {
+    return {
+      provider: family,
+      oauthFamily: family,
+      ...(native.settingsKey === undefined ? {} : { settingsValue: settings[native.settingsKey] as string | undefined }),
+    };
+  }
+  if (family === "openrouter") {
+    return {
+      provider: "openai-compatible",
+      endpoint: "https://openrouter.ai/api/v1/chat/completions",
+      credentialVariable: "OPENROUTER_API_KEY",
+      settingsValue: settings.openRouterKey,
+    };
+  }
+  if (family === "custom") {
+    const base = (settings.customBaseUrl || process.env.ARES_CUSTOM_BASE_URL || "").replace(/\/+$/u, "");
+    if (base === "") throw new Error("The custom provider has no base URL configured.");
+    return {
+      provider: "openai-compatible",
+      endpoint: `${base}/chat/completions`,
+      credentialVariable: "ARES_CUSTOM_API_KEY",
+      settingsValue: settings.customApiKey,
+    };
+  }
+  if (family === "ares") {
+    // The in-house gateway speaks Anthropic Messages; the account token rides
+    // its own variable so a real Anthropic key elsewhere stays untouched.
+    const raw = settings.aresGatewayUrl || process.env.ARES_GATEWAY_URL || "https://www.doingteam.com";
+    const base = raw.replace(/\/+$/u, "").replace("://doingteam.com", "://www.doingteam.com");
+    return {
+      provider: "anthropic",
+      endpoint: `${base}/api/gateway/v1/messages`,
+      credentialVariable: "ARES_GATEWAY_TOKEN",
+      settingsValue: settings.aresGatewayToken,
+    };
+  }
+  throw new Error(
+    family === "moa"
+      ? "Vanguard drives one concrete model at a time — pick a specific provider instead of a MoA ensemble, or turn Vanguard mode off."
+      : `Vanguard cannot drive the '${family}' selection. Switch model or turn Vanguard mode off.`,
+  );
+}
 
 interface Binding {
   vanguardSessionId: string;
@@ -62,7 +136,7 @@ export interface VanguardDrive {
     key: string,
     tag: string | undefined,
     goal: string,
-    selection: { workspace: string; family: string; model: string; settingsKey?: string },
+    selection: { workspace: string; family: string; model: string; settings: DriveSettings },
   ): Promise<void>;
   steerTurn(key: string, text: string): boolean;
   interrupt(key: string): boolean;
@@ -172,47 +246,43 @@ export function createVanguardDrive(tagEmit: TagEmit): VanguardDrive {
     return engine;
   };
 
-  const resolveAuth = async (family: string, settingsKey: string | undefined): Promise<"oauth" | "api-key"> => {
+  const resolveAuth = async (target: DriveTarget, family: string): Promise<"oauth" | "api-key"> => {
     const mod = await loadModule();
-    if (mod.supportsOAuth(family)) {
-      const status = await mod.oauthStatus(family).catch(() => ({ connected: false }));
+    if (target.oauthFamily !== undefined && mod.supportsOAuth(target.oauthFamily)) {
+      const status = await mod.oauthStatus(target.oauthFamily).catch(() => ({ connected: false }));
       if (status.connected) return "oauth";
     }
-    const variable = mod.credentialVariable(family);
+    const variable = target.credentialVariable ?? mod.credentialVariable(target.provider);
     if ((process.env[variable] ?? "") !== "") return "api-key";
-    // Fall back to the key the owner gave Ares itself, so Vanguard mode needs
-    // zero extra setup. Injected into this process's env only.
-    if (settingsKey !== undefined && settingsKey !== "") {
-      process.env[variable] = settingsKey;
+    // Fall back to the credential the owner already gave Ares itself, so
+    // Vanguard mode needs zero extra setup. Injected into this process only.
+    if (target.settingsValue !== undefined && target.settingsValue !== "") {
+      process.env[variable] = target.settingsValue;
       return "api-key";
     }
     if (family === "ollama") return "api-key"; // local daemon needs no key
-    throw new Error(
-      `Vanguard has no ${family} credential: sign in with \`vanguard login ${family}\` or set ${variable}.`,
-    );
+    throw new Error(`Vanguard has no ${family} credential: sign in or set ${variable}.`);
   };
 
   const ensureBinding = async (
     key: string,
     tag: string | undefined,
-    selection: { workspace: string; family: string; model: string; settingsKey?: string },
+    selection: { workspace: string; family: string; model: string; settings: DriveSettings },
   ): Promise<Binding> => {
     const existing = bindings.get(key);
     if (existing !== undefined && existing.family === selection.family && existing.model === selection.model) {
       return existing;
     }
-    if (!DRIVABLE.has(selection.family)) {
-      throw new Error(
-        `Vanguard drives anthropic, openai, deepseek, kimi, and ollama — the current selection is ${selection.family}. Switch model or turn Vanguard mode off.`,
-      );
-    }
+    const target = driveTarget(selection.family, selection.settings);
     const live = await ensureEngine();
-    const auth = await resolveAuth(selection.family, selection.settingsKey);
+    const auth = await resolveAuth(target, selection.family);
     const config = {
       workspace: selection.workspace,
-      provider: selection.family,
+      provider: target.provider,
       model: selection.model,
       auth,
+      ...(target.endpoint === undefined ? {} : { endpoint: target.endpoint }),
+      ...(target.credentialVariable === undefined || auth === "oauth" ? {} : { credentialVariable: target.credentialVariable }),
       direct: true, // same trust model as the Ares agent: real tree, git undo
       maxSteps: 240,
     };

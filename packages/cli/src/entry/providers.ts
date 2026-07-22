@@ -57,7 +57,7 @@ interface DaemonModelOption {
   updated?: string;
 }
 
-export const TERMINAL_PROVIDERS = ["ollama", "openai", "anthropic", "deepseek", "openrouter", "ares", "custom", "moa", "mock"] as const;
+export const TERMINAL_PROVIDERS = ["ollama", "openai", "anthropic", "deepseek", "kimi", "openrouter", "ares", "custom", "moa", "mock"] as const;
 
 // Mixture-of-Agents ensembles — pickable "models" under the `moa` provider.
 // Each reference drafts independently; the aggregator (tool-capable) synthesizes.
@@ -386,6 +386,38 @@ export async function daemonModelCatalog(provider: string): Promise<DaemonModelO
     }));
   }
 
+  if (provider === "kimi") {
+    // Live discovery through the signed-in Kimi account (via the embedded
+    // Vanguard module, which owns the OAuth store); static coding models
+    // otherwise so the picker is never empty.
+    try {
+      const vanguard = await import("vanguard") as {
+        oauthStatus: (p: string) => Promise<{ connected: boolean }>;
+        catalogModels: (p: string, auth: "oauth" | "api-key") => readonly { id: string; note?: string }[];
+      };
+      const connected = (await vanguard.oauthStatus("kimi").catch(() => ({ connected: false }))).connected;
+      const rows = vanguard.catalogModels("kimi", connected ? "oauth" : "api-key");
+      if (rows.length > 0) {
+        return rows.map((model) => ({
+          id: model.id,
+          label: model.id === "kimi-for-coding" ? "Kimi for Coding" : model.id,
+          hint: model.note ?? "agentic coding · 256K context",
+          group: "Kimi",
+          capabilities: ["tools", "reasoning"],
+        }));
+      }
+    } catch {
+      // vanguard module unavailable — fall through to the static row
+    }
+    return [{
+      id: "kimi-for-coding",
+      label: "Kimi for Coding",
+      hint: "agentic coding · 256K context",
+      group: "Kimi",
+      capabilities: ["tools", "reasoning"],
+    }];
+  }
+
   if (provider === "ares") {
     return fetchAresGatewayModels(aresGatewayBase(settings), settings.aresGatewayToken);
   }
@@ -615,6 +647,39 @@ export async function selectProvider(flags: Map<string, string>): Promise<Provid
         } catch (err) {
           return { ok: false, error: `DeepSeek connection failed: ${err instanceof Error ? err.message : String(err)}` };
         }
+      },
+    };
+  }
+  if (preferred === "kimi") {
+    const model = requestedModel ?? settings.lastKimiModel ?? "kimi-for-coding";
+    // Kimi's coding endpoint is plain Chat Completions with Bearer auth, so the
+    // hardened OpenAI-compat client drives it directly. Credential order: the
+    // Ares-stored key, the env key, then the subscription token minted by the
+    // Kimi OAuth sign-in (owned by the embedded Vanguard module's store).
+    let kimiCredential = settings.kimiKey || process.env.KIMI_API_KEY || "";
+    if (!kimiCredential) {
+      try {
+        const vanguard = await import("vanguard") as { resolveKimiAccessToken: () => Promise<string | null> };
+        kimiCredential = (await vanguard.resolveKimiAccessToken()) ?? "";
+      } catch {
+        // vanguard module unavailable — the empty key surfaces as no_auth
+      }
+    }
+    return {
+      provider: new OpenRouterProvider({
+        apiKey: kimiCredential,
+        model,
+        baseUrl: "https://api.kimi.com/coding/v1",
+        providerName: "kimi",
+      }),
+      model,
+      source: explicit ? "explicit:kimi" : "settings:kimi",
+      family: "kimi",
+      preflight: async () => {
+        if (!kimiCredential) {
+          return { ok: false, error: "Kimi is not connected. Sign in with Kimi in Settings → API Keys, or add a Kimi API key." };
+        }
+        return { ok: true };
       },
     };
   }

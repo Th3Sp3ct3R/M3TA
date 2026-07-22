@@ -1248,6 +1248,7 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
         anthropic: Boolean(readySettings.anthropicKey || process.env.ANTHROPIC_API_KEY || process.env.ARES_ANTHROPIC_API_KEY),
         openai: Boolean(readyAuth?.configured),
         deepseek: Boolean(readySettings.deepSeekKey || process.env.DEEPSEEK_API_KEY),
+        kimi: Boolean(readySettings.kimiKey || process.env.KIMI_API_KEY),
         openrouter: Boolean(readySettings.openRouterKey || process.env.OPENROUTER_API_KEY),
         ollama: Boolean(readySettings.ollamaApiKey || process.env.OLLAMA_API_KEY),
         brave: Boolean(readySettings.braveKey || process.env.ARES_BRAVE_API_KEY),
@@ -1520,6 +1521,11 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
         } else if (provider === "anthropic") {
           patch.anthropicKey = key;
           if (model) patch.lastAnthropicModel = model;
+        } else if (provider === "kimi") {
+          patch.kimiKey = key;
+          if (model) patch.lastKimiModel = model;
+          if (key) process.env.KIMI_API_KEY = key;
+          else delete process.env.KIMI_API_KEY;
         } else if (provider === "ollama") {
           patch.ollamaApiKey = key;
           if (model) patch.lastOllamaModel = model;
@@ -1535,7 +1541,7 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           patch.braveKey = key;
           if (key) process.env.ARES_BRAVE_API_KEY = key; // live immediately, no restart
         } else {
-          process.stdout.write(JSON.stringify({ type: "daemon_error", error: `provider_key: unsupported provider "${provider}" (openrouter | deepseek | anthropic | ollama | custom | brave)` }) + "\n");
+          process.stdout.write(JSON.stringify({ type: "daemon_error", error: `provider_key: unsupported provider "${provider}" (openrouter | deepseek | anthropic | kimi | ollama | custom | brave)` }) + "\n");
           continue;
         }
         await updateUiSettings(patch);
@@ -2021,6 +2027,44 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
         }) + "\n");
         continue;
       }
+      if (command.type === "kimi_login_start") {
+        // Kimi subscription sign-in (RFC 8628 device flow) through the embedded
+        // Vanguard module, which owns the token store the drive engine and the
+        // legacy kimi provider both read. The browser opens the verification
+        // page with the code pre-filled; we also emit the URL for the UI card.
+        const sid = command.sessionId;
+        void (async () => {
+          const vanguard = await import("vanguard") as {
+            oauthLogin: (p: string, o?: { force?: boolean; onAuthorizeUrl?: (url: string) => void }) => Promise<{ connected: boolean; detail?: string }>;
+          };
+          return vanguard.oauthLogin("kimi", {
+            force: true,
+            onAuthorizeUrl: (url) => tagEmit(sid, { type: "kimi_login_url", url }),
+          });
+        })()
+          .then((status) => {
+            tagEmit(sid, { type: "kimi_login_done", ok: status.connected, detail: status.detail ?? null });
+          })
+          .catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            tagEmit(sid, { type: "kimi_login_done", ok: false, error: msg.slice(0, 200) });
+          });
+        continue;
+      }
+      if (command.type === "kimi_auth_status") {
+        const status = await (async () => {
+          const vanguard = await import("vanguard") as {
+            oauthStatus: (p: string) => Promise<{ connected: boolean; detail?: string }>;
+          };
+          return vanguard.oauthStatus("kimi");
+        })().catch(() => null);
+        process.stdout.write(JSON.stringify({
+          type: "kimi_auth_status",
+          configured: !!status?.connected,
+          detail: status?.detail ?? null,
+        }) + "\n");
+        continue;
+      }
       if (command.type === "operator_status") {
         const goals = await listGoals(live.context.home).catch(() => []);
         const active = goals.filter((g) => g.status === "active");
@@ -2247,16 +2291,11 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           continue;
         }
         const settings = await loadUiSettings();
-        const family = providerFamilyForSelection(entry.live.selection);
-        const settingsKey = family === "anthropic" ? settings.anthropicKey
-          : family === "deepseek" ? settings.deepSeekKey
-          : family === "ollama" ? settings.ollamaApiKey
-          : undefined;
         void vanguardDrive.runTurn(sid, command.sessionId, goal, {
           workspace: entry.live.context.workspace,
-          family,
+          family: providerFamilyForSelection(entry.live.selection),
           model: entry.live.selection.model,
-          ...(settingsKey ? { settingsKey } : {}),
+          settings,
         });
         continue;
       }

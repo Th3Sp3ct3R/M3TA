@@ -14,6 +14,7 @@ const SECRET_FIELDS = [
   "braveKey",
   "tavilyKey",
   "deepSeekKey",
+  "kimiKey",
   "aresGatewayToken",
   "ollamaApiKey",
   "customApiKey",
@@ -70,6 +71,10 @@ export interface UiSettings {
   deepSeekKey?: string;
   /** Last DeepSeek model id the owner selected. */
   lastDeepSeekModel?: string;
+  /** Kimi (Moonshot) API key for the api.kimi.com coding endpoint. */
+  kimiKey?: string;
+  /** Last Kimi model id the owner selected. */
+  lastKimiModel?: string;
   /** Ollama Cloud API key for direct ollama.com catalog and model access. */
   ollamaApiKey?: string;
   /** Custom OpenAI-compatible provider — base URL ending in the API root, e.g.

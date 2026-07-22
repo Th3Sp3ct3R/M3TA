@@ -2016,6 +2016,7 @@ function App() {
   // ChatGPT (OpenAI) OAuth — routes GPT usage through the user's ChatGPT
   // subscription via the Codex backend; no API key.
   const [openaiAuth, setOpenaiAuth] = useState<{ signingIn: boolean; connected: boolean; email: string | null; plan: string | null }>({ signingIn: false, connected: false, email: null, plan: null });
+  const [kimiAuth, setKimiAuth] = useState<{ signingIn: boolean; connected: boolean; detail: string | null }>({ signingIn: false, connected: false, detail: null });
   const oauthCtx = useRef<{ verifier: string; state: string }>({ verifier: "", state: "" });
   const [logLines, setLogLines] = useState<string[]>([]);
   const [bootGone, setBootGone] = useState(false);
@@ -2652,6 +2653,28 @@ function App() {
           setOpenaiAuth({ signingIn: false, connected: oe.configured === true, email: typeof oe.email === "string" ? oe.email : null, plan: typeof oe.plan === "string" ? oe.plan : null });
           return true;
         }
+        case "kimi_login_url": {
+          // Device flow: the verification URL arrives with the code pre-filled;
+          // open it in the real browser and show the waiting state.
+          const ke = e as { url?: unknown };
+          if (ke.url) void invoke("ares_open_url", { url: String(ke.url) }).catch(() => null);
+          setKimiAuth((s) => ({ ...s, signingIn: true }));
+          pushGatewayToast("Opened Kimi sign-in in your browser — approve to connect.");
+          return true;
+        }
+        case "kimi_login_done": {
+          const ke = e as { ok?: unknown; detail?: unknown; error?: unknown };
+          setKimiAuth({ signingIn: false, connected: ke.ok === true, detail: typeof ke.detail === "string" ? ke.detail : null });
+          pushGatewayToast(ke.ok === true
+            ? "🟢 Kimi connected. Kimi models use your subscription."
+            : `Kimi sign-in failed: ${ke.error ? stringify(ke.error) : "unknown"}`);
+          return true;
+        }
+        case "kimi_auth_status": {
+          const ke = e as { configured?: unknown; detail?: unknown };
+          setKimiAuth({ signingIn: false, connected: ke.configured === true, detail: typeof ke.detail === "string" ? ke.detail : null });
+          return true;
+        }
         case "consciousness_status": {
           const models = Array.isArray(e.models) ? (e.models as ConsciousnessModelVm[]) : [];
           setConsciousness((c) => ({
@@ -3282,9 +3305,18 @@ function App() {
     daemonCmd({ type: "openai_login_start" });
   }, [native, daemonCmd, pushGatewayToast]);
 
-  // Reflect existing ChatGPT connection when the daemon comes up.
+  const startKimiSignIn = useCallback(() => {
+    if (!native) { pushGatewayToast("Kimi sign-in needs the installed app."); return; }
+    setKimiAuth((s) => ({ ...s, signingIn: true }));
+    daemonCmd({ type: "kimi_login_start" });
+  }, [native, daemonCmd, pushGatewayToast]);
+
+  // Reflect existing ChatGPT / Kimi connections when the daemon comes up.
   useEffect(() => {
-    if (native && daemon === "running") daemonCmd({ type: "openai_auth_status" });
+    if (native && daemon === "running") {
+      daemonCmd({ type: "openai_auth_status" });
+      daemonCmd({ type: "kimi_auth_status" });
+    }
   }, [native, daemon, daemonCmd]);
 
   // finishAnthropicSignIn no longer needed — loopback flow handles it automatically.
@@ -4514,6 +4546,8 @@ function App() {
           onOpenModelBrowser={() => setModelPopOpen(true)}
           openaiAuth={openaiAuth}
           onOpenaiSignIn={startOpenaiSignIn}
+          kimiAuth={kimiAuth}
+          onKimiSignIn={startKimiSignIn}
           onLaunchLivingSurface={() => void launchLivingSurface()}
           listProviderVoices={
             ttsProviderSkill
@@ -7768,7 +7802,7 @@ function Boot() {
 }
 
 // Ares (the owner gateway) leads; mock is dev-only and hidden from users.
-const PROVIDERS = ["ares", "ollama", "openai", "anthropic", "deepseek", "openrouter", "custom", "moa"];
+const PROVIDERS = ["ares", "ollama", "openai", "anthropic", "deepseek", "kimi", "openrouter", "custom", "moa"];
 
 // ─── Custom (OpenAI-compatible) provider: bring-your-own URL + key + discovery ──
 // Point Ares at ANY OpenAI-compatible endpoint and pull its full model list from
@@ -7994,6 +8028,7 @@ function CustomProviderBlock({
 const KEYED_PROVIDERS: Array<{ id: string; brand: string; label: string; sub: string; placeholder: string }> = [
   { id: "anthropic", brand: "anthropic", label: "Anthropic", sub: "Claude models via API", placeholder: "sk-ant-…" },
   { id: "deepseek", brand: "deepseek", label: "DeepSeek", sub: "official api.deepseek.com", placeholder: "sk-…" },
+  { id: "kimi", brand: "moonshot", label: "Kimi", sub: "api.kimi.com coding endpoint", placeholder: "sk-…" },
   { id: "openrouter", brand: "openrouter", label: "OpenRouter", sub: "hundreds of models, one key", placeholder: "sk-or-…" },
   { id: "ollama", brand: "ollama", label: "Ollama Cloud", sub: "cloud catalog + inference", placeholder: "ollama.com API key" },
 ];
@@ -8487,6 +8522,8 @@ function Settings({
   onOpenModelBrowser,
   openaiAuth,
   onOpenaiSignIn,
+  kimiAuth,
+  onKimiSignIn,
   onLaunchLivingSurface,
 }: {
   prefs: Prefs;
@@ -8512,6 +8549,8 @@ function Settings({
   onOpenModelBrowser: () => void;
   openaiAuth: { signingIn: boolean; connected: boolean; email: string | null; plan: string | null };
   onOpenaiSignIn: () => void;
+  kimiAuth: { signingIn: boolean; connected: boolean; detail: string | null };
+  onKimiSignIn: () => void;
   onLaunchLivingSurface: () => void;
 }) {
   const [tab, setTab] = useState<SettingsTab>(initialTab ?? "model");
@@ -8788,6 +8827,19 @@ function Settings({
                 </div>
                 <button className="keySignInBtn" disabled={openaiAuth.signingIn} onClick={onOpenaiSignIn}>
                   {openaiAuth.signingIn ? "Waiting…" : openaiAuth.connected ? "Re-sign in" : "Sign in with browser"}
+                </button>
+              </div>
+              <div className="keyCard signIn" data-on={kimiAuth.connected ? "1" : "0"}>
+                <ProviderLogo brand="moonshot" className="keyLogo" />
+                <div className="keyCardBody">
+                  <div className="keyCardHead">
+                    <strong>Kimi (subscription)</strong>
+                    {kimiAuth.connected ? <span className="keyPill" data-on="1">connected{kimiAuth.detail ? ` · ${kimiAuth.detail}` : ""}</span> : null}
+                  </div>
+                  <em>{kimiAuth.connected ? "Kimi models run on your Kimi subscription." : "Run Kimi models on your Kimi subscription — no API key."}</em>
+                </div>
+                <button className="keySignInBtn" disabled={kimiAuth.signingIn} onClick={onKimiSignIn}>
+                  {kimiAuth.signingIn ? "Waiting…" : kimiAuth.connected ? "Re-sign in" : "Sign in with browser"}
                 </button>
               </div>
 
