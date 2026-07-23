@@ -94,6 +94,10 @@ export interface SessionOptions {
   summarizeSpan?: (messages: readonly Message[]) => Promise<string>;
   /** See QueryEngineConfig.compactionThresholdTokens. */
   compactionThresholdTokens?: number;
+  /** Explicit friction directory for isolated tests/portable runtimes. */
+  telemetryDir?: string;
+  /** Explicit global home for the session-location registry. */
+  sessionRegistryHome?: string;
 }
 
 export class Session {
@@ -125,7 +129,19 @@ export class Session {
     const sessionDir = path.join(opts.workspace, ".ares", "sessions", sessionId);
     this.eventsPath = path.join(sessionDir, "events.jsonl");
     this.metaPath = path.join(sessionDir, "meta.json");
-    this.friction = new FrictionRecorder(sessionId);
+    this.friction = new FrictionRecorder(sessionId, {
+      dir: opts.telemetryDir,
+      source: "core",
+      workspace: opts.workspace,
+      provider: providerInfo.name,
+      model: providerInfo.model,
+      location: {
+        registryHome: opts.sessionRegistryHome,
+        rolloutPath: this.eventsPath,
+        metaPath: this.metaPath,
+        format: "core-rollout-v1",
+      },
+    });
     this.engine = new QueryEngine(
       {
         provider: opts.provider,
@@ -204,6 +220,7 @@ export class Session {
   ): Promise<void> {
     this.engine.setProvider(provider, model, context);
     this.meta.provider = { name: provider.name, model };
+    this.friction.updateContext({ provider: provider.name, model });
     await this.ensureSessionDir();
     await writeFile(this.metaPath, JSON.stringify(this.meta, null, 2) + "\n", "utf8");
   }
@@ -376,6 +393,17 @@ export class Session {
     return this.engine.history();
   }
 
+  /**
+   * Persist an externally-driven engine event (the Vanguard drive) into this
+   * session's rollout, so session history, restore after restart, and bug
+   * reports include the turn — a drive conversation must be exactly as
+   * durable as a native one.
+   */
+  async recordExternalEvent(event: TurnEvent): Promise<void> {
+    await this.ensureSessionDir();
+    this.persistEvent(event);
+  }
+
   private async ensureSessionDir(): Promise<void> {
     // ALWAYS ensure the directory exists (mkdir recursive is idempotent + cheap).
     // A resumed/opened session is constructed with metaWritten=true on the
@@ -426,7 +454,7 @@ export class Session {
 
   /** Await all pending rollout appends. */
   private async flush(): Promise<void> {
-    await this.ioChain;
+    await Promise.all([this.ioChain, this.friction.settle()]);
     if (this.ioError) {
       throw new Error(`session rollout persistence failed: ${this.ioError.message}`, { cause: this.ioError });
     }

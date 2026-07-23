@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout, stderr } from "node:process";
-import type { PermissionMode, PermissionPromptDecision } from "@ares/protocol";
+import type { PermissionMode, PermissionPromptDecision, TurnEvent } from "@ares/protocol";
 import { isReasoningLevel, REASONING_LEVELS, messageText, redactSecrets } from "@ares/protocol";
 import type { ToolPermissionRequest, RouteAssignments } from "@ares/core";
 import { notice } from "../terminalUi.js";
@@ -901,8 +901,13 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
   };
 
   // Vanguard drive mode: the second engine. Loads nothing until a session
-  // with the mode enabled actually sends.
-  const vanguardDrive = createVanguardDrive(tagEmit);
+  // with the mode enabled actually sends. Drive events persist into the same
+  // per-session rollout the native engine uses, so history, restore, and bug
+  // reports treat both engines identically.
+  const vanguardDrive = createVanguardDrive(tagEmit, (sessionId, event) => {
+    const entry = sessions.get(sessionId ?? DEFAULT_SID) ?? primaryEntry;
+    void entry.live.session.recordExternalEvent(event as unknown as TurnEvent).catch(() => undefined);
+  });
 
   // Crash safety net. The desktop bridge is a long-lived process on a coworker's
   // machine; until now an uncaught error or stray rejection could kill it with
@@ -2304,6 +2309,18 @@ export async function daemonCommand(args: ParsedArgs): Promise<number> {
           continue;
         }
         const settings = await loadUiSettings();
+        // "Work in C:\X" just works: an absolute path in the goal that names a
+        // real directory (or a file inside one) re-pins this session's drive
+        // workspace — no prompt, no toggle dance. The ack refreshes the badge.
+        const mentioned = goal.match(/[A-Za-z]:[\\/][^\s"'`|<>*?]+/u)?.[0]?.replace(/[.,;:!?)\]]+$/u, "");
+        if (mentioned) {
+          const resolved = path.resolve(mentioned);
+          const target = await stat(resolved).then((s) => (s.isDirectory() ? resolved : path.dirname(resolved))).catch(() => undefined);
+          if (target && target !== (entry.vanguardWorkspace ?? entry.live.context.workspace)) {
+            entry.vanguardWorkspace = target;
+            tagEmit(command.sessionId, { type: "vanguard_mode", enabled: true, workspace: target });
+          }
+        }
         void vanguardDrive.runTurn(sid, command.sessionId, goal, {
           workspace: entry.vanguardWorkspace ?? entry.live.context.workspace,
           family: providerFamilyForSelection(entry.live.selection),

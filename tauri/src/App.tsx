@@ -1997,9 +1997,8 @@ function App() {
   const vgBurstTimer = useRef<number | null>(null);
   // The Vanguard beat of the boot sequence — plays once, right after <Boot/>.
   const [vgIntroDone, setVgIntroDone] = useState(false);
-  // Engage popover: pick the folder Vanguard drives in before switching on.
-  const [vgAsk, setVgAsk] = useState(false);
-  const [vgAskPath, setVgAskPath] = useState(() => localStorage.getItem("ares.vanguard.lastWorkspace") ?? "");
+  // Where each session's drive is working (from vanguard_mode acks) — shown
+  // in the header badge. The workspace follows chat ("work in C:\path").
   const [vgWorkspaces, setVgWorkspaces] = useState<Record<string, string>>({});
   const [sessionQuery, setSessionQuery] = useState("");
   const [garrisonOpen, setGarrisonOpen] = useState(false);
@@ -4270,58 +4269,23 @@ function App() {
             </span>
           </div>
           {view === "chat" ? (
-            <div className="vgDriveWrap">
-              <button
-                className="vgDrive"
-                data-on={vgModes[active?.id ?? "__primary__"] ? "1" : "0"}
-                title={vgModes[active?.id ?? "__primary__"] ? "Vanguard is driving — click to hand back to the Ares core" : "Switch this session's engine to Vanguard"}
-                onClick={() => {
-                  if (vgModes[active?.id ?? "__primary__"]) {
-                    daemonCmd({ type: "vanguard_mode", sessionId: active?.id, enabled: false });
-                    setVgAsk(false);
-                  } else {
-                    setVgAsk((open) => !open);
-                  }
-                }}
-              >
-                <svg viewBox="0 0 16 18" aria-hidden="true">
-                  <path d="M8 1 15 3.6v5.2c0 4.4-2.9 7.1-7 8.2-4.1-1.1-7-3.8-7-8.2V3.6L8 1Z" fill="none" stroke="currentColor" strokeWidth="1.3" />
-                  <path d="m5.2 6.2 2.8 5 2.8-5" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                VANGUARD
-              </button>
-              {vgAsk ? (
-                <div className="vgEngage">
-                  <label>Workspace — where Vanguard builds</label>
-                  <input
-                    autoFocus
-                    value={vgAskPath}
-                    placeholder="blank = this session's Ares workspace"
-                    spellCheck={false}
-                    onChange={(e) => setVgAskPath(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Escape") setVgAsk(false);
-                      if (e.key === "Enter") {
-                        const workspace = vgAskPath.trim();
-                        if (workspace) localStorage.setItem("ares.vanguard.lastWorkspace", workspace);
-                        daemonCmd({ type: "vanguard_mode", sessionId: active?.id, enabled: true, ...(workspace ? { workspace } : {}) });
-                        setVgAsk(false);
-                      }
-                    }}
-                  />
-                  <button
-                    onClick={() => {
-                      const workspace = vgAskPath.trim();
-                      if (workspace) localStorage.setItem("ares.vanguard.lastWorkspace", workspace);
-                      daemonCmd({ type: "vanguard_mode", sessionId: active?.id, enabled: true, ...(workspace ? { workspace } : {}) });
-                      setVgAsk(false);
-                    }}
-                  >
-                    Engage ⨯
-                  </button>
-                </div>
-              ) : null}
-            </div>
+            <button
+              className="vgDrive"
+              data-on={vgModes[active?.id ?? "__primary__"] ? "1" : "0"}
+              title={vgModes[active?.id ?? "__primary__"]
+                ? "Vanguard is driving — click to hand back to the Ares core"
+                : "Switch this session's engine to Vanguard — works wherever Ares works; say \"work in C:\\path\" to move it"}
+              onClick={() => {
+                const enabled = !vgModes[active?.id ?? "__primary__"];
+                daemonCmd({ type: "vanguard_mode", sessionId: active?.id, enabled });
+              }}
+            >
+              <svg viewBox="0 0 16 18" aria-hidden="true">
+                <path d="M8 1 15 3.6v5.2c0 4.4-2.9 7.1-7 8.2-4.1-1.1-7-3.8-7-8.2V3.6L8 1Z" fill="none" stroke="currentColor" strokeWidth="1.3" />
+                <path d="m5.2 6.2 2.8 5 2.8-5" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              VANGUARD
+            </button>
           ) : null}
         </header>
 

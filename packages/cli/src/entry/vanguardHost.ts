@@ -70,6 +70,9 @@ interface VanguardEngineLike {
 /** The daemon's tagEmit: events tagged with the Ares session id. */
 type TagEmit = (sessionId: string | undefined, obj: Record<string, unknown>) => void;
 
+/** Persists a drive event into the owning Ares session's rollout. */
+type PersistEvent = (sessionId: string | undefined, event: Record<string, unknown>) => void;
+
 /** The slice of Ares uiSettings the drive needs to authenticate any family. */
 export interface DriveSettings {
   readonly anthropicKey?: string;
@@ -167,6 +170,8 @@ interface Binding {
   deltaBytes: number;
   /** Visible text emitted this turn — the blank-reply safety net reads this. */
   turnTextBytes: number;
+  /** Assistant text accumulated this turn, persisted as the rollout message. */
+  turnText: string;
   turnActive: boolean;
   turnStartedAt: number;
   /** Wall-clock of the last public event — the liveness signal the hang watchdog reads. */
@@ -189,7 +194,7 @@ export interface VanguardDrive {
   shutdown(): Promise<void>;
 }
 
-export function createVanguardDrive(tagEmit: TagEmit): VanguardDrive {
+export function createVanguardDrive(tagEmit: TagEmit, persist?: PersistEvent): VanguardDrive {
   let modulePromise: Promise<EngineModule> | undefined;
   let engine: VanguardEngineLike | undefined;
   let unsubscribe: (() => void) | undefined;
@@ -220,6 +225,7 @@ export function createVanguardDrive(tagEmit: TagEmit): VanguardDrive {
       case "agent.delta":
         binding.deltaBytes += message.length;
         binding.turnTextBytes += message.length;
+        if (binding.turnText.length < 400_000) binding.turnText += message;
         emit({ type: "text_delta", text: message });
         return;
       case "agent.thinking":
@@ -233,6 +239,7 @@ export function createVanguardDrive(tagEmit: TagEmit): VanguardDrive {
         // duplicate sentence.
         if (message && (binding.deltaBytes === 0 || binding.turnTextBytes === 0)) {
           binding.turnTextBytes += message.length;
+          if (binding.turnText.length < 400_000) binding.turnText += `${binding.turnText.length > 0 ? "\n" : ""}${message}`;
           emit({ type: "text_delta", text: message });
         }
         binding.deltaBytes = 0;
@@ -245,6 +252,7 @@ export function createVanguardDrive(tagEmit: TagEmit): VanguardDrive {
         queue.push(id);
         binding.pendingTools.set(tool, queue);
         emit({ type: "tool_start", id, name: tool, activityDescription: detail ?? title ?? tool });
+        persist?.(binding.tag, { type: "tool_start", id, name: tool, input: {}, activityDescription: detail ?? title ?? tool });
         return;
       }
       case "tool.completed":
@@ -253,8 +261,13 @@ export function createVanguardDrive(tagEmit: TagEmit): VanguardDrive {
         const id = binding.pendingTools.get(tool)?.shift();
         const durationMs = typeof ev.durationMs === "number" ? ev.durationMs : undefined;
         if (id === undefined) return;
-        if (type === "tool.completed") emit({ type: "tool_end", id, display: detail ?? "done", durationMs });
-        else emit({ type: "tool_error", id, error: detail ?? "failed", durationMs });
+        if (type === "tool.completed") {
+          emit({ type: "tool_end", id, display: detail ?? "done", durationMs });
+          persist?.(binding.tag, { type: "tool_end", id, output: detail ?? "done", durationMs: durationMs ?? 0, display: detail ?? "done" });
+        } else {
+          emit({ type: "tool_error", id, error: detail ?? "failed", durationMs });
+          persist?.(binding.tag, { type: "tool_error", id, error: detail ?? "failed", durationMs: durationMs ?? 0 });
+        }
         return;
       }
       case "run.contracted": {
@@ -392,6 +405,7 @@ export function createVanguardDrive(tagEmit: TagEmit): VanguardDrive {
       pendingTools: new Map(),
       deltaBytes: 0,
       turnTextBytes: 0,
+      turnText: "",
       turnActive: false,
       turnStartedAt: 0,
       lastEventAt: Date.now(),
@@ -418,7 +432,38 @@ export function createVanguardDrive(tagEmit: TagEmit): VanguardDrive {
         binding.turnStartedAt = startedAt;
         binding.deltaBytes = 0;
         binding.turnTextBytes = 0;
+        binding.turnText = "";
         binding.lastEventAt = Date.now();
+        // Drive turns are exactly as durable as native ones: the goal, tool
+        // activity, the assistant message, and the turn end all persist to the
+        // Ares session rollout (history, restore, bug reports).
+        persist?.(tag, {
+          type: "turn_start",
+          turnId: `vanguard-turn-${startedAt}`,
+          sessionId: tag ?? "",
+          userMessage: {
+            id: `vanguard-user-${startedAt}`,
+            role: "user",
+            content: [{ type: "text", text: goal }],
+            createdAt: new Date(startedAt).toISOString(),
+          },
+        });
+        const persistTurnClose = (status: string): void => {
+          if (binding !== undefined && binding.turnText.length > 0) {
+            persist?.(tag, {
+              type: "message_done",
+              message: {
+                id: `vanguard-assistant-${startedAt}`,
+                role: "assistant",
+                content: [{ type: "text", text: binding.turnText }],
+                createdAt: new Date().toISOString(),
+              },
+              usage: { inputTokens: 0, outputTokens: 0 },
+              stopReason: "end_turn",
+            });
+          }
+          persist?.(tag, { type: "turn_end", status, usage: { inputTokens: 0, outputTokens: 0 }, durationMs: Date.now() - startedAt });
+        };
         const live = await ensureEngine();
         live.advance(binding.vanguardSessionId, goal);
         // No-hang layer 3: the worker runs in the background and public events
@@ -433,6 +478,7 @@ export function createVanguardDrive(tagEmit: TagEmit): VanguardDrive {
           await new Promise((resolve) => setTimeout(resolve, 600));
           const state = live.status(binding.vanguardSessionId).state;
           if (state !== "running") {
+            persistTurnClose(state === "failed" ? "failed" : "completed");
             tagEmit(tag, {
               type: "turn_end",
               status: state === "failed" ? "failed" : "ok",
@@ -451,6 +497,7 @@ export function createVanguardDrive(tagEmit: TagEmit): VanguardDrive {
               tagEmit(tag, { type: "tool_start", id: cardId, name: "vanguard.watchdog", activityDescription: "worker unresponsive" });
               tagEmit(tag, { type: "tool_error", id: cardId, error: "no activity for 3 minutes after two restarts — stopping this turn; send again to resume the contract" });
               live.cancel(binding.vanguardSessionId);
+              persistTurnClose("failed");
               tagEmit(tag, { type: "turn_end", status: "failed", usage: {}, durationMs: Date.now() - startedAt });
               return;
             }
@@ -466,7 +513,22 @@ export function createVanguardDrive(tagEmit: TagEmit): VanguardDrive {
           }
         }
       } catch (error) {
-        tagEmit(tag, { type: "text_delta", text: `Vanguard engine: ${error instanceof Error ? error.message : String(error)}` });
+        const text = `Vanguard engine: ${error instanceof Error ? error.message : String(error)}`;
+        // A failed turn must NEVER render blank: prose plus an error card, so
+        // the reason survives even if one rendering path drops it.
+        tagEmit(tag, { type: "text_delta", text });
+        toolCardSequence += 1;
+        const cardId = `vanguard-${toolCardSequence}`;
+        tagEmit(tag, { type: "tool_start", id: cardId, name: "vanguard.engine", activityDescription: "engine error" });
+        tagEmit(tag, { type: "tool_error", id: cardId, error: text, durationMs: 0 });
+        if (binding !== undefined && binding.turnText.length < 400_000) binding.turnText += `${binding.turnText.length > 0 ? "\n" : ""}${text}`;
+        persist?.(tag, {
+          type: "message_done",
+          message: { id: `vanguard-assistant-${startedAt}`, role: "assistant", content: [{ type: "text", text: binding?.turnText || text }], createdAt: new Date().toISOString() },
+          usage: { inputTokens: 0, outputTokens: 0 },
+          stopReason: "error",
+        });
+        persist?.(tag, { type: "turn_end", status: "failed", usage: { inputTokens: 0, outputTokens: 0 }, durationMs: Date.now() - startedAt });
         tagEmit(tag, { type: "turn_end", status: "failed", usage: {}, durationMs: Date.now() - startedAt });
       } finally {
         if (binding !== undefined) binding.turnActive = false;
