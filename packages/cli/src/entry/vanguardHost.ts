@@ -327,6 +327,11 @@ export function createVanguardDrive(tagEmit: TagEmit): VanguardDrive {
       ...(target.credentialVariable === undefined || auth === "oauth" ? {} : { credentialVariable: target.credentialVariable }),
       direct: true, // same trust model as the Ares agent: real tree, git undo
       maxSteps: 240,
+      // Kill any agent-run command after 90s of silence (same watchdog the
+      // Vanguard TUI uses). Without it a hung command — an installer waiting
+      // on a prompt, a dev server that never exits — freezes the transcript
+      // for the full 30-minute hard cap and starves steering of a boundary.
+      commandIdleTimeoutMs: 90_000,
     };
     let created;
     try {
