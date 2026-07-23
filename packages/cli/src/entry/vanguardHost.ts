@@ -63,6 +63,7 @@ interface VanguardEngineLike {
   advance(sessionId: string, message?: string): Record<string, unknown>;
   steer(sessionId: string, message: string): Record<string, unknown>;
   cancel(sessionId: string): Record<string, unknown>;
+  stopAndWait(sessionId: string): Promise<Record<string, unknown>>;
   status(sessionId: string): { state?: string };
   subscribe(handler: (envelope: { sessionId: string; event: Record<string, unknown> }) => void): () => void;
   shutdown(): Promise<void>;
@@ -518,7 +519,16 @@ export function createVanguardDrive(tagEmit: TagEmit, persist?: PersistEvent): V
         const live = await ensureEngine();
         // Keep the bridged Anthropic session tracking Ares's token refreshes.
         if (binding.aresOAuthBridge) await syncAresAnthropicOAuth();
-        live.advance(binding.vanguardSessionId, goal);
+        try {
+          live.advance(binding.vanguardSessionId, goal);
+        } catch (error) {
+          // A lingering worker from a cancelled or wedged prior turn means the
+          // session is still mid-advance. Attach instead of failing: steering
+          // delivers this message into the running run.
+          const text = error instanceof Error ? error.message : String(error);
+          if (!/active advance|session_busy/iu.test(text)) throw error;
+          live.steer(binding.vanguardSessionId, goal);
+        }
         // No-hang layer 3: the worker runs in the background and public events
         // are its heartbeat. Tool execution windows are already bounded by the
         // command watchdogs (their completions produce events), so a long
@@ -555,10 +565,22 @@ export function createVanguardDrive(tagEmit: TagEmit, persist?: PersistEvent): V
               return;
             }
             tagEmit(tag, { type: "tool_start", id: cardId, name: "vanguard.watchdog", activityDescription: `no activity for ${Math.round(idleMs / 1000)}s — restarting the worker from its journal` });
-            live.cancel(binding.vanguardSessionId);
-            const cancelledAt = Date.now();
-            while (live.status(binding.vanguardSessionId).state === "running" && Date.now() - cancelledAt < 10_000) {
-              await new Promise((resolve) => setTimeout(resolve, 400));
+            // stopAndWait returns only when the worker generation has actually
+            // settled — restarting off a bare cancel raced lingering workers
+            // and collided with "the session already has an active advance".
+            try {
+              await live.stopAndWait(binding.vanguardSessionId);
+            } catch {
+              live.cancel(binding.vanguardSessionId);
+              const cancelledAt = Date.now();
+              while (live.status(binding.vanguardSessionId).state === "running" && Date.now() - cancelledAt < 30_000) {
+                await new Promise((resolve) => setTimeout(resolve, 400));
+              }
+            }
+            if (live.status(binding.vanguardSessionId).state === "running") {
+              tagEmit(tag, { type: "tool_end", id: cardId, display: "worker still settling — will retry on the next quiet window" });
+              binding.lastEventAt = Date.now();
+              continue;
             }
             live.advance(binding.vanguardSessionId);
             binding.lastEventAt = Date.now();
