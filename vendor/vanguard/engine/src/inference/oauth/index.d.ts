@@ -34,7 +34,7 @@ export interface LoginOptions {
 /** Run the interactive sign-in for one provider. Resolves once tokens are stored. */
 export declare function oauthLogin(provider: OAuthProvider, options?: LoginOptions): Promise<OAuthStatus>;
 export declare function oauthLogout(provider: OAuthProvider): Promise<void>;
-export { ANTHROPIC_OAUTH_BETA, ANTHROPIC_OAUTH_IDENTITY, ANTHROPIC_OAUTH_USER_AGENT, ANTHROPIC_OAUTH_X_APP, clearAnthropicTokens, fetchClaudeModels, finishAnthropicLogin, loadAnthropicTokens, refreshAnthropicTokens, resolveAnthropicAccessToken, runAnthropicLoginFlow, startAnthropicLogin, } from "./anthropicOAuth.js";
+export { ANTHROPIC_OAUTH_BETA, ANTHROPIC_OAUTH_IDENTITY, ANTHROPIC_OAUTH_USER_AGENT, ANTHROPIC_OAUTH_X_APP, clearAnthropicTokens, fetchClaudeModels, finishAnthropicLogin, loadAnthropicTokens, refreshAnthropicTokens, resolveAnthropicAccessToken, runAnthropicLoginFlow, saveAnthropicTokens, startAnthropicLogin, } from "./anthropicOAuth.js";
 export type { AnthropicAuthChallenge, AnthropicOAuthTokens, ClaudeModel } from "./anthropicOAuth.js";
 export { CODEX_RESPONSES_URL, clearOpenAITokens, fetchCodexModels, loadOpenAITokens, openAIPlanType, refreshOpenAITokens, resolveOpenAIAccessToken, runOpenAILoginFlow, } from "./openaiOAuth.js";
 export type { CodexModel, OpenAIAccessToken, OpenAIOAuthTokens } from "./openaiOAuth.js";

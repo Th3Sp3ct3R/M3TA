@@ -23,6 +23,7 @@ interface EngineModule {
   supportsOAuth: (provider: string) => boolean;
   oauthStatus: (provider: string) => Promise<{ connected: boolean }>;
   credentialVariable: (provider: string) => string;
+  saveAnthropicTokens: (tokens: { accessToken: string; refreshToken: string; expiresAt: number; scopes?: readonly string[] }) => Promise<void>;
 }
 
 /**
@@ -162,6 +163,9 @@ interface Binding {
   family: string;
   model: string;
   workspace: string;
+  /** True when the engine's Anthropic session is bridged from Ares's OAuth
+   *  store — re-synced every turn so the copy tracks Ares's refreshes. */
+  aresOAuthBridge: boolean;
   /** Ares session tag for emitted events (undefined = primary/untagged). */
   tag: string | undefined;
   /** FIFO of live tool-card ids, per tool name, for start/end matching. */
@@ -343,22 +347,52 @@ export function createVanguardDrive(tagEmit: TagEmit, persist?: PersistEvent): V
     return engine;
   };
 
-  const resolveAuth = async (target: DriveTarget, family: string): Promise<"oauth" | "api-key"> => {
+  /**
+   * The owner signed into Claude through ARES's OAuth; the engine reads its
+   * own token store. Same OAuth contract, identical token shape — so sync the
+   * (auto-refreshed) Ares tokens across whenever the engine store is stale.
+   * Returns true when the engine now holds a usable Anthropic session.
+   */
+  const syncAresAnthropicOAuth = async (): Promise<boolean> => {
+    try {
+      const mod = await loadModule();
+      const core = await import("@ares/core") as {
+        resolveAnthropicAccessToken: () => Promise<string | null>;
+        loadAnthropicTokens: () => Promise<{ accessToken: string; refreshToken: string; expiresAt: number; scopes?: string[] } | null>;
+      };
+      const access = await core.resolveAnthropicAccessToken();
+      if (!access) return false;
+      const tokens = await core.loadAnthropicTokens();
+      if (!tokens?.accessToken || !tokens.refreshToken) return false;
+      await mod.saveAnthropicTokens({
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
+        expiresAt: tokens.expiresAt,
+        ...(tokens.scopes === undefined ? {} : { scopes: tokens.scopes }),
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const resolveAuth = async (target: DriveTarget, family: string): Promise<{ auth: "oauth" | "api-key"; aresBridged: boolean }> => {
     const mod = await loadModule();
     if (target.oauthFamily !== undefined && mod.supportsOAuth(target.oauthFamily)) {
       const status = await mod.oauthStatus(target.oauthFamily).catch(() => ({ connected: false }));
-      if (status.connected) return "oauth";
+      if (status.connected) return { auth: "oauth", aresBridged: false };
+      if (target.oauthFamily === "anthropic" && await syncAresAnthropicOAuth()) return { auth: "oauth", aresBridged: true };
     }
     const variable = target.credentialVariable ?? mod.credentialVariable(target.provider);
-    if ((process.env[variable] ?? "") !== "") return "api-key";
+    if ((process.env[variable] ?? "") !== "") return { auth: "api-key", aresBridged: false };
     // Fall back to the credential the owner already gave Ares itself, so
     // Vanguard mode needs zero extra setup. Injected into this process only.
     if (target.settingsValue !== undefined && target.settingsValue !== "") {
       process.env[variable] = target.settingsValue;
-      return "api-key";
+      return { auth: "api-key", aresBridged: false };
     }
-    if (family === "ollama") return "api-key"; // local daemon needs no key
-    throw new Error(`Vanguard has no ${family} credential: sign in or set ${variable}.`);
+    if (family === "ollama") return { auth: "api-key", aresBridged: false }; // local daemon needs no key
+    throw new Error(`Vanguard has no ${family} credential: sign in with the Claude/ChatGPT/Kimi card in Settings, or set ${variable}.`);
   };
 
   const ensureBinding = async (
@@ -377,7 +411,7 @@ export function createVanguardDrive(tagEmit: TagEmit, persist?: PersistEvent): V
     await mkdir(selection.workspace, { recursive: true });
     const target = driveTarget(selection.family, selection.settings);
     const live = await ensureEngine();
-    const auth = await resolveAuth(target, selection.family);
+    const { auth, aresBridged } = await resolveAuth(target, selection.family);
     const config = {
       workspace: selection.workspace,
       provider: target.provider,
@@ -417,6 +451,7 @@ export function createVanguardDrive(tagEmit: TagEmit, persist?: PersistEvent): V
       family: selection.family,
       model: selection.model,
       workspace: selection.workspace,
+      aresOAuthBridge: aresBridged,
       tag,
       pendingTools: new Map(),
       deltaBytes: 0,
@@ -481,6 +516,8 @@ export function createVanguardDrive(tagEmit: TagEmit, persist?: PersistEvent): V
           persist?.(tag, { type: "turn_end", status, usage: { inputTokens: 0, outputTokens: 0 }, durationMs: Date.now() - startedAt });
         };
         const live = await ensureEngine();
+        // Keep the bridged Anthropic session tracking Ares's token refreshes.
+        if (binding.aresOAuthBridge) await syncAresAnthropicOAuth();
         live.advance(binding.vanguardSessionId, goal);
         // No-hang layer 3: the worker runs in the background and public events
         // are its heartbeat. Tool execution windows are already bounded by the
